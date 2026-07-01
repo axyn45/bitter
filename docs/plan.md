@@ -98,7 +98,18 @@ The timeout daemon keeps track of the time elapsed since the last SSH signature 
   - Deletes the identity tokens from config.
   - Requires full `sshwarden login` and `sshwarden sync` to be used again.
 
-### E. Real-time Live Sync (WebSocket & SignalR Hub)
+### E. Hot Reloading & Daemon IPC Control
+To handle hot-reloading configurations (e.g., changing timeout settings via `sshwarden settings`) and vault cache updates (e.g., manually syncing via `sshwarden sync`), `sshwarden` implements a Unix socket IPC control mechanism:
+1. **Control IPC Socket**:
+   - The daemon creates a separate control socket at `<socket_path>.control` (e.g., `~/.run/sshwarden.sock.control`).
+   - The CLI connects to this control socket to notify the daemon of configuration changes, lock/unlock events, or cache invalidations.
+   - This socket is also used to securely transfer the derived master key from the CLI to the daemon during interactive `unlock` commands.
+2. **Dynamic Reloading**:
+   - When the daemon receives a reload command from the control socket:
+     - For configuration updates: It re-reads `config.toml` and updates active settings (such as the timeout duration) in-memory.
+     - For vault cache updates: If the daemon is unlocked, it re-reads the encrypted cache `vault.db` from disk and decrypts the new SSH keys into memory.
+
+### F. Real-time Live Sync (WebSocket & SignalR Hub)
 To keep the local vault cache up-to-date without continuously pulling the entire vault (via `/sync`), `sshwarden` evaluates and implements real-time notifications:
 1. **Feasibility**:
    - Both the official Bitwarden server and Vaultwarden support a notification hub.
