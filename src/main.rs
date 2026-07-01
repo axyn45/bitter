@@ -497,53 +497,80 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 .ok_or_else(|| "Local database salt missing from config.".to_string())?;
             let db_key = storage::derive_db_key(&password, salt)?;
 
-            println!("Decrypting local cache database...");
-            let cache_keys = storage::load_db(&db_key)?;
-            if cache_keys.is_empty() {
-                return Err(
-                    "No keys found in local cache database. Run 'sshwarden sync' first."
-                        .to_string(),
-                );
-            }
-
             let api_client = ApiClient::new(&config.server_url);
 
-            println!("Fetching KDF settings...");
-            let prelogin = api_client.prelogin(email).await?;
+            // Attempt online sync first
+            println!("Syncing ciphers and decrypting keys from server...");
+            let mut keys_to_load = Vec::new();
+            let mut enc_hex = String::new();
+            let mut mac_hex = String::new();
+            let mut synced_successfully = false;
 
-            println!("Deriving keys...");
-            let master_key = match prelogin.kdf {
-                0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations)?,
-                1 => {
-                    let mem = prelogin
-                        .kdf_memory
-                        .ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
-                    let para = prelogin
-                        .kdf_parallelism
-                        .ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
-                    crypto::derive_master_key_argon2(
-                        &password,
-                        email,
-                        prelogin.kdf_iterations,
-                        mem,
-                        para,
-                    )?
+            match api_client.prelogin(email).await {
+                Ok(prelogin) => {
+                    let master_key_res = match prelogin.kdf {
+                        0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations),
+                        1 => {
+                            if let (Some(mem), Some(para)) = (prelogin.kdf_memory, prelogin.kdf_parallelism) {
+                                crypto::derive_master_key_argon2(&password, email, prelogin.kdf_iterations, mem, para)
+                            } else {
+                                Err("Argon2 parameters missing from prelogin response".to_string())
+                            }
+                        }
+                        t => Err(format!("Unsupported KDF type: {}", t)),
+                    };
+
+                    match master_key_res {
+                        Ok(master_key) => {
+                            match api_client.sync(token).await {
+                                Ok(sync_data) => {
+                                    match crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key) {
+                                        Ok((enc_key, mac_key)) => {
+                                            let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+                                            println!("Sync successful. Saving encrypted cache to disk...");
+                                            if let Err(e) = storage::save_db(&ssh_keys, &db_key) {
+                                                eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
+                                            }
+                                            enc_hex = hex::encode(enc_key);
+                                            mac_hex = hex::encode(mac_key);
+                                            keys_to_load = ssh_keys;
+                                            synced_successfully = true;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Warning: Failed to decrypt profile keys: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to sync vault: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Key derivation failed: {}", e);
+                        }
+                    }
                 }
-                t => return Err(format!("Unsupported KDF type: {}", t)),
-            };
+                Err(e) => {
+                    eprintln!("Warning: Prelogin failed: {}", e);
+                }
+            }
 
-            // Retrieve symmetric key from sync response
-            println!("Fetching active profile keys from server...");
-            let sync_data = api_client.sync(token).await?;
-            let (enc_key, mac_key) =
-                crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key)?;
+            if !synced_successfully {
+                println!("Falling back to decrypting local cache database...");
+                let cache_keys = storage::load_db(&db_key)?;
+                if cache_keys.is_empty() {
+                    return Err(
+                        "No keys found in local cache database. Please check your network and try again."
+                            .to_string(),
+                    );
+                }
+                keys_to_load = cache_keys;
+                println!("Warning: Running in offline mode. Live background sync will be unavailable.");
+            }
 
-            let enc_hex = hex::encode(enc_key);
-            let mac_hex = hex::encode(mac_key);
             let db_hex = hex::encode(db_key);
-
-            println!("Sending keys and context to background agent daemon...");
-            let daemon_keys: Vec<daemon::SshKeyData> = cache_keys
+            let daemon_keys: Vec<daemon::SshKeyData> = keys_to_load
                 .into_iter()
                 .map(|k| daemon::SshKeyData {
                     name: k.name,
@@ -551,6 +578,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 })
                 .collect();
 
+            println!("Sending keys to background agent daemon...");
             let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
                 keys: daemon_keys,
                 enc_key: enc_hex,
