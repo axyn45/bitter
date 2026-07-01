@@ -13,16 +13,16 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
 - [x] Verify compilation and test skeleton CLI commands
 
 ## Phase 2: Cryptography & Bitwarden API Client
-- [ ] Implement cryptographic primitives (`crypto` module)
-  - [ ] Client-side KDF derivation for PBKDF2 (deriving Master Key and Login Hash)
-  - [ ] Client-side KDF derivation for Argon2id (deriving Master Key and Login Hash)
-  - [ ] Cipher decryption helpers (AES-256-CBC and AES-256-GCM)
-- [ ] Implement REST HTTP API Client (`api` module)
-  - [ ] Fetch user KDF parameters via email
-  - [ ] Standard Login API (Email + Password) returning bearer token
-  - [ ] API Key Login (`client_id` + `client_secret`) returning bearer token
-  - [ ] Sync API (`/sync`) to download full encrypted vault payload
-  - [ ] Individual Cipher Details API (`GET /api/ciphers/<id>/details`)
+- [x] Implement cryptographic primitives (`crypto` module)
+  - [x] Client-side KDF derivation for PBKDF2 (deriving Master Key and Login Hash)
+  - [x] Client-side KDF derivation for Argon2id (deriving Master Key and Login Hash)
+  - [x] Cipher decryption helpers (AES-256-CBC and AES-256-GCM)
+- [x] Implement REST HTTP API Client (`api` module)
+  - [x] Fetch user KDF parameters via email
+  - [x] Standard Login API (Email + Password) returning bearer token
+  - [x] API Key Login (`client_id` + `client_secret`) returning bearer token
+  - [x] Sync API (`/sync`) to download full encrypted vault payload
+  - [x] Individual Cipher Details API (`GET /api/ciphers/<id>/details`)
 
 ## Phase 3: Secure Local Storage & Cache
 - [ ] Implement secure vault cache (`storage` module)
