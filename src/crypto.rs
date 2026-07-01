@@ -239,3 +239,39 @@ pub fn decrypt_symmetric_key(
 
     Ok((enc_key, mac_key))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pbkdf2_derivation() {
+        let password = "masterpassword123";
+        let email = "test@example.com";
+        let iterations = 5000;
+        let master_key = derive_master_key_pbkdf2(password, email, iterations).unwrap();
+        assert_eq!(master_key.len(), 32);
+
+        // Derive login hash
+        let login_hash = derive_login_hash(&master_key, password);
+        assert!(!login_hash.is_empty());
+    }
+
+    #[test]
+    fn test_argon2_derivation() {
+        let password = "masterpassword123";
+        let email = "test@example.com";
+        let iterations = 2;
+        let memory_mb = 8;
+        let parallelism = 1;
+        let master_key = derive_master_key_argon2(password, email, iterations, memory_mb, parallelism).unwrap();
+        assert_eq!(master_key.len(), 32);
+    }
+
+    #[test]
+    fn test_aes_cbc_decryption_error() {
+        let key = [0u8; 32];
+        let res = decrypt_symmetric_key(&key, "invalid_cipher_string");
+        assert!(res.is_err());
+    }
+}
