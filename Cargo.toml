@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = "0.9.1"
+aes-gcm = "0.11.0"
+argon2 = "0.5.3"
+base64 = "0.22.1"
+cbc = "0.2.1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 directories = "6.0.0"
+reqwest = { version = "0.13.4", features = ["json"] }
+ring = "0.17.14"
 serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
