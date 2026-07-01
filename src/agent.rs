@@ -83,8 +83,6 @@ const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_AGENT_FAILURE: u8 = 5;
 
 // RSA SHA2 flags
-#[allow(dead_code)]
-const SSH_AGENT_RSA_SHA2_256: u32 = 0x02;
 const SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
 
 pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<Vec<u8>, String> {
