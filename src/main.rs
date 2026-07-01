@@ -341,13 +341,13 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
         },
         Commands::Agent(args) => match args.command {
             AgentCommands::Start(start_args) => {
-                daemon::start_agent(start_args.foreground, start_args.socket)?;
+                daemon::start_agent(start_args.foreground, start_args.socket).await?;
             }
             AgentCommands::Stop => {
                 daemon::stop_agent()?;
             }
             AgentCommands::Status => {
-                daemon::print_status()?;
+                daemon::print_status().await?;
             }
         },
         Commands::Unlock => {

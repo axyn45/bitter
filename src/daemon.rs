@@ -61,7 +61,7 @@ type KeyRing = Arc<RwLock<Vec<PrivateKey>>>;
 type SharedKeysContext = Arc<RwLock<Option<KeysContext>>>;
 
 /// Starts the agent background process
-pub fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
+pub async fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
     let cache_dir =
         storage::cache_dir().ok_or_else(|| "Could not determine cache directory".to_string())?;
     fs::create_dir_all(&cache_dir)
@@ -88,14 +88,9 @@ pub fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) -> Res
         fs::write(&pid_path, pid.to_string())
             .map_err(|e| format!("Failed to write pid file: {}", e))?;
 
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("Failed to start Tokio runtime: {}", e))?;
-
-        rt.block_on(async {
-            if let Err(e) = run_daemon_loops(socket_path, control_socket_path, pid_path).await {
-                eprintln!("Agent error: {}", e);
-            }
-        });
+        if let Err(e) = run_daemon_loops(socket_path, control_socket_path, pid_path).await {
+            eprintln!("Agent error: {}", e);
+        }
         Ok(())
     } else {
         let daemonize = Daemonize::new()
@@ -169,7 +164,7 @@ pub fn stop_agent() -> Result<(), String> {
 }
 
 /// Checks the status of the background agent process
-pub fn print_status() -> Result<(), String> {
+pub async fn print_status() -> Result<(), String> {
     let cache_dir =
         storage::cache_dir().ok_or_else(|| "Could not determine cache directory".to_string())?;
     let socket_path = cache_dir.join("ssh-agent.sock");
@@ -180,23 +175,20 @@ pub fn print_status() -> Result<(), String> {
         println!("SSH_AUTH_SOCK:   {}", socket_path.display());
 
         // Connect to control socket to fetch key statistics
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            match query_agent_status(&control_socket_path).await {
-                Ok(resp) => {
-                    let status_str = if resp.unlocked.unwrap_or(false) {
-                        "Unlocked"
-                    } else {
-                        "Locked"
-                    };
-                    println!("Vault Status:    {}", status_str);
-                    println!("Keys Loaded:     {}", resp.key_count.unwrap_or(0));
-                }
-                Err(e) => {
-                    println!("Vault Status:    Error contacting control socket ({})", e);
-                }
+        match query_agent_status(&control_socket_path).await {
+            Ok(resp) => {
+                let status_str = if resp.unlocked.unwrap_or(false) {
+                    "Unlocked"
+                } else {
+                    "Locked"
+                };
+                println!("Vault Status:    {}", status_str);
+                println!("Keys Loaded:     {}", resp.key_count.unwrap_or(0));
             }
-        });
+            Err(e) => {
+                println!("Vault Status:    Error contacting control socket ({})", e);
+            }
+        }
     } else {
         println!("sshwarden agent: stopped");
     }
