@@ -25,17 +25,17 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
   - [x] Individual Cipher Details API (`GET /api/ciphers/<id>/details`)
 
 ## Phase 3: Secure Local Storage & Cache
-- [ ] Implement secure vault cache (`storage` module)
-  - [ ] Derive local cache encryption key using Argon2id + local salt from master password
-  - [ ] Encrypt/Decrypt local database using AES-256-GCM
-- [ ] Implement cipher parsing and filtering logic
-  - [ ] Parse and extract SSH keys from native SSH key items (type `100`)
-  - [ ] Parse and extract SSH keys from Secure Notes containing PEM/OpenSSH private key text
-  - [ ] Parse and extract SSH keys from Logins containing custom `ssh_private_key` fields
-- [ ] Implement local vault keys management CLI commands
-  - [ ] `sshwarden keys list`: List all synced SSH keys
-  - [ ] `sshwarden sync`: Manually trigger synchronization and refresh local cache
-  - [ ] `sshwarden keys add / edit / delete`: Modifying keys and sync changes back to Bitwarden server
+- [x] Implement secure vault cache (`storage` module)
+  - [x] Derive local cache encryption key using Argon2id + local salt from master password
+  - [x] Encrypt/Decrypt local database using AES-256-GCM
+- [x] Implement cipher parsing and filtering logic
+  - [x] Parse and extract SSH keys from native SSH key items (type `100`)
+  - [x] Parse and extract SSH keys from Secure Notes containing PEM/OpenSSH private key text
+  - [x] Parse and extract SSH keys from Logins containing custom `ssh_private_key` fields
+- [x] Implement local vault keys management CLI commands
+  - [x] `sshwarden keys list`: List all synced SSH keys
+  - [x] `sshwarden sync`: Manually trigger synchronization and refresh local cache
+  - [-] `sshwarden keys add / edit / delete`: Modifying keys (Placeholder, deferred for post-agent implementation)
 
 ## Phase 4: SSH Agent Protocol & Unix Socket
 - [ ] Implement SSH Agent Protocol parser (`agent` module)
