@@ -179,6 +179,12 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
         }
         Commands::Logout => {
             println!("Logging out...");
+            if daemon::is_agent_running() {
+                println!("Locking and clearing background agent memory...");
+                if let Err(e) = daemon::send_control_request(daemon::ControlRequest::Lock).await {
+                    eprintln!("Warning: Failed to notify agent to lock/clear keys: {}", e);
+                }
+            }
             if let Err(e) = storage::wipe_db() {
                 eprintln!("Warning: Failed to delete local database cache: {}", e);
             }
