@@ -66,9 +66,13 @@ pub struct UserDecryptionOptionsJson {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct TokenResponse {
+    #[serde(rename = "access_token")]
     pub access_token: String,
+    #[serde(rename = "expires_in")]
     pub expires_in: u32,
+    #[serde(rename = "token_type")]
     pub token_type: String,
+    #[serde(rename = "refresh_token")]
     pub refresh_token: Option<String>,
     pub key: String, // MasterKeyWrappedUserKey
     pub kdf: u32,
@@ -128,6 +132,7 @@ pub struct CipherSync {
     pub login: Option<LoginSync>,
     pub attachments: Option<Vec<AttachmentSync>>,
     pub ssh_key: Option<SshKeySync>,
+    pub deleted_date: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -157,8 +162,23 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(server_url: &str) -> Self {
         let (api_url, identity_url) = get_endpoints(server_url);
+        use reqwest::header::{HeaderMap, HeaderValue};
+        
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Client-Type", HeaderValue::from_static("web"));
+        headers.insert("X-Client-Version", HeaderValue::from_static("2026.1.0"));
+        headers.insert("Bitwarden-Client-Version", HeaderValue::from_static("2026.1.0"));
+        headers.insert("X-Client-Feature-Flags", HeaderValue::from_static("ssh-key-vault-item,ssh-agent"));
+        headers.insert("Device-Type", HeaderValue::from_static("9"));
+        headers.insert("device-type", HeaderValue::from_static("9"));
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         ApiClient {
-            client: reqwest::Client::new(),
+            client,
             api_url,
             identity_url,
         }
@@ -206,13 +226,13 @@ impl ApiClient {
 
         let mut params = HashMap::new();
         params.insert("grant_type", "password".to_string());
-        params.insert("client_id", "cli".to_string());
+        params.insert("client_id", "web".to_string());
         params.insert("scope", "api offline_access".to_string());
         params.insert("username", email.to_string());
         params.insert("password", login_hash.to_string());
         params.insert("device_identifier", device_id.to_string());
         params.insert("device_name", device_name.to_string());
-        params.insert("device_type", "14".to_string()); // CLI type is 14
+        params.insert("device_type", "9".to_string()); // Chrome Browser type is 9
 
         let response = self
             .client
@@ -252,7 +272,7 @@ impl ApiClient {
         params.insert("scope", "api".to_string());
         params.insert("device_identifier", device_id.to_string());
         params.insert("device_name", device_name.to_string());
-        params.insert("device_type", "14".to_string()); // CLI type is 14
+        params.insert("device_type", "9".to_string()); // Chrome Browser type is 9
 
         let response = self
             .client
@@ -277,7 +297,7 @@ impl ApiClient {
 
     /// Fetches the user's encrypted vault payload
     pub async fn sync(&self, access_token: &str) -> Result<SyncResponse, String> {
-        let url = format!("{}/sync", self.api_url);
+        let url = format!("{}/sync?excludeDomains=true", self.api_url);
 
         let response = self
             .client

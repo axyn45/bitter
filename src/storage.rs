@@ -178,6 +178,10 @@ fn process_cipher(
     mac_key: &[u8; 32],
     ssh_keys: &mut Vec<SshKeyItem>,
 ) -> Result<(), String> {
+    if cipher.deleted_date.is_some() {
+        return Ok(());
+    }
+
     // Decrypt cipher name
     let plain_name = match &cipher.name {
         Some(enc_name) => {

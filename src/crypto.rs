@@ -83,9 +83,7 @@ pub fn derive_login_hash(master_key: &[u8], password: &str) -> String {
 /// Derive the Stretched Master Key (split into 256-bit enc_key and 256-bit mac_key) using HKDF-SHA256
 pub fn derive_stretched_key(master_key: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
     // HKDF Extract is bypassed because Master Key is already high-entropy.
-    // We use a blank salt.
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]);
-    let prk = salt.extract(master_key);
+    let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, master_key);
 
     // Expand for Encryption Key
     let okm_enc = prk

@@ -1,2 +1,3 @@
 vaultwarden
 target/
+.env

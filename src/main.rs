@@ -154,7 +154,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 };
 
                 let login_hash = crypto::derive_login_hash(&master_key, &password);
-                println!("Authenticating with server...");
+                println!("Authenticating with server... ({login_hash})");
 
                 let resp = api_client
                     .login_password(&email, &login_hash, &config.device_id, "sshwarden_client")
@@ -249,9 +249,12 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             storage::save_db(&ssh_keys, &db_key)?;
 
             println!(
-                "Sync completed successfully. Synced {} SSH keys.",
+                "Sync completed successfully. Synced {} SSH keys:",
                 ssh_keys.len()
             );
+            for key in &ssh_keys {
+                println!("  - {}", key.name);
+            }
         }
         Commands::Settings(args) => {
             let mut updated = false;
