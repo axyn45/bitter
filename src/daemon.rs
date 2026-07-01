@@ -300,6 +300,20 @@ async fn run_daemon_loops(
     let timeout = config.parse_timeout_duration().unwrap_or(None);
     let timeout_action = config.timeout_action;
 
+    // If timeout is "never", try to load unencrypted keys automatically
+    if config.timeout.trim().to_lowercase() == "never" {
+        if let Some(raw_keys) = storage::load_unencrypted_db() {
+            let count = raw_keys.len();
+            *keyring.write().await = raw_keys;
+            *keys_context.write().await = Some(KeysContext {
+                enc_key: [0u8; 32],
+                mac_key: [0u8; 32],
+                db_key: [0u8; 32],
+            });
+            info!("Agent started: automatically unlocked and loaded {} keys from unencrypted cache.", count);
+        }
+    }
+
     let shared_timeout = Arc::new(RwLock::new(timeout));
     let shared_timeout_action = Arc::new(RwLock::new(timeout_action));
 
@@ -607,6 +621,16 @@ async fn handle_control_connection(
                     let t = config.parse_timeout_duration().unwrap_or(None);
                     *shared_timeout.write().await = t;
                     *shared_timeout_action.write().await = config.timeout_action;
+
+                    // If timeout is not "never", remove unencrypted DB if it exists
+                    if config.timeout.trim().to_lowercase() != "never" {
+                        if let Some(raw_path) = storage::unencrypted_db_path() {
+                            if raw_path.exists() {
+                                let _ = fs::remove_file(raw_path);
+                            }
+                        }
+                    }
+
                     ControlResponse {
                         status: "ok".to_string(),
                         error: None,
