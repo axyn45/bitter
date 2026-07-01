@@ -269,6 +269,12 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 updated = true;
             }
 
+            if let Some(url) = args.server_url {
+                config.server_url = url.clone();
+                println!("Server URL updated to: {}", url);
+                updated = true;
+            }
+
             if updated {
                 config
                     .save()

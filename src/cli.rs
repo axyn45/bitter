@@ -86,6 +86,10 @@ pub struct SettingsArgs {
     /// Set timeout action: 'lock' (requires master password) or 'logout' (wipes vault)
     #[arg(short = 'a', long)]
     pub timeout_action: Option<String>,
+
+    /// Set custom Bitwarden server URL (e.g. self-hosted Vaultwarden)
+    #[arg(short, long)]
+    pub server_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
