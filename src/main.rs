@@ -56,7 +56,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             let client_id = args.client_id.or_else(|| config.client_id.clone());
             let client_secret = args.client_secret.or_else(|| config.client_secret.clone());
 
-            let token_resp = if let (Some(cid), Some(csec)) = (client_id, client_secret) {
+            let (token_resp, _master_key, (enc_key, mac_key), password, email) = if let (Some(cid), Some(csec)) = (client_id, client_secret) {
                 println!("Logging in using Personal API Key client credentials...");
 
                 let resp = api_client
@@ -67,8 +67,19 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 config.client_id = Some(cid.clone());
                 config.client_secret = Some(csec.clone());
 
+                let email = match args.email.clone().or_else(|| config.email.clone()) {
+                    Some(e) => e,
+                    None => {
+                        print!("Email Address: ");
+                        io::stdout().flush().unwrap();
+                        let mut input = String::new();
+                        io::stdin().read_line(&mut input).map_err(|e| format!("Failed to read email: {}", e))?;
+                        input.trim().to_string()
+                    }
+                };
+
                 // Prompt for master password to verify we can derive the Master Key and decrypt the symmetric key
-                let password = match args.password {
+                let password = match args.password.clone() {
                     Some(pass) => pass,
                     None => rpassword::prompt_password("Master Password (to decrypt vault keys): ")
                         .map_err(|e| format!("Password prompt failed: {}", e))?,
@@ -110,10 +121,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 };
 
                 println!("Decrypting vault symmetric keys...");
-                let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
+                let sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
                 println!("Vault keys decrypted and verified successfully.");
 
-                resp
+                (resp, master_key, sym_keys, password, email)
             } else {
                 // Password Login
                 let email = match args.email.or_else(|| config.email.clone()) {
@@ -172,21 +183,84 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                     .await?;
 
                 println!("Decrypting vault symmetric keys...");
-                let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
+                let sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
                 println!("Vault keys decrypted and verified successfully.");
 
-                config.email = Some(email);
-                resp
+                (resp, master_key, sym_keys, password, email)
             };
 
             // Store token and configurations
             config.server_url = server_url;
-            config.access_token = Some(token_resp.access_token);
+            config.access_token = Some(token_resp.access_token.clone());
+            config.email = Some(email);
             config
                 .save()
                 .map_err(|e| format!("Failed to save configuration: {}", e))?;
 
             println!("Logged in successfully. Session token stored locally.");
+
+            // Automatically perform synchronization
+            println!("Automatically syncing ciphers from server...");
+            match api_client.sync(&token_resp.access_token).await {
+                Ok(sync_data) => {
+                    let salt = config
+                        .cache_salt
+                        .as_ref()
+                        .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                    let db_key = storage::derive_db_key(&password, salt)?;
+
+                    let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+                    if let Err(e) = storage::save_db(&ssh_keys, &db_key) {
+                        eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
+                    } else {
+                        println!("Sync completed. Synced {} SSH keys.", ssh_keys.len());
+                        for key in &ssh_keys {
+                            println!("  - {}", key.name);
+                        }
+
+                        // Automatically unlock active background agent if it is running
+                        if daemon::is_agent_running() {
+                            println!("Agent daemon is running. Automatically unlocking and loading keys...");
+                            let enc_hex = hex::encode(enc_key);
+                            let mac_hex = hex::encode(mac_key);
+                            let db_hex = hex::encode(db_key);
+                            let daemon_keys: Vec<daemon::SshKeyData> = ssh_keys
+                                .into_iter()
+                                .map(|k| daemon::SshKeyData {
+                                    name: k.name,
+                                    private_key: k.private_key,
+                                })
+                                .collect();
+
+                            match daemon::send_control_request(daemon::ControlRequest::Unlock {
+                                keys: daemon_keys,
+                                enc_key: enc_hex,
+                                mac_key: mac_hex,
+                                db_key: db_hex,
+                            })
+                            .await
+                            {
+                                Ok(resp) => {
+                                    if resp.status == "ok" {
+                                        println!(
+                                            "Agent unlocked successfully. Synced {} keys to memory.",
+                                            resp.key_count.unwrap_or(0)
+                                        );
+                                    } else {
+                                        eprintln!("Warning: Failed to unlock agent: {}", resp.error.unwrap_or_default());
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to communicate with running agent to unlock: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Automatic sync failed: {}", e);
+                }
+            }
         }
         Commands::Logout => {
             println!("Logging out...");
@@ -271,6 +345,44 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             );
             for key in &ssh_keys {
                 println!("  - {}", key.name);
+            }
+
+            // Automatically unlock active background agent if it is running
+            if daemon::is_agent_running() {
+                println!("Agent daemon is running. Automatically updating keys in agent memory...");
+                let enc_hex = hex::encode(enc_key);
+                let mac_hex = hex::encode(mac_key);
+                let db_hex = hex::encode(db_key);
+                let daemon_keys: Vec<daemon::SshKeyData> = ssh_keys
+                    .into_iter()
+                    .map(|k| daemon::SshKeyData {
+                        name: k.name,
+                        private_key: k.private_key,
+                    })
+                    .collect();
+
+                match daemon::send_control_request(daemon::ControlRequest::Unlock {
+                    keys: daemon_keys,
+                    enc_key: enc_hex,
+                    mac_key: mac_hex,
+                    db_key: db_hex,
+                })
+                .await
+                {
+                    Ok(resp) => {
+                        if resp.status == "ok" {
+                            println!(
+                                "Agent keys updated successfully. Synced {} keys to memory.",
+                                resp.key_count.unwrap_or(0)
+                            );
+                        } else {
+                            eprintln!("Warning: Failed to update keys in agent: {}", resp.error.unwrap_or_default());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to communicate with running agent to update keys: {}", e);
+                    }
+                }
             }
         }
         Commands::Settings(args) => {
