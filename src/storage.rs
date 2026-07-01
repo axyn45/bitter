@@ -44,6 +44,13 @@ pub fn unencrypted_db_path() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join(RAW_DB_FILE_NAME))
 }
 
+const KEYS_FILE_NAME: &str = "vault.db.keys";
+
+/// Gets the path to the vault.db.keys file (cached keys)
+pub fn keys_path() -> Option<PathBuf> {
+    cache_dir().map(|dir| dir.join(KEYS_FILE_NAME))
+}
+
 /// Derive the local cache encryption key from master password and local salt
 pub fn derive_db_key(password: &str, salt_b64: &str) -> Result<[u8; 32], String> {
     let salt = BASE64_STANDARD
@@ -103,8 +110,69 @@ pub fn load_db(db_key: &[u8; 32]) -> Result<Vec<SshKeyItem>, String> {
     Ok(items)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedKeys {
+    pub enc_key: String,
+    pub mac_key: String,
+    pub db_key: String,
+}
+
+/// Save derived keys to keys cache on disk if timeout is "never"
+pub fn save_keys(enc: &[u8; 32], mac: &[u8; 32], db: &[u8; 32]) -> Result<(), String> {
+    if let Some(path) = keys_path() {
+        let saved = SavedKeys {
+            enc_key: hex::encode(enc),
+            mac_key: hex::encode(mac),
+            db_key: hex::encode(db),
+        };
+        let content = serde_json::to_string_pretty(&saved)
+            .map_err(|e| format!("Failed to serialize keys: {}", e))?;
+        fs::write(&path, content)
+            .map_err(|e| format!("Failed to write keys file: {}", e))?;
+        
+        let file = File::open(&path)
+            .map_err(|e| format!("Failed to open keys file to set permissions: {}", e))?;
+        let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)
+            .map_err(|e| format!("Failed to set permissions on keys file: {}", e))?;
+    }
+    Ok(())
+}
+
+/// Load saved keys from disk
+pub fn load_saved_keys() -> Option<([u8; 32], [u8; 32], [u8; 32])> {
+    let path = keys_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&path).ok()?;
+    let saved: SavedKeys = serde_json::from_str(&content).ok()?;
+    
+    let enc_vec = hex::decode(&saved.enc_key).ok()?;
+    let mac_vec = hex::decode(&saved.mac_key).ok()?;
+    let db_vec = hex::decode(&saved.db_key).ok()?;
+    
+    if enc_vec.len() == 32 && mac_vec.len() == 32 && db_vec.len() == 32 {
+        let mut enc = [0u8; 32];
+        let mut mac = [0u8; 32];
+        let mut db = [0u8; 32];
+        enc.copy_from_slice(&enc_vec);
+        mac.copy_from_slice(&mac_vec);
+        db.copy_from_slice(&db_vec);
+        Some((enc, mac, db))
+    } else {
+        None
+    }
+}
+
 /// Encrypt and save the local cache database to disk with 0600 permissions
-pub fn save_db(items: &[SshKeyItem], db_key: &[u8; 32]) -> Result<(), String> {
+pub fn save_db(
+    items: &[SshKeyItem],
+    db_key: &[u8; 32],
+    enc_key: Option<&[u8; 32]>,
+    mac_key: Option<&[u8; 32]>,
+) -> Result<(), String> {
     let path = db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
 
     // Ensure parent cache directory exists
@@ -161,10 +229,20 @@ pub fn save_db(items: &[SshKeyItem], db_key: &[u8; 32]) -> Result<(), String> {
                 file.set_permissions(perms)
                     .map_err(|e| format!("Failed to set permissions on unencrypted cache: {}", e))?;
             }
+
+            // Save encryption keys if provided
+            if let (Some(enc), Some(mac)) = (enc_key, mac_key) {
+                let _ = save_keys(enc, mac, db_key);
+            }
         } else {
             if let Some(raw_path) = unencrypted_db_path() {
                 if raw_path.exists() {
                     let _ = fs::remove_file(raw_path);
+                }
+            }
+            if let Some(k_path) = keys_path() {
+                if k_path.exists() {
+                    let _ = fs::remove_file(k_path);
                 }
             }
         }
@@ -184,6 +262,12 @@ pub fn wipe_db() -> Result<(), String> {
         if raw_path.exists() {
             fs::remove_file(&raw_path)
                 .map_err(|e| format!("Failed to delete unencrypted cache database file: {}", e))?;
+        }
+    }
+    if let Some(k_path) = keys_path() {
+        if k_path.exists() {
+            fs::remove_file(&k_path)
+                .map_err(|e| format!("Failed to delete keys cache file: {}", e))?;
         }
     }
     Ok(())

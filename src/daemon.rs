@@ -302,15 +302,28 @@ async fn run_daemon_loops(
     let timeout = config.parse_timeout_duration().unwrap_or(None);
     let timeout_action = config.timeout_action;
 
-    // If timeout is "never", try to load unencrypted keys automatically
+    // If timeout is "never", try to load unencrypted keys and decryption keys automatically
     if config.timeout.trim().to_lowercase() == "never" {
         if let Some(raw_keys) = storage::load_unencrypted_db() {
             let count = raw_keys.len();
             *keyring.write().await = raw_keys;
+
+            let mut enc_bytes = [0u8; 32];
+            let mut mac_bytes = [0u8; 32];
+            let mut db_bytes = [0u8; 32];
+            if let Some((enc, mac, db)) = storage::load_saved_keys() {
+                enc_bytes = enc;
+                mac_bytes = mac;
+                db_bytes = db;
+                info!("Agent started: loaded decryption keys from secure cache.");
+            } else {
+                info!("Agent started: decryption keys missing, running in read-only cache mode until unlocked.");
+            }
+
             *keys_context.write().await = Some(KeysContext {
-                enc_key: [0u8; 32],
-                mac_key: [0u8; 32],
-                db_key: [0u8; 32],
+                enc_key: enc_bytes,
+                mac_key: mac_bytes,
+                db_key: db_bytes,
             });
             info!("Agent started: automatically unlocked and loaded {} keys from unencrypted cache.", count);
         }
@@ -624,11 +637,16 @@ async fn handle_control_connection(
                     *shared_timeout.write().await = t;
                     *shared_timeout_action.write().await = config.timeout_action;
 
-                    // If timeout is not "never", remove unencrypted DB if it exists
+                    // If timeout is not "never", remove unencrypted DB and keys if they exist
                     if config.timeout.trim().to_lowercase() != "never" {
                         if let Some(raw_path) = storage::unencrypted_db_path() {
                             if raw_path.exists() {
                                 let _ = fs::remove_file(raw_path);
+                            }
+                        }
+                        if let Some(keys_path) = storage::keys_path() {
+                            if keys_path.exists() {
+                                let _ = fs::remove_file(keys_path);
                             }
                         }
                     }
@@ -683,7 +701,7 @@ async fn handle_control_connection(
                                         let count = parsed_keys.len();
                                         *keyring.write().await = parsed_keys;
 
-                                        if let Err(err) = storage::save_db(&new_items, &ctx.db_key) {
+                                        if let Err(err) = storage::save_db(&new_items, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
                                             ControlResponse {
                                                 status: "error".to_string(),
                                                 error: Some(format!("Failed to save cache database: {}", err)),
@@ -811,7 +829,7 @@ async fn handle_surgical_cipher_update(
     }
 
     // Save updated items back to database cache
-    storage::save_db(&updated_items, &ctx.db_key)?;
+    storage::save_db(&updated_items, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key))?;
 
     // Reload keyring memory
     let mut parsed_keys = Vec::new();
@@ -971,6 +989,8 @@ async fn run_websocket_sync_loop(
                                                     if let Err(err) = storage::save_db(
                                                         &new_items,
                                                         &ctx.db_key,
+                                                        Some(&ctx.enc_key),
+                                                        Some(&ctx.mac_key),
                                                     ) {
                                                         error!(
                                                             "WebSocket background sync failed to save db: {}",
@@ -1084,7 +1104,7 @@ async fn run_websocket_sync_loop(
                                                                     }
                                                                     let count = parsed_keys.len();
                                                                     *keyring.write().await = parsed_keys;
-                                                                    if let Err(err) = storage::save_db(&new_items, &ctx.db_key) {
+                                                                    if let Err(err) = storage::save_db(&new_items, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
                                                                         error!("WebSocket background sync failed to save db: {}", err);
                                                                     } else {
                                                                         info!("WebSocket (binary): Background sync completed. Synced and reloaded {} keys.", count);

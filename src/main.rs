@@ -210,7 +210,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                     let db_key = storage::derive_db_key(&password, salt)?;
 
                     let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
-                    if let Err(e) = storage::save_db(&ssh_keys, &db_key) {
+                    if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
                         eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
                     } else {
                         println!("Sync completed. Synced {} SSH keys.", ssh_keys.len());
@@ -358,7 +358,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
 
             println!("Saving encrypted cache to disk...");
-            storage::save_db(&ssh_keys, &db_key)?;
+            storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key))?;
 
             println!(
                 "Sync completed successfully. Synced {} SSH keys:",
@@ -430,6 +430,8 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                         let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
                         let mut verified = false;
                         let mut loaded_keys = Vec::new();
+                        let mut enc_opt = None;
+                        let mut mac_opt = None;
 
                         if path.exists() {
                             if let Ok(keys) = storage::load_db(&db_key) {
@@ -463,6 +465,8 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                                                 Ok((enc_key, mac_key)) => {
                                                     verified = true;
                                                     loaded_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+                                                    enc_opt = Some(enc_key);
+                                                    mac_opt = Some(mac_key);
                                                 }
                                                 Err(_) => {}
                                             }
@@ -489,7 +493,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                         
                         if !loaded_keys.is_empty() {
                             println!("Generating unencrypted cache database...");
-                            if let Err(e) = storage::save_db(&loaded_keys, &db_key) {
+                            if let Err(e) = storage::save_db(&loaded_keys, &db_key, enc_opt.as_ref(), mac_opt.as_ref()) {
                                 eprintln!("Warning: Failed to generate unencrypted cache: {}", e);
                             }
                         }
@@ -640,7 +644,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                                         Ok((enc_key, mac_key)) => {
                                             let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
                                             println!("Sync successful. Saving encrypted cache to disk...");
-                                            if let Err(e) = storage::save_db(&ssh_keys, &db_key) {
+                                            if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
                                                 eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
                                             }
                                             enc_hex = hex::encode(enc_key);
