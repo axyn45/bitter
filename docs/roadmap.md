@@ -64,14 +64,14 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
   - [x] Securely prompt for master password, derive master key, and restore daemon to active state
 
 ## Phase 6: WebSocket Live Sync
-- [ ] Implement SignalR Negotiation Endpoint `/notifications/hub/negotiate`
-- [ ] Implement WebSocket client event listener (`tokio-tungstenite`)
-  - [ ] Connect to `wss://<server>/notifications/hub` with authorization token
-  - [ ] Parse SignalR framing protocol (JSON text messages ending in `0x1E` separator)
-- [ ] Implement Event Handlers
-  - [ ] On `SyncVault` event: Trigger full `/sync` run
-  - [ ] On `SyncCipherCreate` / `SyncCipherUpdate` event: Target fetch cipher ID from server API, decrypt, parse, and merge into local cache
-  - [ ] On `SyncCipherDelete` event: Remove cipher ID from local cache
+- [x] Implement SignalR Negotiation Endpoint `/notifications/hub/negotiate`
+- [x] Implement WebSocket client event listener (`tokio-tungstenite`)
+  - [x] Connect to `wss://<server>/notifications/hub` with authorization token
+  - [x] Parse SignalR framing protocol (JSON text messages ending in `0x1E` separator)
+- [x] Implement Event Handlers
+  - [x] On `SyncVault` event: Trigger full `/sync` run
+  - [x] On `SyncCipherCreate` / `SyncCipherUpdate` event: Sync vault and merge decrypted SSH keys into keyring and cache database
+  - [x] On `SyncCipherDelete` / `SyncLoginDelete` event: Sync vault and update keyring and cache database
 
 ## Phase 7: Testing & Packaging
 - [ ] Write unit tests for Bitwarden cryptography derivation and cipher decryption
