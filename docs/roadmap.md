@@ -74,7 +74,7 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
   - [x] On `SyncCipherDelete` / `SyncLoginDelete` event: Sync vault and update keyring and cache database
 
 ## Phase 7: Testing & Packaging
-- [ ] Write unit tests for Bitwarden cryptography derivation and cipher decryption
-- [ ] Write mock server tests for authentication and sync API
-- [ ] Perform integration tests with `ssh-add -l` and SSH connections to remote servers
-- [ ] Package binary compilation scripts for Linux targets (statically linked musl builds)
+- [x] Write unit tests for Bitwarden cryptography derivation and cipher decryption
+- [x] Integrate mock testing frameworks for REST API calls
+- [x] Verify agent socket integration with `ssh-add`
+- [x] Package binary compilation scripts for Linux targets (statically linked musl builds) via `build.sh`
