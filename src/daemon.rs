@@ -638,16 +638,13 @@ async fn run_websocket_sync_loop(
         .ok_or_else(|| "No session token in configuration".to_string())?;
 
     let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
-
     let client = ApiClient::new(&config.server_url);
-    let negotiate_resp = client.negotiate(token, &notifications_url).await?;
 
-    let conn_token = negotiate_resp
-        .connection_token
-        .or(negotiate_resp.connection_id)
-        .ok_or_else(|| "Negotiate response missing connection token".to_string())?;
-
-    let mut ws_url = format!("{}/notifications/hub?id={}", notifications_url, conn_token);
+    let mut ws_url = format!(
+        "{}/notifications/hub?access_token={}",
+        notifications_url.trim_end_matches('/'),
+        token
+    );
     if ws_url.starts_with("https://") {
         ws_url = ws_url.replace("https://", "wss://");
     } else if ws_url.starts_with("http://") {
