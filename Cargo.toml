@@ -13,6 +13,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 directories = "6.0.0"
 reqwest = { version = "0.13.4", features = ["json"] }
 ring = "0.17.14"
+rpassword = "7.5.4"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
