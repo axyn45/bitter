@@ -15,6 +15,17 @@ use std::str::FromStr;
 
 #[tokio::main]
 async fn main() {
+    let max_level = if std::env::var("RUST_LOG").unwrap_or_default().to_lowercase() == "debug" {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    };
+
+    tracing_subscriber::fmt()
+        .with_max_level(max_level)
+        .with_target(false)
+        .init();
+
     let cli = Cli::parse();
 
     let mut config = match Config::load() {

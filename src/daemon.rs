@@ -13,6 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{debug, error, info};
 
 use crate::agent;
 use crate::api::ApiClient;
@@ -80,8 +81,8 @@ pub async fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) 
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&control_socket_path);
 
-    println!("Starting sshwarden agent...");
-    println!("SSH_AUTH_SOCK={}", socket_path.display());
+    info!("Starting sshwarden agent...");
+    info!("SSH_AUTH_SOCK={}", socket_path.display());
 
     if foreground {
         let pid = std::process::id();
@@ -89,7 +90,7 @@ pub async fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) 
             .map_err(|e| format!("Failed to write pid file: {}", e))?;
 
         if let Err(e) = run_daemon_loops(socket_path, control_socket_path, pid_path).await {
-            eprintln!("Agent error: {}", e);
+            error!("Agent error: {}", e);
         }
         Ok(())
     } else {
@@ -107,7 +108,7 @@ pub async fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) 
                     if let Err(e) =
                         run_daemon_loops(socket_path, control_socket_path, pid_path).await
                     {
-                        eprintln!("Daemon error: {}", e);
+                        error!("Daemon error: {}", e);
                     }
                 });
                 std::process::exit(0);
@@ -138,7 +139,7 @@ pub fn stop_agent() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("Invalid pid format: {}", e))?;
 
-    println!("Stopping agent with PID {}...", pid);
+    info!("Stopping agent with PID {}...", pid);
 
     // Send SIGTERM
     unsafe {
@@ -151,7 +152,7 @@ pub fn stop_agent() -> Result<(), String> {
     // Wait up to 5 seconds for shutdown and cleanup
     for _ in 0..50 {
         if !pid_path.exists() {
-            println!("Agent stopped successfully.");
+            info!("Agent stopped successfully.");
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -171,8 +172,8 @@ pub async fn print_status() -> Result<(), String> {
     let control_socket_path = cache_dir.join("ssh-agent.sock.control");
 
     if is_agent_running() {
-        println!("sshwarden agent: running");
-        println!("SSH_AUTH_SOCK:   {}", socket_path.display());
+        info!("sshwarden agent: running");
+        info!("SSH_AUTH_SOCK:   {}", socket_path.display());
 
         // Connect to control socket to fetch key statistics
         match query_agent_status(&control_socket_path).await {
@@ -182,15 +183,15 @@ pub async fn print_status() -> Result<(), String> {
                 } else {
                     "Locked"
                 };
-                println!("Vault Status:    {}", status_str);
-                println!("Keys Loaded:     {}", resp.key_count.unwrap_or(0));
+                info!("Vault Status:    {}", status_str);
+                info!("Keys Loaded:     {}", resp.key_count.unwrap_or(0));
             }
             Err(e) => {
-                println!("Vault Status:    Error contacting control socket ({})", e);
+                info!("Vault Status:    Error contacting control socket ({})", e);
             }
         }
     } else {
-        println!("sshwarden agent: stopped");
+        info!("sshwarden agent: stopped");
     }
     Ok(())
 }
@@ -329,12 +330,12 @@ async fn run_daemon_loops(
                 let last_act = *la.read().await;
                 if !kr.read().await.is_empty() && last_act.elapsed() >= timeout_dur {
                     let action = *sta.read().await;
-                    eprintln!("Session timeout reached. Triggering action: {:?}", action);
+                    info!("Session timeout reached. Triggering action: {:?}", action);
                     match action {
                         crate::config::TimeoutAction::Lock => {
                             kr.write().await.clear();
                             *kc.write().await = None;
-                            eprintln!("Agent locked due to inactivity.");
+                            info!("Agent locked due to inactivity.");
                         }
                         crate::config::TimeoutAction::Logout => {
                             kr.write().await.clear();
@@ -344,7 +345,7 @@ async fn run_daemon_loops(
                                 config.access_token = None;
                                 let _ = config.save();
                             }
-                            eprintln!("Logged out due to inactivity.");
+                            info!("Logged out due to inactivity.");
                         }
                     }
                 }
@@ -366,7 +367,7 @@ async fn run_daemon_loops(
             }
 
             if let Err(e) = run_websocket_sync_loop(kc_ws.clone(), kr_ws.clone()).await {
-                eprintln!(
+                error!(
                     "WebSocket live sync loop error: {}. Reconnecting in {} seconds...",
                     e, backoff
                 );
@@ -378,7 +379,7 @@ async fn run_daemon_loops(
         }
     });
 
-    println!("Listeners bound successfully. Running daemon listeners.");
+    info!("Listeners bound successfully. Running daemon listeners.");
 
     loop {
         tokio::select! {
@@ -395,7 +396,7 @@ async fn run_daemon_loops(
                 let la = last_activity.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_ssh_agent_connection(stream, kr, la).await {
-                        eprintln!("SSH Agent connection error: {}", e);
+                        error!("SSH Agent connection error: {}", e);
                     }
                 });
             }
@@ -408,7 +409,7 @@ async fn run_daemon_loops(
                 let kc = keys_context.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_control_connection(stream, kr, la, st, sta, kc).await {
-                        eprintln!("Control connection error: {}", e);
+                        error!("Control connection error: {}", e);
                     }
                 });
             }
@@ -449,7 +450,7 @@ async fn handle_ssh_agent_connection(
         let response = match agent::handle_agent_request(&payload, &keys) {
             Ok(resp) => resp,
             Err(e) => {
-                eprintln!("Error handling agent request: {}", e);
+                error!("Error handling agent request: {}", e);
                 // Fail message type 5
                 vec![5]
             }
@@ -651,12 +652,12 @@ async fn run_websocket_sync_loop(
         ws_url = ws_url.replace("http://", "ws://");
     }
 
-    println!("WebSocket: Connecting to {}", ws_url);
+    info!("WebSocket: Connecting to {}", ws_url);
     let (mut ws_stream, _) = connect_async(&ws_url)
         .await
         .map_err(|e| format!("WebSocket connection failed: {}", e))?;
 
-    println!("WebSocket: Connected. Sending handshake...");
+    info!("WebSocket: Connected. Sending handshake...");
     let handshake = "{\"protocol\":\"json\",\"version\":1}\u{1E}";
     ws_stream
         .send(Message::Text(handshake.to_string().into()))
@@ -665,15 +666,17 @@ async fn run_websocket_sync_loop(
 
     while let Some(msg_res) = ws_stream.next().await {
         let msg = msg_res.map_err(|e| format!("WebSocket read error: {}", e))?;
+        debug!("WebSocket received frame: {:?}", msg);
 
         if keys_context.read().await.is_none() {
-            println!("WebSocket: Agent locked. Closing connection...");
+            info!("WebSocket: Agent locked. Closing connection...");
             let _ = ws_stream.close(None).await;
             break;
         }
 
         match msg {
             Message::Text(text) => {
+                debug!("WebSocket text payload: {}", text);
                 for part in text.split('\u{1E}') {
                     if part.is_empty() {
                         continue;
@@ -681,6 +684,7 @@ async fn run_websocket_sync_loop(
 
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(part) {
                         if val.get("type").and_then(|t| t.as_i64()) == Some(6) {
+                            debug!("WebSocket received Ping (type 6).");
                             continue;
                         }
 
@@ -691,7 +695,7 @@ async fn run_websocket_sync_loop(
                             for arg in args {
                                 let update_type = arg.get("Type").and_then(|t| t.as_i64());
                                 if let Some(ut) = update_type.filter(|&ut| ut == 0 || ut == 1 || ut == 4 || ut == 5) {
-                                    println!(
+                                    info!(
                                         "WebSocket: Received vault update event (Type {}). Syncing...",
                                         ut
                                     );
@@ -727,12 +731,12 @@ async fn run_websocket_sync_loop(
                                                     &new_items,
                                                     &ctx.db_key,
                                                 ) {
-                                                    eprintln!(
+                                                    error!(
                                                         "WebSocket background sync failed to save db: {}",
                                                         err
                                                     );
                                                 } else {
-                                                    println!(
+                                                    info!(
                                                         "WebSocket: Background sync completed. Synced and reloaded {} keys.",
                                                         count
                                                     );
@@ -740,7 +744,7 @@ async fn run_websocket_sync_loop(
                                             }
                                         }
                                         Err(err) => {
-                                            eprintln!(
+                                            error!(
                                                 "WebSocket background sync failed: {}",
                                                 err
                                             );
@@ -756,7 +760,7 @@ async fn run_websocket_sync_loop(
                 let _ = ws_stream.send(Message::Pong(ping)).await;
             }
             Message::Close(_) => {
-                println!("WebSocket: Connection closed by server.");
+                info!("WebSocket: Connection closed by server.");
                 break;
             }
             _ => {}
