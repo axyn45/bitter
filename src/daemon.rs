@@ -655,48 +655,57 @@ async fn handle_control_connection(
                     if let Some(token) = config.access_token.as_ref() {
                         let ctx_opt = keys_context.read().await;
                         if let Some(ref ctx) = *ctx_opt {
-                            let client = ApiClient::new(&config.server_url);
-                            match client.sync(token).await {
-                                Ok(sync_data) => {
-                                    let new_items = storage::parse_and_extract_ssh_keys(
-                                        &sync_data,
-                                        &ctx.enc_key,
-                                        &ctx.mac_key,
-                                    );
-
-                                    let mut parsed_keys = Vec::new();
-                                    for item in &new_items {
-                                        if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
-                                            pkey.set_comment(&item.name);
-                                            parsed_keys.push(pkey);
-                                        }
-                                    }
-
-                                    let count = parsed_keys.len();
-                                    *keyring.write().await = parsed_keys;
-
-                                    if let Err(err) = storage::save_db(&new_items, &ctx.db_key) {
-                                        ControlResponse {
-                                            status: "error".to_string(),
-                                            error: Some(format!("Failed to save cache database: {}", err)),
-                                            unlocked: Some(true),
-                                            key_count: Some(count),
-                                        }
-                                    } else {
-                                        ControlResponse {
-                                            status: "ok".to_string(),
-                                            error: None,
-                                            unlocked: Some(true),
-                                            key_count: Some(count),
-                                        }
-                                    }
-                                }
-                                Err(e) => ControlResponse {
+                            if ctx.enc_key == [0u8; 32] {
+                                ControlResponse {
                                     status: "error".to_string(),
-                                    error: Some(format!("Server sync request failed: {}", e)),
+                                    error: Some("Decryption keys missing (agent was auto-unlocked from cache)".to_string()),
                                     unlocked: Some(true),
                                     key_count: Some(keyring.read().await.len()),
-                                },
+                                }
+                            } else {
+                                let client = ApiClient::new(&config.server_url);
+                                match client.sync(token).await {
+                                    Ok(sync_data) => {
+                                        let new_items = storage::parse_and_extract_ssh_keys(
+                                            &sync_data,
+                                            &ctx.enc_key,
+                                            &ctx.mac_key,
+                                        );
+
+                                        let mut parsed_keys = Vec::new();
+                                        for item in &new_items {
+                                            if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
+                                                pkey.set_comment(&item.name);
+                                                parsed_keys.push(pkey);
+                                            }
+                                        }
+
+                                        let count = parsed_keys.len();
+                                        *keyring.write().await = parsed_keys;
+
+                                        if let Err(err) = storage::save_db(&new_items, &ctx.db_key) {
+                                            ControlResponse {
+                                                status: "error".to_string(),
+                                                error: Some(format!("Failed to save cache database: {}", err)),
+                                                unlocked: Some(true),
+                                                key_count: Some(count),
+                                            }
+                                        } else {
+                                            ControlResponse {
+                                                status: "ok".to_string(),
+                                                error: None,
+                                                unlocked: Some(true),
+                                                key_count: Some(count),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => ControlResponse {
+                                        status: "error".to_string(),
+                                        error: Some(format!("Server sync request failed: {}", e)),
+                                        unlocked: Some(true),
+                                        key_count: Some(keyring.read().await.len()),
+                                    },
+                                }
                             }
                         } else {
                             ControlResponse {
@@ -742,7 +751,9 @@ async fn handle_surgical_cipher_update(
         Some(c) => c,
         None => return Err("Agent locked".to_string()),
     };
-
+    if ctx.enc_key == [0u8; 32] {
+        return Err("Decryption keys missing (agent was auto-unlocked from cache)".to_string());
+    }
     // Load existing items from cache database
     let existing_items = storage::load_db(&ctx.db_key).unwrap_or_default();
     let mut updated_items = existing_items;
@@ -930,6 +941,10 @@ async fn run_websocket_sync_loop(
                                             Ok(sync_data) => {
                                                 let ctx_opt = keys_context.read().await;
                                                 if let Some(ref ctx) = *ctx_opt {
+                                                    if ctx.enc_key == [0u8; 32] {
+                                                        info!("WebSocket: Agent was auto-unlocked from cache; skipping real-time full sync decryption since decryption keys are missing.");
+                                                        continue;
+                                                    }
                                                     let new_items =
                                                         storage::parse_and_extract_ssh_keys(
                                                             &sync_data,
@@ -1051,6 +1066,10 @@ async fn run_websocket_sync_loop(
                                                             Ok(sync_data) => {
                                                                 let ctx_opt = keys_context.read().await;
                                                                 if let Some(ref ctx) = *ctx_opt {
+                                                                    if ctx.enc_key == [0u8; 32] {
+                                                                        info!("WebSocket: Agent was auto-unlocked from cache; skipping real-time full sync decryption since decryption keys are missing.");
+                                                                        continue;
+                                                                    }
                                                                     let new_items = storage::parse_and_extract_ssh_keys(
                                                                         &sync_data,
                                                                         &ctx.enc_key,
