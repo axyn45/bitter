@@ -38,17 +38,17 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
   - [-] `sshwarden keys add / edit / delete`: Modifying keys (Placeholder, deferred for post-agent implementation)
 
 ## Phase 4: SSH Agent Protocol & Unix Socket
-- [ ] Implement SSH Agent Protocol parser (`agent` module)
-  - [ ] Read and parse SSH agent request frames
-  - [ ] Implement SSH2_AGENTC_REQUEST_IDENTITIES (list available public keys)
-  - [ ] Implement SSH2_AGENTC_SIGN_REQUEST (sign challenge data using private keys)
-- [ ] Create Unix Domain Socket Server
-  - [ ] Handle concurrent incoming connections using Tokio async socket listener
-- [ ] Implement signing operations for standard SSH keys
-  - [ ] RSA, Ed25519, and ECDSA signature algorithms
-- [ ] Implement daemonization (`daemonize` crate)
-  - [ ] Launch `sshwarden daemon` to spin off the background agent process
-  - [ ] Auto-generate and clean up Unix socket file
+- [x] Implement SSH Agent Protocol parser (`agent` module)
+  - [x] Read and parse SSH agent request frames
+  - [x] Implement SSH2_AGENTC_REQUEST_IDENTITIES (list available public keys)
+  - [x] Implement SSH2_AGENTC_SIGN_REQUEST (sign challenge data using private keys)
+- [x] Create Unix Domain Socket Server
+  - [x] Handle concurrent incoming connections using Tokio async socket listener
+- [x] Implement signing operations for standard SSH keys
+  - [x] RSA, Ed25519, and ECDSA signature algorithms
+- [x] Implement daemonization (`daemonize` crate)
+  - [x] Launch `sshwarden agent start` to spin off the background agent process
+  - [x] Auto-generate and clean up Unix socket file
 
 ## Phase 5: Session Timeout & Memory Hardening
 - [ ] Implement memory protection rules
