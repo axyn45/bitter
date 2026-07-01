@@ -429,14 +429,16 @@ async fn handle_ssh_agent_connection(
     keyring: KeyRing,
     last_activity: Arc<RwLock<Instant>>,
 ) -> Result<(), std::io::Error> {
+    debug!("New SSH Agent connection accepted.");
     loop {
         // Read 4-byte length prefix
         let mut len_bytes = [0u8; 4];
         if stream.read_exact(&mut len_bytes).await.is_err() {
-            // Connection closed by client
+            debug!("SSH Agent connection closed by client.");
             return Ok(());
         }
         let len = u32::from_be_bytes(len_bytes) as usize;
+        debug!("Received SSH Agent request length: {} bytes.", len);
 
         // Read message payload
         let mut payload = vec![0u8; len];
@@ -458,6 +460,7 @@ async fn handle_ssh_agent_connection(
 
         // Write response length prefix
         let resp_len = response.len() as u32;
+        debug!("Sending SSH Agent response length: {} bytes.", resp_len);
         stream.write_all(&resp_len.to_be_bytes()).await?;
         // Write response payload
         stream.write_all(&response).await?;

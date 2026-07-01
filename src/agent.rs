@@ -1,5 +1,6 @@
 use ssh_encoding::Encode;
 use ssh_key::private::PrivateKey;
+use tracing::{debug, warn};
 
 struct Reader<'a> {
     data: &'a [u8],
@@ -88,9 +89,11 @@ const _SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
 pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<Vec<u8>, String> {
     let mut reader = Reader::new(request_data);
     let msg_type = reader.read_u8()?;
+    debug!("SSH Agent request received, type: {}", msg_type);
 
     match msg_type {
         SSH2_AGENTC_REQUEST_IDENTITIES => {
+            debug!("SSH Agent requested identities. Returning {} keys.", keys.len());
             let mut writer = Writer::new();
             writer.write_u8(SSH2_AGENT_IDENTITIES_ANSWER);
             writer.write_u32(keys.len() as u32);
@@ -110,6 +113,7 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
             let pubkey_blob = reader.read_string()?;
             let data_to_sign = reader.read_string()?;
             let _flags = reader.read_u32()?;
+            debug!("SSH Agent signature request received. Looking for matching public key...");
 
             // Find matching key
             let mut matching_key = None;
@@ -125,19 +129,22 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
             }
 
             let key = match matching_key {
-                Some(k) => k,
+                Some(k) => {
+                    debug!("Found matching key: '{}'", k.comment());
+                    k
+                }
                 None => {
+                    warn!("No matching key found in keyring for signature request.");
                     let mut writer = Writer::new();
                     writer.write_u8(SSH_AGENT_FAILURE);
                     return Ok(writer.into_bytes());
                 }
             };
 
-
-
             use signature::Signer;
 
             // Perform signature
+            debug!("Signing raw SSH agent challenge ({} bytes)...", data_to_sign.len());
             let signature = key
                 .try_sign(data_to_sign)
                 .map_err(|e| format!("Signing failed: {}", e))?;
@@ -147,6 +154,7 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
             signature
                 .encode(&mut sig_bytes)
                 .map_err(|e| format!("Failed to serialize signature: {}", e))?;
+            debug!("Signature generated successfully ({} bytes).", sig_bytes.len());
 
             let mut writer = Writer::new();
             writer.write_u8(SSH2_AGENT_SIGN_RESPONSE);
@@ -156,6 +164,7 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
         }
         _ => {
             // Return failure for unsupported messages
+            warn!("Unsupported SSH Agent request code: {}", msg_type);
             let mut writer = Writer::new();
             writer.write_u8(SSH_AGENT_FAILURE);
             Ok(writer.into_bytes())
