@@ -283,27 +283,6 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             println!("Logged out successfully. Configuration, session, and local cache cleared.");
         }
         Commands::Sync => {
-            // Check if daemon is running and unlocked to perform passwordless sync
-            if daemon::is_agent_running() {
-                println!("Requesting running agent daemon to perform sync...");
-                match daemon::send_control_request(daemon::ControlRequest::Sync).await {
-                    Ok(resp) => {
-                        if resp.status == "ok" {
-                            println!(
-                                "Sync completed successfully via agent daemon. Synced {} SSH keys.",
-                                resp.key_count.unwrap_or(0)
-                            );
-                            return Ok(());
-                        } else {
-                            println!("Agent daemon could not sync: {}. Falling back to password-based sync...", resp.error.unwrap_or_default());
-                        }
-                    }
-                    Err(e) => {
-                        println!("Could not communicate with agent daemon: {}. Falling back to password-based sync...", e);
-                    }
-                }
-            }
-
             let token = config
                 .access_token
                 .as_ref()
@@ -312,52 +291,66 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             let api_client = ApiClient::new(&config.server_url);
             println!("Syncing ciphers from server {}...", config.server_url);
 
-            let password = rpassword::prompt_password("Master Password (to decrypt vault keys): ")
-                .map_err(|e| format!("Password prompt failed: {}", e))?;
-
-            let email = config.email.as_ref().ok_or_else(|| {
-                "Email address missing from config. Please log in again.".to_string()
-            })?;
-
-            println!("Fetching KDF settings...");
-            let prelogin = api_client.prelogin(email).await?;
-
-            println!("Deriving keys...");
-            let master_key = match prelogin.kdf {
-                0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations)?,
-                1 => {
-                    let mem = prelogin
-                        .kdf_memory
-                        .ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
-                    let para = prelogin
-                        .kdf_parallelism
-                        .ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
-                    crypto::derive_master_key_argon2(
-                        &password,
-                        email,
-                        prelogin.kdf_iterations,
-                        mem,
-                        para,
-                    )?
-                }
-                t => return Err(format!("Unsupported KDF type: {}", t)),
-            };
-
-            let salt = config
-                .cache_salt
-                .as_ref()
-                .ok_or_else(|| "Local database salt missing from config.".to_string())?;
-            let db_key = storage::derive_db_key(&password, salt)?;
-
             let sync_data = api_client.sync(token).await?;
 
-            let (enc_key, mac_key) =
-                crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key)?;
+            let mut cached_keys = None;
+            if config.timeout.trim().to_lowercase() == "never" {
+                if let Some((enc, mac, db)) = storage::load_saved_keys() {
+                    println!("Using cached decryption keys for passwordless sync...");
+                    cached_keys = Some((enc, mac, db));
+                }
+            }
+
+            let (enc_key, mac_key, db_key) = match cached_keys {
+                Some(keys) => keys,
+                None => {
+                    let password = rpassword::prompt_password("Master Password (to decrypt vault keys): ")
+                        .map_err(|e| format!("Password prompt failed: {}", e))?;
+
+                    let email = config.email.as_ref().ok_or_else(|| {
+                        "Email address missing from config. Please log in again.".to_string()
+                    })?;
+
+                    println!("Fetching KDF settings...");
+                    let prelogin = api_client.prelogin(email).await?;
+
+                    println!("Deriving keys...");
+                    let master_key = match prelogin.kdf {
+                        0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations)?,
+                        1 => {
+                            let mem = prelogin
+                                .kdf_memory
+                                .ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
+                            let para = prelogin
+                                .kdf_parallelism
+                                .ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
+                            crypto::derive_master_key_argon2(
+                                &password,
+                                email,
+                                prelogin.kdf_iterations,
+                                mem,
+                                para,
+                            )?
+                        }
+                        t => return Err(format!("Unsupported KDF type: {}", t)),
+                    };
+
+                    let salt = config
+                        .cache_salt
+                        .as_ref()
+                        .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                    let db_key = storage::derive_db_key(&password, salt)?;
+
+                    let (enc, mac) =
+                        crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key)?;
+                    (enc, mac, db_key)
+                }
+            };
 
             println!("Decrypting and filtering SSH keys...");
             let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
 
-            println!("Saving encrypted cache to disk...");
+            println!("Saving cache to disk...");
             storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key))?;
 
             println!(
