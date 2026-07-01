@@ -51,18 +51,17 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
   - [x] Auto-generate and clean up Unix socket file
 
 ## Phase 5: Session Timeout & Memory Hardening
-- [ ] Implement memory protection rules
-  - [ ] Clear sensitive data from memory using `zeroize` and `secrecy`
-- [ ] Integrate Linux Kernel Keyring (`keyctl`)
-  - [ ] Store decrypted master password/key securely in kernel keyring space
-- [ ] Implement Background Timeout Monitor Thread
-  - [ ] Tracks idle time since last SSH signature request or interaction
-  - [ ] Supports timeout values: immediately, 1m, 5m, 15m, 30m, 1h, 4h, on logout, never, custom
-- [ ] Implement Timeout Actions
-  - [ ] **Lock**: Wipe decrypted keys from memory (kernel keyring), requires `sshwarden unlock` (master password) to restore
-  - [ ] **Logout**: Wipe decrypted keys, delete local encrypted cache database, clear authentication tokens
-- [ ] Implement `sshwarden unlock` subcommand
-  - [ ] Securely prompt for master password, derive master key, and restore daemon to active state
+- [x] Implement memory protection rules
+  - [x] Clear sensitive data from memory using `zeroize`
+- [x] Store decrypted keys securely in agent daemon memory space only (no disk persistence)
+- [x] Implement Background Timeout Monitor Thread
+  - [x] Tracks idle time since last SSH signature request or interaction
+  - [x] Supports timeout values: immediately, 1m, 5m, 15m, 30m, 1h, 4h, on logout, never, custom
+- [x] Implement Timeout Actions
+  - [x] **Lock**: Wipe decrypted keys from memory, requires `sshwarden unlock` (master password) to restore
+  - [x] **Logout**: Wipe decrypted keys, delete local encrypted cache database, clear authentication tokens
+- [x] Implement `sshwarden unlock` subcommand
+  - [x] Securely prompt for master password, derive master key, and restore daemon to active state
 
 ## Phase 6: WebSocket Live Sync
 - [ ] Implement SignalR Negotiation Endpoint `/notifications/hub/negotiate`
