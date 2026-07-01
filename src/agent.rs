@@ -1,5 +1,5 @@
 use ssh_encoding::Encode;
-use ssh_key::private::{KeypairData, PrivateKey};
+use ssh_key::private::PrivateKey;
 
 struct Reader<'a> {
     data: &'a [u8],
@@ -83,7 +83,7 @@ const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_AGENT_FAILURE: u8 = 5;
 
 // RSA SHA2 flags
-const SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
+const _SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
 
 pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<Vec<u8>, String> {
     let mut reader = Reader::new(request_data);
@@ -109,7 +109,7 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
         SSH2_AGENTC_SIGN_REQUEST => {
             let pubkey_blob = reader.read_string()?;
             let data_to_sign = reader.read_string()?;
-            let flags = reader.read_u32()?;
+            let _flags = reader.read_u32()?;
 
             // Find matching key
             let mut matching_key = None;
@@ -133,27 +133,18 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
                 }
             };
 
-            // Determine signing algorithm/hash algorithm from flags and key type
-            let hash_alg = match key.key_data() {
-                KeypairData::Rsa(_) => {
-                    if flags & SSH_AGENT_RSA_SHA2_512 != 0 {
-                        ssh_key::HashAlg::Sha512
-                    } else {
-                        ssh_key::HashAlg::Sha256
-                    }
-                }
-                _ => ssh_key::HashAlg::Sha256,
-            };
+
+
+            use signature::Signer;
 
             // Perform signature
             let signature = key
-                .sign("agent", hash_alg, data_to_sign)
+                .try_sign(data_to_sign)
                 .map_err(|e| format!("Signing failed: {}", e))?;
 
             // Serialize signature to standard SSH signature format
             let mut sig_bytes = Vec::new();
             signature
-                .signature()
                 .encode(&mut sig_bytes)
                 .map_err(|e| format!("Failed to serialize signature: {}", e))?;
 

@@ -2159,6 +2159,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "signature",
  "ssh-encoding",
  "ssh-key",
  "tokio",
