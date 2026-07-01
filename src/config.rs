@@ -41,6 +41,13 @@ pub struct Config {
     pub timeout_action: TimeoutAction,
     pub socket_path: Option<PathBuf>,
     pub vault_cache_path: Option<PathBuf>,
+    #[serde(default = "generate_device_id")]
+    pub device_id: String,
+    pub access_token: Option<String>,
+}
+
+fn generate_device_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 impl Default for Config {
@@ -54,6 +61,8 @@ impl Default for Config {
             timeout_action: TimeoutAction::Lock,
             socket_path: None,
             vault_cache_path: None,
+            device_id: generate_device_id(),
+            access_token: None,
         }
     }
 }
