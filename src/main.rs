@@ -274,6 +274,15 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                     .save()
                     .map_err(|e| format!("Failed to save configuration: {}", e))?;
                 println!("Settings saved.");
+
+                if daemon::is_agent_running() {
+                    println!("Notifying active agent daemon to reload settings...");
+                    if let Err(e) =
+                        daemon::send_control_request(daemon::ControlRequest::Reload).await
+                    {
+                        eprintln!("Warning: Failed to notify running agent: {}", e);
+                    }
+                }
             } else {
                 println!("Current settings:");
                 println!("  Server URL:     {}", config.server_url);

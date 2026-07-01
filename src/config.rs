@@ -83,6 +83,41 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Parses the timeout string into a Duration, or None if set to 'never'
+    pub fn parse_timeout_duration(&self) -> Result<Option<std::time::Duration>, String> {
+        let s = self.timeout.trim().to_lowercase();
+        if s == "never" {
+            return Ok(None);
+        }
+        if s == "immediately" {
+            return Ok(Some(std::time::Duration::ZERO));
+        }
+        if s.starts_with("custom ") {
+            let secs_str = s.strip_prefix("custom ").unwrap();
+            let secs: u64 = secs_str
+                .parse()
+                .map_err(|e| format!("Invalid custom seconds '{}': {}", secs_str, e))?;
+            return Ok(Some(std::time::Duration::from_secs(secs)));
+        }
+        // Check for suffixes: s, m, h, d
+        let (val_str, multiplier) = if s.ends_with('s') {
+            (s.strip_suffix('s').unwrap(), 1)
+        } else if s.ends_with('m') {
+            (s.strip_suffix('m').unwrap(), 60)
+        } else if s.ends_with('h') {
+            (s.strip_suffix('h').unwrap(), 3600)
+        } else if s.ends_with('d') {
+            (s.strip_suffix('d').unwrap(), 86400)
+        } else {
+            // Assume minutes if no suffix
+            (s.as_str(), 60)
+        };
+
+        let val: u64 = val_str
+            .parse()
+            .map_err(|e| format!("Invalid timeout duration value '{}': {}", val_str, e))?;
+        Ok(Some(std::time::Duration::from_secs(val * multiplier)))
+    }
     /// Gets the standard configuration directory for sshwarden
     pub fn config_dir() -> Option<PathBuf> {
         ProjectDirs::from("com", "", APP_NAME).map(|proj| proj.config_dir().to_path_buf())

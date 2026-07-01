@@ -6,6 +6,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -20,6 +21,7 @@ pub enum ControlRequest {
     Unlock { keys: Vec<SshKeyData> },
     Lock,
     Status,
+    Reload,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,10 +283,18 @@ async fn run_daemon_loops(
     pid_path: PathBuf,
 ) -> Result<(), String> {
     let keyring: KeyRing = Arc::new(RwLock::new(Vec::new()));
+    let last_activity = Arc::new(RwLock::new(Instant::now()));
+
+    // Load configuration to initialize timeout settings
+    let config = crate::config::Config::load().unwrap_or_default();
+    let timeout = config.parse_timeout_duration().unwrap_or(None);
+    let timeout_action = config.timeout_action;
+
+    let shared_timeout = Arc::new(RwLock::new(timeout));
+    let shared_timeout_action = Arc::new(RwLock::new(timeout_action));
 
     let agent_listener = UnixListener::bind(&socket_path)
         .map_err(|e| format!("Failed to bind SSH agent socket: {}", e))?;
-    // Set socket permissions to 0600 so only the owner can connect
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("Failed to set socket permissions: {}", e))?;
 
@@ -295,6 +305,40 @@ async fn run_daemon_loops(
 
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let mut sigint = signal(SignalKind::interrupt()).unwrap();
+
+    // Spawn the inactivity watchdog task
+    let kr = keyring.clone();
+    let la = last_activity.clone();
+    let st = shared_timeout.clone();
+    let sta = shared_timeout_action.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let timeout_dur_opt = *st.read().await;
+            if let Some(timeout_dur) = timeout_dur_opt {
+                let last_act = *la.read().await;
+                if !kr.read().await.is_empty() && last_act.elapsed() >= timeout_dur {
+                    let action = *sta.read().await;
+                    eprintln!("Session timeout reached. Triggering action: {:?}", action);
+                    match action {
+                        crate::config::TimeoutAction::Lock => {
+                            kr.write().await.clear();
+                            eprintln!("Agent locked due to inactivity.");
+                        }
+                        crate::config::TimeoutAction::Logout => {
+                            kr.write().await.clear();
+                            let _ = storage::wipe_db();
+                            if let Ok(mut config) = crate::config::Config::load() {
+                                config.access_token = None;
+                                let _ = config.save();
+                            }
+                            eprintln!("Logged out due to inactivity.");
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     println!("Listeners bound successfully. Running daemon listeners.");
 
@@ -310,8 +354,9 @@ async fn run_daemon_loops(
             // SSH Agent protocol connection
             Ok((stream, _)) = agent_listener.accept() => {
                 let kr = keyring.clone();
+                let la = last_activity.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ssh_agent_connection(stream, kr).await {
+                    if let Err(e) = handle_ssh_agent_connection(stream, kr, la).await {
                         eprintln!("SSH Agent connection error: {}", e);
                     }
                 });
@@ -319,8 +364,11 @@ async fn run_daemon_loops(
             // Control socket connection
             Ok((stream, _)) = control_listener.accept() => {
                 let kr = keyring.clone();
+                let la = last_activity.clone();
+                let st = shared_timeout.clone();
+                let sta = shared_timeout_action.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_control_connection(stream, kr).await {
+                    if let Err(e) = handle_control_connection(stream, kr, la, st, sta).await {
                         eprintln!("Control connection error: {}", e);
                     }
                 });
@@ -339,6 +387,7 @@ async fn run_daemon_loops(
 async fn handle_ssh_agent_connection(
     mut stream: UnixStream,
     keyring: KeyRing,
+    last_activity: Arc<RwLock<Instant>>,
 ) -> Result<(), std::io::Error> {
     loop {
         // Read 4-byte length prefix
@@ -352,6 +401,9 @@ async fn handle_ssh_agent_connection(
         // Read message payload
         let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await?;
+
+        // Update inactivity timer
+        *last_activity.write().await = Instant::now();
 
         // Process request
         let keys = keyring.read().await;
@@ -375,9 +427,15 @@ async fn handle_ssh_agent_connection(
 async fn handle_control_connection(
     mut stream: UnixStream,
     keyring: KeyRing,
+    last_activity: Arc<RwLock<Instant>>,
+    shared_timeout: Arc<RwLock<Option<std::time::Duration>>>,
+    shared_timeout_action: Arc<RwLock<crate::config::TimeoutAction>>,
 ) -> Result<(), std::io::Error> {
     let mut request_bytes = Vec::new();
     stream.read_to_end(&mut request_bytes).await?;
+
+    // Update inactivity timer
+    *last_activity.write().await = Instant::now();
 
     let req: ControlRequest = match serde_json::from_slice(&request_bytes) {
         Ok(r) => r,
@@ -451,6 +509,28 @@ async fn handle_control_connection(
                 error: None,
                 unlocked: Some(!kr.is_empty()),
                 key_count: Some(kr.len()),
+            }
+        }
+        ControlRequest::Reload => {
+            let config_res = crate::config::Config::load();
+            match config_res {
+                Ok(config) => {
+                    let t = config.parse_timeout_duration().unwrap_or(None);
+                    *shared_timeout.write().await = t;
+                    *shared_timeout_action.write().await = config.timeout_action;
+                    ControlResponse {
+                        status: "ok".to_string(),
+                        error: None,
+                        unlocked: Some(!keyring.read().await.is_empty()),
+                        key_count: Some(keyring.read().await.len()),
+                    }
+                }
+                Err(e) => ControlResponse {
+                    status: "error".to_string(),
+                    error: Some(format!("Failed to reload config: {}", e)),
+                    unlocked: Some(!keyring.read().await.is_empty()),
+                    key_count: Some(keyring.read().await.len()),
+                },
             }
         }
     };
