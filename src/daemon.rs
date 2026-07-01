@@ -653,6 +653,99 @@ async fn handle_control_connection(
     Ok(())
 }
 
+async fn handle_surgical_cipher_update(
+    client: &ApiClient,
+    token: &str,
+    cipher_id: &str,
+    keys_context: &SharedKeysContext,
+    keyring: &KeyRing,
+) -> Result<(), String> {
+    let ctx_opt = keys_context.read().await;
+    let ctx = match &*ctx_opt {
+        Some(c) => c,
+        None => return Err("Agent locked".to_string()),
+    };
+
+    // Load existing items from cache database
+    let existing_items = storage::load_db(&ctx.db_key).unwrap_or_default();
+    let mut updated_items = existing_items;
+
+    // Fetch individual cipher details from server
+    let fetch_result = client.get_cipher_details(token, cipher_id).await;
+
+    let mut is_deleted = false;
+    let mut new_key_item = None;
+
+    match fetch_result {
+        Ok(cipher) => {
+            if cipher.deleted_date.is_some() {
+                is_deleted = true;
+            } else if cipher.r#type == 5 {
+                // Decrypt this cipher
+                let decrypted_list = storage::parse_and_extract_ssh_keys(
+                    &crate::api::SyncResponse {
+                        profile: crate::api::ProfileSync {
+                            id: String::new(),
+                            email: String::new(),
+                            key: String::new(),
+                        },
+                        ciphers: vec![cipher],
+                    },
+                    &ctx.enc_key,
+                    &ctx.mac_key,
+                );
+                if let Some(decrypted_item) = decrypted_list.into_iter().next() {
+                    new_key_item = Some(decrypted_item);
+                } else {
+                    is_deleted = true;
+                }
+            } else {
+                // Not a type 5 cipher (not an SSH key)
+                is_deleted = true;
+            }
+        }
+        Err(e) => {
+            info!("Failed to fetch cipher details for {}: {}. Assuming deleted.", cipher_id, e);
+            is_deleted = true;
+        }
+    }
+
+    if is_deleted {
+        // Remove from list
+        updated_items.retain(|item| item.id != cipher_id);
+    } else if let Some(item) = new_key_item {
+        // Upsert item
+        if let Some(pos) = updated_items.iter().position(|x| x.id == cipher_id) {
+            updated_items[pos] = item;
+        } else {
+            updated_items.push(item);
+        }
+    }
+
+    // Save updated items back to database cache
+    storage::save_db(&updated_items, &ctx.db_key)?;
+
+    // Reload keyring memory
+    let mut parsed_keys = Vec::new();
+    for item in &updated_items {
+        if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
+            pkey.set_comment(&item.name);
+            parsed_keys.push(pkey);
+        }
+    }
+
+    let count = parsed_keys.len();
+    let mut kr = keyring.write().await;
+    *kr = parsed_keys;
+
+    info!(
+        "WebSocket: Surgically updated cipher {}. Keyring now has {} keys.",
+        cipher_id, count
+    );
+
+    Ok(())
+}
+
 async fn run_websocket_sync_loop(
     keys_context: SharedKeysContext,
     keyring: KeyRing,
@@ -720,14 +813,38 @@ async fn run_websocket_sync_loop(
 
                         if let Some(args) = is_receive_msg.then(|| val.get("arguments").and_then(|a| a.as_array())).flatten() {
                             for arg in args {
-                                let update_type = arg.get("Type").and_then(|t| t.as_i64());
-                                if let Some(ut) = update_type.filter(|&ut| ut == 0 || ut == 1 || ut == 4 || ut == 5) {
-                                    info!(
-                                        "WebSocket: Received vault update event (Type {}). Syncing...",
-                                        ut
-                                    );
+                                if let Some(ut) = arg.get("Type").and_then(|t| t.as_i64()) {
+                                    if ut == 3 {
+                                        // Surgical cipher update
+                                        if let Some(cipher_id) = arg.get("Id").or_else(|| arg.get("id")).and_then(|id| id.as_str()) {
+                                            info!("WebSocket: Received cipher update event for ID: {}. Processing surgically...", cipher_id);
+                                            let client_clone = client.clone();
+                                            let token_clone = token.clone();
+                                            let kc_clone = keys_context.clone();
+                                            let kr_clone = keyring.clone();
+                                            let cipher_id_str = cipher_id.to_string();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = handle_surgical_cipher_update(
+                                                    &client_clone,
+                                                    &token_clone,
+                                                    &cipher_id_str,
+                                                    &kc_clone,
+                                                    &kr_clone,
+                                                )
+                                                .await
+                                                {
+                                                    error!("Surgical cipher update failed for {}: {}", cipher_id_str, e);
+                                                }
+                                            });
+                                        }
+                                    } else if ut == 0 || ut == 1 || ut == 4 || ut == 5 {
+                                        // Full Sync
+                                        info!(
+                                            "WebSocket: Received vault update event (Type {}). Syncing...",
+                                            ut
+                                        );
 
-                                    match client.sync(token).await {
+                                        match client.sync(token).await {
                                         Ok(sync_data) => {
                                             let ctx_opt = keys_context.read().await;
                                             if let Some(ref ctx) = *ctx_opt {
@@ -783,6 +900,7 @@ async fn run_websocket_sync_loop(
                     }
                 }
             }
+        }
             Message::Ping(ping) => {
                 let _ = ws_stream.send(Message::Pong(ping)).await;
             }

@@ -154,6 +154,7 @@ pub struct NegotiateResponse {
     pub url: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
     api_url: String,
