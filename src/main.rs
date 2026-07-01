@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod crypto;
 mod storage;
+mod agent;
 
 use api::ApiClient;
 use clap::Parser;
