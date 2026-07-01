@@ -389,9 +389,100 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             let mut updated = false;
 
             if let Some(t) = args.timeout {
-                config.timeout = t.clone();
-                println!("Timeout updated to: {}", t);
-                updated = true;
+                if t.trim().to_lowercase() == "never" {
+                    if let Some(ref email) = config.email {
+                        let token = config
+                            .access_token
+                            .as_ref()
+                            .ok_or_else(|| "Access token missing from config".to_string())?;
+
+                        let password = rpassword::prompt_password("Enter Master Password to verify and enable 'never' timeout: ")
+                            .map_err(|e| format!("Password prompt failed: {}", e))?;
+
+                        let salt = config
+                            .cache_salt
+                            .as_ref()
+                            .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                        let db_key = storage::derive_db_key(&password, salt)?;
+
+                        // Try verifying with local cache first
+                        let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
+                        let mut verified = false;
+                        let mut loaded_keys = Vec::new();
+
+                        if path.exists() {
+                            if let Ok(keys) = storage::load_db(&db_key) {
+                                verified = true;
+                                loaded_keys = keys;
+                            }
+                        }
+
+                        // If not verified locally, verify with server
+                        if !verified {
+                            println!("Verifying master password with server...");
+                            let api_client = ApiClient::new(&config.server_url);
+                            let prelogin = api_client.prelogin(email).await?;
+                            let master_key_res = match prelogin.kdf {
+                                0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations),
+                                1 => {
+                                    if let (Some(mem), Some(para)) = (prelogin.kdf_memory, prelogin.kdf_parallelism) {
+                                        crypto::derive_master_key_argon2(&password, email, prelogin.kdf_iterations, mem, para)
+                                    } else {
+                                        Err("Argon2 parameters missing".to_string())
+                                    }
+                                }
+                                t => Err(format!("Unsupported KDF type: {}", t)),
+                            };
+
+                            match master_key_res {
+                                Ok(master_key) => {
+                                    match api_client.sync(token).await {
+                                        Ok(sync_data) => {
+                                            match crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key) {
+                                                Ok((enc_key, mac_key)) => {
+                                                    verified = true;
+                                                    loaded_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+                                                }
+                                                Err(_) => {}
+                                            }
+                                        }
+                                        Err(_) => {}
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+
+                        if !verified {
+                            return Err("Incorrect Master Password. Timeout setting remains unchanged.".to_string());
+                        }
+
+                        config.timeout = t.clone();
+                        println!("Timeout updated to: {}", t);
+                        updated = true;
+
+                        // Save configuration first so that save_db reads timeout as "never"
+                        config
+                            .save()
+                            .map_err(|e| format!("Failed to save configuration: {}", e))?;
+                        
+                        if !loaded_keys.is_empty() {
+                            println!("Generating unencrypted cache database...");
+                            if let Err(e) = storage::save_db(&loaded_keys, &db_key) {
+                                eprintln!("Warning: Failed to generate unencrypted cache: {}", e);
+                            }
+                        }
+                    } else {
+                        // Not logged in, allow setting timeout to "never"
+                        config.timeout = t.clone();
+                        println!("Timeout updated to: {}", t);
+                        updated = true;
+                    }
+                } else {
+                    config.timeout = t.clone();
+                    println!("Timeout updated to: {}", t);
+                    updated = true;
+                }
             }
 
             if let Some(act_str) = args.timeout_action {
