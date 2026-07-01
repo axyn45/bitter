@@ -1,5 +1,5 @@
-use ssh_key::private::{PrivateKey, KeypairData};
 use ssh_encoding::Encode;
+use ssh_key::private::{KeypairData, PrivateKey};
 
 struct Reader<'a> {
     data: &'a [u8],
@@ -83,6 +83,7 @@ const SSH2_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_AGENT_FAILURE: u8 = 5;
 
 // RSA SHA2 flags
+#[allow(dead_code)]
 const SSH_AGENT_RSA_SHA2_256: u32 = 0x02;
 const SSH_AGENT_RSA_SHA2_512: u32 = 0x04;
 
@@ -98,7 +99,8 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
 
             for key in keys {
                 let pubkey = key.public_key();
-                let pubkey_bytes = pubkey.to_bytes()
+                let pubkey_bytes = pubkey
+                    .to_bytes()
                     .map_err(|e| format!("Failed to serialize public key: {}", e))?;
                 writer.write_string(&pubkey_bytes);
                 writer.write_string(key.comment().as_bytes());
@@ -115,7 +117,8 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
             let mut matching_key = None;
             for key in keys {
                 let pubkey = key.public_key();
-                let pubkey_bytes = pubkey.to_bytes()
+                let pubkey_bytes = pubkey
+                    .to_bytes()
                     .map_err(|e| format!("Failed to serialize public key: {}", e))?;
                 if pubkey_bytes == pubkey_blob {
                     matching_key = Some(key);
@@ -137,22 +140,23 @@ pub fn handle_agent_request(request_data: &[u8], keys: &[PrivateKey]) -> Result<
                 KeypairData::Rsa(_) => {
                     if flags & SSH_AGENT_RSA_SHA2_512 != 0 {
                         ssh_key::HashAlg::Sha512
-                    } else if flags & SSH_AGENT_RSA_SHA2_256 != 0 {
-                        ssh_key::HashAlg::Sha256
                     } else {
-                        ssh_key::HashAlg::Sha256 // Fallback to Sha256 instead of deprecated Sha1
+                        ssh_key::HashAlg::Sha256
                     }
                 }
                 _ => ssh_key::HashAlg::Sha256,
             };
 
             // Perform signature
-            let signature = key.sign("agent", hash_alg, data_to_sign)
+            let signature = key
+                .sign("agent", hash_alg, data_to_sign)
                 .map_err(|e| format!("Signing failed: {}", e))?;
 
             // Serialize signature to standard SSH signature format
             let mut sig_bytes = Vec::new();
-            signature.signature().encode(&mut sig_bytes)
+            signature
+                .signature()
+                .encode(&mut sig_bytes)
                 .map_err(|e| format!("Failed to serialize signature: {}", e))?;
 
             let mut writer = Writer::new();

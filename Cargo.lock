@@ -2097,6 +2097,7 @@ dependencies = [
  "clap",
  "daemonize",
  "directories",
+ "libc",
  "reqwest",
  "ring",
  "rpassword",

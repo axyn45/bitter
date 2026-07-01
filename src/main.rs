@@ -1,9 +1,10 @@
+mod agent;
 mod api;
 mod cli;
 mod config;
 mod crypto;
+mod daemon;
 mod storage;
-mod agent;
 
 use api::ApiClient;
 use clap::Parser;
@@ -321,18 +322,58 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             }
         },
         Commands::Agent(args) => match args.command {
-            AgentCommands::Start(_) => {
-                println!("Starting agent socket daemon... (Will be implemented in Phase 4)");
+            AgentCommands::Start(start_args) => {
+                daemon::start_agent(start_args.foreground, start_args.socket)?;
             }
             AgentCommands::Stop => {
-                println!("Stopping agent socket daemon... (Will be implemented in Phase 4)");
+                daemon::stop_agent()?;
             }
             AgentCommands::Status => {
-                println!("Checking agent status... (Will be implemented in Phase 4)");
+                daemon::print_status()?;
             }
         },
         Commands::Unlock => {
-            println!("Unlocking agent... (Will be implemented in Phase 5)");
+            let password = rpassword::prompt_password("Master Password: ")
+                .map_err(|e| format!("Password prompt failed: {}", e))?;
+
+            let salt = config
+                .cache_salt
+                .as_ref()
+                .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+            let db_key = storage::derive_db_key(&password, salt)?;
+
+            println!("Decrypting local cache database...");
+            let cache_keys = storage::load_db(&db_key)?;
+            if cache_keys.is_empty() {
+                return Err(
+                    "No keys found in local cache database. Run 'sshwarden sync' first."
+                        .to_string(),
+                );
+            }
+
+            println!("Sending keys to background agent daemon...");
+            let daemon_keys: Vec<daemon::SshKeyData> = cache_keys
+                .into_iter()
+                .map(|k| daemon::SshKeyData {
+                    name: k.name,
+                    private_key: k.private_key,
+                })
+                .collect();
+
+            let resp =
+                daemon::send_control_request(daemon::ControlRequest::Unlock { keys: daemon_keys })
+                    .await?;
+            if resp.status == "ok" {
+                println!(
+                    "Agent unlocked successfully. Synced {} keys to memory.",
+                    resp.key_count.unwrap_or(0)
+                );
+            } else {
+                return Err(format!(
+                    "Failed to unlock agent: {}",
+                    resp.error.unwrap_or_default()
+                ));
+            }
         }
     }
     Ok(())
