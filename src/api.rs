@@ -133,6 +133,7 @@ pub struct CipherSync {
     pub attachments: Option<Vec<AttachmentSync>>,
     pub ssh_key: Option<SshKeySync>,
     pub deleted_date: Option<String>,
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

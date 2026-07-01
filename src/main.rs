@@ -154,7 +154,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 };
 
                 let login_hash = crypto::derive_login_hash(&master_key, &password);
-                println!("Authenticating with server... ({login_hash})");
+                println!("Authenticating with server...");
 
                 let resp = api_client
                     .login_password(&email, &login_hash, &config.device_id, "sshwarden_client")

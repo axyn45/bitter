@@ -174,13 +174,33 @@ pub fn parse_and_extract_ssh_keys(
 
 fn process_cipher(
     cipher: &CipherSync,
-    enc_key: &[u8; 32],
-    mac_key: &[u8; 32],
+    user_enc_key: &[u8; 32],
+    user_mac_key: &[u8; 32],
     ssh_keys: &mut Vec<SshKeyItem>,
 ) -> Result<(), String> {
     if cipher.deleted_date.is_some() {
         return Ok(());
     }
+
+    let (ck_enc, ck_mac) = if let Some(ref cipher_key_str) = cipher.key {
+        let decrypted = crypto::decrypt_cipher_string(cipher_key_str, user_enc_key, user_mac_key)?;
+        if decrypted.len() != 64 {
+            return Err(format!(
+                "Decrypted cipher key has invalid length: {} (expected 64)",
+                decrypted.len()
+            ));
+        }
+        let mut ck_enc = [0u8; 32];
+        let mut ck_mac = [0u8; 32];
+        ck_enc.copy_from_slice(&decrypted[0..32]);
+        ck_mac.copy_from_slice(&decrypted[32..64]);
+        (ck_enc, ck_mac)
+    } else {
+        (*user_enc_key, *user_mac_key)
+    };
+
+    let enc_key = &ck_enc;
+    let mac_key = &ck_mac;
 
     // Decrypt cipher name
     let plain_name = match &cipher.name {
