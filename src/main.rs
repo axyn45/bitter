@@ -342,6 +342,14 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             }
         },
         Commands::Unlock => {
+            let email = config.email.as_ref().ok_or_else(|| {
+                "Email address missing from config. Please log in first.".to_string()
+            })?;
+            let token = config
+                .access_token
+                .as_ref()
+                .ok_or_else(|| "Not logged in. Please run 'sshwarden login' first.".to_string())?;
+
             let password = rpassword::prompt_password("Master Password: ")
                 .map_err(|e| format!("Password prompt failed: {}", e))?;
 
@@ -360,7 +368,43 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 );
             }
 
-            println!("Sending keys to background agent daemon...");
+            let api_client = ApiClient::new(&config.server_url);
+
+            println!("Fetching KDF settings...");
+            let prelogin = api_client.prelogin(email).await?;
+
+            println!("Deriving keys...");
+            let master_key = match prelogin.kdf {
+                0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations)?,
+                1 => {
+                    let mem = prelogin
+                        .kdf_memory
+                        .ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
+                    let para = prelogin
+                        .kdf_parallelism
+                        .ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
+                    crypto::derive_master_key_argon2(
+                        &password,
+                        email,
+                        prelogin.kdf_iterations,
+                        mem,
+                        para,
+                    )?
+                }
+                t => return Err(format!("Unsupported KDF type: {}", t)),
+            };
+
+            // Retrieve symmetric key from sync response
+            println!("Fetching active profile keys from server...");
+            let sync_data = api_client.sync(token).await?;
+            let (enc_key, mac_key) =
+                crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key)?;
+
+            let enc_hex = hex::encode(enc_key);
+            let mac_hex = hex::encode(mac_key);
+            let db_hex = hex::encode(db_key);
+
+            println!("Sending keys and context to background agent daemon...");
             let daemon_keys: Vec<daemon::SshKeyData> = cache_keys
                 .into_iter()
                 .map(|k| daemon::SshKeyData {
@@ -369,9 +413,14 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 })
                 .collect();
 
-            let resp =
-                daemon::send_control_request(daemon::ControlRequest::Unlock { keys: daemon_keys })
-                    .await?;
+            let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
+                keys: daemon_keys,
+                enc_key: enc_hex,
+                mac_key: mac_hex,
+                db_key: db_hex,
+            })
+            .await?;
+
             if resp.status == "ok" {
                 println!(
                     "Agent unlocked successfully. Synced {} keys to memory.",

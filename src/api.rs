@@ -14,6 +14,16 @@ pub fn get_endpoints(server_url: &str) -> (String, String) {
     }
 }
 
+/// Determines the Notifications URL from the user-configured server URL
+pub fn get_notifications_endpoints(server_url: &str) -> String {
+    let server = server_url.trim_end_matches('/');
+    if server.contains("bitwarden.com") {
+        "https://notifications.bitwarden.com".to_string()
+    } else {
+        server.to_string() // Self-hosted Vaultwarden hosts it on the same domain
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreloginRequest {
@@ -125,6 +135,17 @@ pub struct CipherSync {
 pub struct SyncResponse {
     pub profile: ProfileSync,
     pub ciphers: Vec<CipherSync>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct NegotiateResponse {
+    #[serde(alias = "ConnectionToken")]
+    pub connection_token: Option<String>,
+    #[serde(alias = "ConnectionId")]
+    pub connection_id: Option<String>,
+    #[serde(alias = "Url")]
+    pub url: Option<String>,
 }
 
 pub struct ApiClient {
@@ -307,5 +328,40 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse cipher details response: {}", e))?;
 
         Ok(cipher_resp)
+    }
+
+    /// Negotiates a SignalR WebSocket connection token
+    pub async fn negotiate(
+        &self,
+        token: &str,
+        notifications_url: &str,
+    ) -> Result<NegotiateResponse, String> {
+        let url = format!(
+            "{}/notifications/hub/negotiate",
+            notifications_url.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| format!("Negotiation request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Negotiation failed with status {}: {}",
+                status, err_text
+            ));
+        }
+
+        let negotiate_resp: NegotiateResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse negotiate JSON: {}", e))?;
+
+        Ok(negotiate_resp)
     }
 }

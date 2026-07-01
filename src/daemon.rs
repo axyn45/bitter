@@ -1,4 +1,5 @@
 use daemonize::Daemonize;
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use ssh_key::private::PrivateKey;
 use std::fs::{self, File};
@@ -11,14 +12,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::agent;
+use crate::api::ApiClient;
 use crate::storage;
+
+#[derive(Clone)]
+pub struct KeysContext {
+    pub enc_key: [u8; 32],
+    pub mac_key: [u8; 32],
+    pub db_key: [u8; 32],
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ControlRequest {
-    Unlock { keys: Vec<SshKeyData> },
+    Unlock {
+        keys: Vec<SshKeyData>,
+        enc_key: String,
+        mac_key: String,
+        db_key: String,
+    },
     Lock,
     Status,
     Reload,
@@ -43,6 +58,7 @@ pub struct ControlResponse {
 }
 
 type KeyRing = Arc<RwLock<Vec<PrivateKey>>>;
+type SharedKeysContext = Arc<RwLock<Option<KeysContext>>>;
 
 /// Starts the agent background process
 pub fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
@@ -284,6 +300,7 @@ async fn run_daemon_loops(
 ) -> Result<(), String> {
     let keyring: KeyRing = Arc::new(RwLock::new(Vec::new()));
     let last_activity = Arc::new(RwLock::new(Instant::now()));
+    let keys_context: SharedKeysContext = Arc::new(RwLock::new(None));
 
     // Load configuration to initialize timeout settings
     let config = crate::config::Config::load().unwrap_or_default();
@@ -311,6 +328,7 @@ async fn run_daemon_loops(
     let la = last_activity.clone();
     let st = shared_timeout.clone();
     let sta = shared_timeout_action.clone();
+    let kc = keys_context.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -323,10 +341,12 @@ async fn run_daemon_loops(
                     match action {
                         crate::config::TimeoutAction::Lock => {
                             kr.write().await.clear();
+                            *kc.write().await = None;
                             eprintln!("Agent locked due to inactivity.");
                         }
                         crate::config::TimeoutAction::Logout => {
                             kr.write().await.clear();
+                            *kc.write().await = None;
                             let _ = storage::wipe_db();
                             if let Ok(mut config) = crate::config::Config::load() {
                                 config.access_token = None;
@@ -336,6 +356,27 @@ async fn run_daemon_loops(
                         }
                     }
                 }
+            }
+        }
+    });
+
+    // Spawn the background WebSocket live-sync listener
+    let kc_ws = keys_context.clone();
+    let kr_ws = keyring.clone();
+    tokio::spawn(async move {
+        loop {
+            let has_context = kc_ws.read().await.is_some();
+            if !has_context {
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
+            }
+
+            if let Err(e) = run_websocket_sync_loop(kc_ws.clone(), kr_ws.clone()).await {
+                eprintln!(
+                    "WebSocket live sync loop error: {}. Reconnecting in 10 seconds...",
+                    e
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         }
     });
@@ -367,8 +408,9 @@ async fn run_daemon_loops(
                 let la = last_activity.clone();
                 let st = shared_timeout.clone();
                 let sta = shared_timeout_action.clone();
+                let kc = keys_context.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_control_connection(stream, kr, la, st, sta).await {
+                    if let Err(e) = handle_control_connection(stream, kr, la, st, sta, kc).await {
                         eprintln!("Control connection error: {}", e);
                     }
                 });
@@ -430,6 +472,7 @@ async fn handle_control_connection(
     last_activity: Arc<RwLock<Instant>>,
     shared_timeout: Arc<RwLock<Option<std::time::Duration>>>,
     shared_timeout_action: Arc<RwLock<crate::config::TimeoutAction>>,
+    keys_context: SharedKeysContext,
 ) -> Result<(), std::io::Error> {
     let mut request_bytes = Vec::new();
     stream.read_to_end(&mut request_bytes).await?;
@@ -453,7 +496,12 @@ async fn handle_control_connection(
     };
 
     let response = match req {
-        ControlRequest::Unlock { keys } => {
+        ControlRequest::Unlock {
+            keys,
+            enc_key,
+            mac_key,
+            db_key,
+        } => {
             let mut parsed_keys = Vec::new();
             let mut parse_err = None;
 
@@ -481,20 +529,60 @@ async fn handle_control_connection(
                     key_count: Some(keyring.read().await.len()),
                 }
             } else {
-                let count = parsed_keys.len();
-                let mut kr = keyring.write().await;
-                *kr = parsed_keys;
-                ControlResponse {
-                    status: "ok".to_string(),
-                    error: None,
-                    unlocked: Some(true),
-                    key_count: Some(count),
+                // Decode hex keys
+                let enc_dec = hex::decode(&enc_key);
+                let mac_dec = hex::decode(&mac_key);
+                let db_dec = hex::decode(&db_key);
+
+                if let (Ok(enc_val), Ok(mac_val), Ok(db_val)) = (enc_dec, mac_dec, db_dec) {
+                    let mut enc_bytes = [0u8; 32];
+                    let mut mac_bytes = [0u8; 32];
+                    let mut db_bytes = [0u8; 32];
+
+                    if enc_val.len() == 32 && mac_val.len() == 32 && db_val.len() == 32 {
+                        enc_bytes.copy_from_slice(&enc_val);
+                        mac_bytes.copy_from_slice(&mac_val);
+                        db_bytes.copy_from_slice(&db_val);
+
+                        // Store keys context in memory for WebSocket sync
+                        *keys_context.write().await = Some(KeysContext {
+                            enc_key: enc_bytes,
+                            mac_key: mac_bytes,
+                            db_key: db_bytes,
+                        });
+
+                        let count = parsed_keys.len();
+                        let mut kr = keyring.write().await;
+                        *kr = parsed_keys;
+
+                        ControlResponse {
+                            status: "ok".to_string(),
+                            error: None,
+                            unlocked: Some(true),
+                            key_count: Some(count),
+                        }
+                    } else {
+                        ControlResponse {
+                            status: "error".to_string(),
+                            error: Some("Security keys must be exactly 32 bytes".to_string()),
+                            unlocked: Some(!keyring.read().await.is_empty()),
+                            key_count: Some(keyring.read().await.len()),
+                        }
+                    }
+                } else {
+                    ControlResponse {
+                        status: "error".to_string(),
+                        error: Some("Invalid hex format for security keys".to_string()),
+                        unlocked: Some(!keyring.read().await.is_empty()),
+                        key_count: Some(keyring.read().await.len()),
+                    }
                 }
             }
         }
         ControlRequest::Lock => {
             let mut kr = keyring.write().await;
             kr.clear();
+            *keys_context.write().await = None;
             ControlResponse {
                 status: "ok".to_string(),
                 error: None,
@@ -537,5 +625,149 @@ async fn handle_control_connection(
 
     let resp_bytes = serde_json::to_vec(&response).unwrap();
     stream.write_all(&resp_bytes).await?;
+    Ok(())
+}
+
+async fn run_websocket_sync_loop(
+    keys_context: SharedKeysContext,
+    keyring: KeyRing,
+) -> Result<(), String> {
+    let config =
+        crate::config::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
+
+    let token = config
+        .access_token
+        .as_ref()
+        .ok_or_else(|| "No session token in configuration".to_string())?;
+
+    let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
+
+    let client = ApiClient::new(&config.server_url);
+    let negotiate_resp = client.negotiate(token, &notifications_url).await?;
+
+    let conn_token = negotiate_resp
+        .connection_token
+        .or(negotiate_resp.connection_id)
+        .ok_or_else(|| "Negotiate response missing connection token".to_string())?;
+
+    let mut ws_url = format!("{}/notifications/hub?id={}", notifications_url, conn_token);
+    if ws_url.starts_with("https://") {
+        ws_url = ws_url.replace("https://", "wss://");
+    } else if ws_url.starts_with("http://") {
+        ws_url = ws_url.replace("http://", "ws://");
+    }
+
+    println!("WebSocket: Connecting to {}", ws_url);
+    let (mut ws_stream, _) = connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("WebSocket connection failed: {}", e))?;
+
+    println!("WebSocket: Connected. Sending handshake...");
+    let handshake = "{\"protocol\":\"json\",\"version\":1}\u{1E}";
+    ws_stream
+        .send(Message::Text(handshake.to_string().into()))
+        .await
+        .map_err(|e| format!("Failed to send handshake: {}", e))?;
+
+    while let Some(msg_res) = ws_stream.next().await {
+        let msg = msg_res.map_err(|e| format!("WebSocket read error: {}", e))?;
+
+        if keys_context.read().await.is_none() {
+            println!("WebSocket: Agent locked. Closing connection...");
+            let _ = ws_stream.close(None).await;
+            break;
+        }
+
+        match msg {
+            Message::Text(text) => {
+                for part in text.split('\u{1E}') {
+                    if part.is_empty() {
+                        continue;
+                    }
+
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(part) {
+                        if val.get("type").and_then(|t| t.as_i64()) == Some(6) {
+                            continue;
+                        }
+
+                        let is_receive_msg = val.get("type").and_then(|t| t.as_i64()) == Some(1)
+                            && val.get("target").and_then(|t| t.as_str()) == Some("ReceiveMessage");
+
+                        if let Some(args) = is_receive_msg.then(|| val.get("arguments").and_then(|a| a.as_array())).flatten() {
+                            for arg in args {
+                                let update_type = arg.get("Type").and_then(|t| t.as_i64());
+                                if let Some(ut) = update_type.filter(|&ut| ut == 0 || ut == 1 || ut == 4 || ut == 5) {
+                                    println!(
+                                        "WebSocket: Received vault update event (Type {}). Syncing...",
+                                        ut
+                                    );
+
+                                    match client.sync(token).await {
+                                        Ok(sync_data) => {
+                                            let ctx_opt = keys_context.read().await;
+                                            if let Some(ref ctx) = *ctx_opt {
+                                                let new_items =
+                                                    storage::parse_and_extract_ssh_keys(
+                                                        &sync_data,
+                                                        &ctx.enc_key,
+                                                        &ctx.mac_key,
+                                                    );
+
+                                                let mut parsed_keys = Vec::new();
+                                                for item in &new_items {
+                                                    if let Ok(mut pkey) =
+                                                        PrivateKey::from_openssh(
+                                                            &item.private_key,
+                                                        )
+                                                    {
+                                                        pkey.set_comment(&item.name);
+                                                        parsed_keys.push(pkey);
+                                                    }
+                                                }
+
+                                                let count = parsed_keys.len();
+                                                let mut kr = keyring.write().await;
+                                                *kr = parsed_keys;
+
+                                                if let Err(err) = storage::save_db(
+                                                    &new_items,
+                                                    &ctx.db_key,
+                                                ) {
+                                                    eprintln!(
+                                                        "WebSocket background sync failed to save db: {}",
+                                                        err
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "WebSocket: Background sync completed. Synced and reloaded {} keys.",
+                                                        count
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            eprintln!(
+                                                "WebSocket background sync failed: {}",
+                                                err
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Message::Ping(ping) => {
+                let _ = ws_stream.send(Message::Pong(ping)).await;
+            }
+            Message::Close(_) => {
+                println!("WebSocket: Connection closed by server.");
+                break;
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
