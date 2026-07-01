@@ -7,10 +7,10 @@ This document tracks the step-by-step progress of the `sshwarden` project. Tasks
 ## Phase 1: Project Setup & CLI Skeleton
 - [x] Initialize Cargo binary project in workspace
 - [x] Add base dependencies to `Cargo.toml` (`clap`, `serde`, `toml`, `directories`)
-- [ ] Implement configuration file manager in `src/config.rs` (XDG config directories, strict `0600` owner permissions)
-- [ ] Implement CLI subcommand parsing in `src/cli.rs` using `clap`
-- [ ] Integrate CLI parser and config loading in `src/main.rs`
-- [ ] Verify compilation and test skeleton CLI commands
+- [x] Implement configuration file manager in `src/config.rs` (XDG config directories, strict `0600` owner permissions)
+- [x] Implement CLI subcommand parsing in `src/cli.rs` using `clap`
+- [x] Integrate CLI parser and config loading in `src/main.rs`
+- [x] Verify compilation and test skeleton CLI commands
 
 ## Phase 2: Cryptography & Bitwarden API Client
 - [ ] Implement cryptographic primitives (`crypto` module)
