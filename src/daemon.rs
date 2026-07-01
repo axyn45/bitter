@@ -13,6 +13,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use rmpv::Value;
 use tracing::{debug, error, info};
 
 use crate::agent;
@@ -814,9 +815,14 @@ async fn run_websocket_sync_loop(
                         if let Some(args) = is_receive_msg.then(|| val.get("arguments").and_then(|a| a.as_array())).flatten() {
                             for arg in args {
                                 if let Some(ut) = arg.get("Type").and_then(|t| t.as_i64()) {
-                                    if ut == 3 {
-                                        // Surgical cipher update
-                                        if let Some(cipher_id) = arg.get("Id").or_else(|| arg.get("id")).and_then(|id| id.as_str()) {
+                                    if ut == 1 {
+                                        // Surgical cipher update (Type 1 is SyncCipher)
+                                        let cipher_id = arg.get("Payload")
+                                            .and_then(|p| p.get("Id").or_else(|| p.get("id")))
+                                            .and_then(|id| id.as_str())
+                                            .or_else(|| arg.get("Id").or_else(|| arg.get("id")).and_then(|id| id.as_str()));
+
+                                        if let Some(cipher_id) = cipher_id {
                                             info!("WebSocket: Received cipher update event for ID: {}. Processing surgically...", cipher_id);
                                             let client_clone = client.clone();
                                             let token_clone = token.clone();
@@ -837,7 +843,7 @@ async fn run_websocket_sync_loop(
                                                 }
                                             });
                                         }
-                                    } else if ut == 0 || ut == 1 || ut == 4 || ut == 5 {
+                                    } else if ut == 0 || ut == 4 || ut == 5 {
                                         // Full Sync
                                         info!(
                                             "WebSocket: Received vault update event (Type {}). Syncing...",
@@ -845,53 +851,54 @@ async fn run_websocket_sync_loop(
                                         );
 
                                         match client.sync(token).await {
-                                        Ok(sync_data) => {
-                                            let ctx_opt = keys_context.read().await;
-                                            if let Some(ref ctx) = *ctx_opt {
-                                                let new_items =
-                                                    storage::parse_and_extract_ssh_keys(
-                                                        &sync_data,
-                                                        &ctx.enc_key,
-                                                        &ctx.mac_key,
-                                                    );
+                                            Ok(sync_data) => {
+                                                let ctx_opt = keys_context.read().await;
+                                                if let Some(ref ctx) = *ctx_opt {
+                                                    let new_items =
+                                                        storage::parse_and_extract_ssh_keys(
+                                                            &sync_data,
+                                                            &ctx.enc_key,
+                                                            &ctx.mac_key,
+                                                        );
 
-                                                let mut parsed_keys = Vec::new();
-                                                for item in &new_items {
-                                                    if let Ok(mut pkey) =
-                                                        PrivateKey::from_openssh(
-                                                            &item.private_key,
-                                                        )
-                                                    {
-                                                        pkey.set_comment(&item.name);
-                                                        parsed_keys.push(pkey);
+                                                    let mut parsed_keys = Vec::new();
+                                                    for item in &new_items {
+                                                        if let Ok(mut pkey) =
+                                                            PrivateKey::from_openssh(
+                                                                &item.private_key,
+                                                            )
+                                                        {
+                                                            pkey.set_comment(&item.name);
+                                                            parsed_keys.push(pkey);
+                                                        }
+                                                    }
+
+                                                    let count = parsed_keys.len();
+                                                    let mut kr = keyring.write().await;
+                                                    *kr = parsed_keys;
+
+                                                    if let Err(err) = storage::save_db(
+                                                        &new_items,
+                                                        &ctx.db_key,
+                                                    ) {
+                                                        error!(
+                                                            "WebSocket background sync failed to save db: {}",
+                                                            err
+                                                        );
+                                                    } else {
+                                                        info!(
+                                                            "WebSocket: Background sync completed. Synced and reloaded {} keys.",
+                                                            count
+                                                        );
                                                     }
                                                 }
-
-                                                let count = parsed_keys.len();
-                                                let mut kr = keyring.write().await;
-                                                *kr = parsed_keys;
-
-                                                if let Err(err) = storage::save_db(
-                                                    &new_items,
-                                                    &ctx.db_key,
-                                                ) {
-                                                    error!(
-                                                        "WebSocket background sync failed to save db: {}",
-                                                        err
-                                                    );
-                                                } else {
-                                                    info!(
-                                                        "WebSocket: Background sync completed. Synced and reloaded {} keys.",
-                                                        count
-                                                    );
-                                                }
                                             }
-                                        }
-                                        Err(err) => {
-                                            error!(
-                                                "WebSocket background sync failed: {}",
-                                                err
-                                            );
+                                            Err(err) => {
+                                                error!(
+                                                    "WebSocket background sync failed: {}",
+                                                    err
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -900,7 +907,116 @@ async fn run_websocket_sync_loop(
                     }
                 }
             }
-        }
+            Message::Binary(bytes) => {
+                debug!("WebSocket received Binary payload length: {}", bytes.len());
+                let mut current_slice = &bytes[..];
+                while !current_slice.is_empty() {
+                    let (msg_len, remaining) = match read_varint(current_slice) {
+                        Some(val) => val,
+                        None => {
+                            error!("WebSocket: Failed to parse varint message length prefix");
+                            break;
+                        }
+                    };
+                    if remaining.len() < msg_len {
+                        error!("WebSocket: Binary message truncated (expected {} bytes, got {})", msg_len, remaining.len());
+                        break;
+                    }
+                    let (msg_bytes, next_slice) = remaining.split_at(msg_len);
+                    current_slice = next_slice;
+
+                    let mut read_cursor = msg_bytes;
+                    match rmpv::decode::read_value(&mut read_cursor) {
+                        Ok(Value::Array(arr)) => {
+                            if arr.len() >= 5 {
+                                let msg_type = arr[0].as_i64();
+                                let target = arr[3].as_str();
+
+                                if msg_type == Some(1) && target == Some("ReceiveMessage") {
+                                    if let Value::Array(ref args) = arr[4] {
+                                        for arg in args {
+                                            if let Value::Map(map) = arg {
+                                                let ut = get_map_val(map, "Type").and_then(|v| v.as_i64());
+                                                if let Some(ut_val) = ut {
+                                                    if ut_val == 1 {
+                                                        // Surgical cipher update
+                                                        let payload_val = get_map_val(map, "Payload");
+                                                        let cipher_id = if let Some(Value::Map(p_map)) = payload_val {
+                                                            get_map_val(p_map, "Id").and_then(|v| v.as_str())
+                                                        } else {
+                                                            get_map_val(map, "Id").and_then(|v| v.as_str())
+                                                        };
+
+                                                        if let Some(cipher_id) = cipher_id {
+                                                            info!("WebSocket (binary): Received cipher update event for ID: {}. Processing surgically...", cipher_id);
+                                                            let client_clone = client.clone();
+                                                            let token_clone = token.clone();
+                                                            let kc_clone = keys_context.clone();
+                                                            let kr_clone = keyring.clone();
+                                                            let cipher_id_str = cipher_id.to_string();
+                                                            tokio::spawn(async move {
+                                                                if let Err(e) = handle_surgical_cipher_update(
+                                                                    &client_clone,
+                                                                    &token_clone,
+                                                                    &cipher_id_str,
+                                                                    &kc_clone,
+                                                                    &kr_clone,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    error!("Surgical cipher update failed for {}: {}", cipher_id_str, e);
+                                                                }
+                                                            });
+                                                        }
+                                                    } else if ut_val == 0 || ut_val == 4 || ut_val == 5 {
+                                                        // Full Sync
+                                                        info!("WebSocket (binary): Received vault update event (Type {}). Syncing...", ut_val);
+                                                        match client.sync(token).await {
+                                                            Ok(sync_data) => {
+                                                                let ctx_opt = keys_context.read().await;
+                                                                if let Some(ref ctx) = *ctx_opt {
+                                                                    let new_items = storage::parse_and_extract_ssh_keys(
+                                                                        &sync_data,
+                                                                        &ctx.enc_key,
+                                                                        &ctx.mac_key,
+                                                                    );
+                                                                    let mut parsed_keys = Vec::new();
+                                                                    for item in &new_items {
+                                                                        if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
+                                                                            pkey.set_comment(&item.name);
+                                                                            parsed_keys.push(pkey);
+                                                                        }
+                                                                    }
+                                                                    let count = parsed_keys.len();
+                                                                    *keyring.write().await = parsed_keys;
+                                                                    if let Err(err) = storage::save_db(&new_items, &ctx.db_key) {
+                                                                        error!("WebSocket background sync failed to save db: {}", err);
+                                                                    } else {
+                                                                        info!("WebSocket (binary): Background sync completed. Synced and reloaded {} keys.", count);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(err) => {
+                                                                error!("WebSocket background sync failed: {}", err);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(other) => {
+                            debug!("WebSocket parsed non-array message: {:?}", other);
+                        }
+                        Err(e) => {
+                            error!("WebSocket: Failed to parse MessagePack payload: {}", e);
+                        }
+                    }
+                }
+            }
             Message::Ping(ping) => {
                 let _ = ws_stream.send(Message::Pong(ping)).await;
             }
@@ -913,4 +1029,34 @@ async fn run_websocket_sync_loop(
     }
 
     Ok(())
+}
+
+fn read_varint(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    let mut value = 0usize;
+    let mut shift = 0usize;
+    let mut bytes_read = 0;
+    
+    for &b in bytes {
+        bytes_read += 1;
+        value |= ((b & 0x7f) as usize) << shift;
+        if (b & 0x80) == 0 {
+            return Some((value, &bytes[bytes_read..]));
+        }
+        shift += 7;
+        if shift >= 32 {
+            return None;
+        }
+    }
+    None
+}
+
+fn get_map_val<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    for (k, v) in map {
+        if let Some(k_str) = k.as_str() {
+            if k_str == key {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
