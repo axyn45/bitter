@@ -5,7 +5,7 @@ mod crypto;
 
 use api::ApiClient;
 use clap::Parser;
-use cli::{Cli, Commands, KeysCommands};
+use cli::{AgentCommands, Cli, Commands, KeysCommands};
 use config::{Config, TimeoutAction};
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -246,9 +246,17 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 println!("Deleting key {}... (Will be implemented in Phase 3)", id);
             }
         },
-        Commands::Daemon(_) => {
-            println!("Starting agent socket daemon... (Will be implemented in Phase 4)");
-        }
+        Commands::Agent(args) => match args.command {
+            AgentCommands::Start(_) => {
+                println!("Starting agent socket daemon... (Will be implemented in Phase 4)");
+            }
+            AgentCommands::Stop => {
+                println!("Stopping agent socket daemon... (Will be implemented in Phase 4)");
+            }
+            AgentCommands::Status => {
+                println!("Checking agent status... (Will be implemented in Phase 4)");
+            }
+        },
         Commands::Unlock => {
             println!("Unlocking agent... (Will be implemented in Phase 5)");
         }

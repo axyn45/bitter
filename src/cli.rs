@@ -29,11 +29,29 @@ pub enum Commands {
     /// Manage SSH keys
     Keys(KeysArgs),
 
-    /// Run the SSH agent daemon
-    Daemon(DaemonArgs),
+    /// Manage the background SSH agent
+    Agent(AgentArgs),
 
     /// Unlock the agent by supplying the master password
     Unlock,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentArgs {
+    #[command(subcommand)]
+    pub command: AgentCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommands {
+    /// Start the background agent
+    Start(DaemonArgs),
+
+    /// Stop the running background agent
+    Stop,
+
+    /// View the status of the background agent
+    Status,
 }
 
 #[derive(Debug, Args)]
