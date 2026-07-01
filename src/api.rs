@@ -371,7 +371,13 @@ impl ApiClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let err_text = response.text().await.unwrap_or_default();
+            let mut err_text = response.text().await.unwrap_or_default();
+            if err_text.trim().starts_with('<') {
+                err_text = "HTML response (possibly a proxy 404 or page not found)".to_string();
+            } else if err_text.len() > 120 {
+                err_text.truncate(120);
+                err_text.push_str("...");
+            }
             return Err(format!(
                 "Negotiation failed with status {}: {}",
                 status, err_text

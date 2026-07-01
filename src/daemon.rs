@@ -356,19 +356,24 @@ async fn run_daemon_loops(
     let kc_ws = keys_context.clone();
     let kr_ws = keyring.clone();
     tokio::spawn(async move {
+        let mut backoff = 10;
         loop {
             let has_context = kc_ws.read().await.is_some();
             if !has_context {
+                backoff = 10;
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
 
             if let Err(e) = run_websocket_sync_loop(kc_ws.clone(), kr_ws.clone()).await {
                 eprintln!(
-                    "WebSocket live sync loop error: {}. Reconnecting in 10 seconds...",
-                    e
+                    "WebSocket live sync loop error: {}. Reconnecting in {} seconds...",
+                    e, backoff
                 );
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                backoff = std::cmp::min(backoff * 2, 300); // Max backoff 5 minutes
+            } else {
+                backoff = 10;
             }
         }
     });
