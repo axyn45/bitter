@@ -52,10 +52,13 @@ pub fn derive_master_key_argon2(
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut master_key = [0u8; 32];
 
+    use ring::digest;
+    let email_hash = digest::digest(&digest::SHA256, email.to_lowercase().as_bytes());
+
     argon2
         .hash_password_into(
             password.as_bytes(),
-            email.to_lowercase().as_bytes(),
+            email_hash.as_ref(),
             &mut master_key,
         )
         .map_err(|e| format!("Argon2 key derivation failed: {}", e))?;
