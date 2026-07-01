@@ -39,6 +39,7 @@ pub enum ControlRequest {
     Lock,
     Status,
     Reload,
+    Sync,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -642,6 +643,81 @@ async fn handle_control_connection(
                 Err(e) => ControlResponse {
                     status: "error".to_string(),
                     error: Some(format!("Failed to reload config: {}", e)),
+                    unlocked: Some(!keyring.read().await.is_empty()),
+                    key_count: Some(keyring.read().await.len()),
+                },
+            }
+        }
+        ControlRequest::Sync => {
+            let config_res = crate::config::Config::load();
+            match config_res {
+                Ok(config) => {
+                    if let Some(token) = config.access_token.as_ref() {
+                        let ctx_opt = keys_context.read().await;
+                        if let Some(ref ctx) = *ctx_opt {
+                            let client = ApiClient::new(&config.server_url);
+                            match client.sync(token).await {
+                                Ok(sync_data) => {
+                                    let new_items = storage::parse_and_extract_ssh_keys(
+                                        &sync_data,
+                                        &ctx.enc_key,
+                                        &ctx.mac_key,
+                                    );
+
+                                    let mut parsed_keys = Vec::new();
+                                    for item in &new_items {
+                                        if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
+                                            pkey.set_comment(&item.name);
+                                            parsed_keys.push(pkey);
+                                        }
+                                    }
+
+                                    let count = parsed_keys.len();
+                                    *keyring.write().await = parsed_keys;
+
+                                    if let Err(err) = storage::save_db(&new_items, &ctx.db_key) {
+                                        ControlResponse {
+                                            status: "error".to_string(),
+                                            error: Some(format!("Failed to save cache database: {}", err)),
+                                            unlocked: Some(true),
+                                            key_count: Some(count),
+                                        }
+                                    } else {
+                                        ControlResponse {
+                                            status: "ok".to_string(),
+                                            error: None,
+                                            unlocked: Some(true),
+                                            key_count: Some(count),
+                                        }
+                                    }
+                                }
+                                Err(e) => ControlResponse {
+                                    status: "error".to_string(),
+                                    error: Some(format!("Server sync request failed: {}", e)),
+                                    unlocked: Some(true),
+                                    key_count: Some(keyring.read().await.len()),
+                                },
+                            }
+                        } else {
+                            ControlResponse {
+                                status: "error".to_string(),
+                                error: Some("Agent is locked".to_string()),
+                                unlocked: Some(false),
+                                key_count: Some(0),
+                            }
+                        }
+                    } else {
+                        ControlResponse {
+                            status: "error".to_string(),
+                            error: Some("Not logged in. Please log in first.".to_string()),
+                            unlocked: Some(!keyring.read().await.is_empty()),
+                            key_count: Some(keyring.read().await.len()),
+                        }
+                    }
+                }
+                Err(e) => ControlResponse {
+                    status: "error".to_string(),
+                    error: Some(format!("Failed to load config: {}", e)),
                     unlocked: Some(!keyring.read().await.is_empty()),
                     key_count: Some(keyring.read().await.len()),
                 },

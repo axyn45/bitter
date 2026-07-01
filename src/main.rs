@@ -283,6 +283,27 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             println!("Logged out successfully. Configuration, session, and local cache cleared.");
         }
         Commands::Sync => {
+            // Check if daemon is running and unlocked to perform passwordless sync
+            if daemon::is_agent_running() {
+                println!("Requesting running agent daemon to perform sync...");
+                match daemon::send_control_request(daemon::ControlRequest::Sync).await {
+                    Ok(resp) => {
+                        if resp.status == "ok" {
+                            println!(
+                                "Sync completed successfully via agent daemon. Synced {} SSH keys.",
+                                resp.key_count.unwrap_or(0)
+                            );
+                            return Ok(());
+                        } else {
+                            println!("Agent daemon could not sync: {}. Falling back to password-based sync...", resp.error.unwrap_or_default());
+                        }
+                    }
+                    Err(e) => {
+                        println!("Could not communicate with agent daemon: {}. Falling back to password-based sync...", e);
+                    }
+                }
+            }
+
             let token = config
                 .access_token
                 .as_ref()
