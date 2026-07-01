@@ -102,6 +102,13 @@ pub struct AttachmentSync {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct SshKeySync {
+    pub private_key: Option<String>,
+    pub public_key: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct CipherSync {
     pub id: String,
     pub r#type: i32, // 1: Login, 2: SecureNote, etc.
@@ -110,6 +117,7 @@ pub struct CipherSync {
     pub fields: Option<Vec<FieldSync>>,
     pub login: Option<LoginSync>,
     pub attachments: Option<Vec<AttachmentSync>>,
+    pub ssh_key: Option<SshKeySync>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

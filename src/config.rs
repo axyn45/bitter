@@ -1,4 +1,7 @@
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use directories::ProjectDirs;
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
@@ -44,10 +47,21 @@ pub struct Config {
     #[serde(default = "generate_device_id")]
     pub device_id: String,
     pub access_token: Option<String>,
+    pub cache_salt: Option<String>,
 }
 
 fn generate_device_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+fn generate_cache_salt() -> String {
+    let mut salt = [0u8; 16];
+    let sr = SystemRandom::new();
+    if sr.fill(&mut salt).is_ok() {
+        BASE64_STANDARD.encode(salt)
+    } else {
+        BASE64_STANDARD.encode(uuid::Uuid::new_v4().as_bytes())
+    }
 }
 
 impl Default for Config {
@@ -63,6 +77,7 @@ impl Default for Config {
             vault_cache_path: None,
             device_id: generate_device_id(),
             access_token: None,
+            cache_salt: Some(generate_cache_salt()),
         }
     }
 }
@@ -95,12 +110,17 @@ impl Config {
         }
 
         let content = fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content).map_err(|e| {
+        let mut config: Config = toml::from_str(&content).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to parse config: {}", e),
             )
         })?;
+
+        if config.cache_salt.is_none() {
+            config.cache_salt = Some(generate_cache_salt());
+            config.save()?;
+        }
 
         Ok(config)
     }

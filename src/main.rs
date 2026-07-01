@@ -2,6 +2,7 @@ mod api;
 mod cli;
 mod config;
 mod crypto;
+mod storage;
 
 use api::ApiClient;
 use clap::Parser;
@@ -176,6 +177,9 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
         }
         Commands::Logout => {
             println!("Logging out...");
+            if let Err(e) = storage::wipe_db() {
+                eprintln!("Warning: Failed to delete local database cache: {}", e);
+            }
             config.email = None;
             config.client_id = None;
             config.client_secret = None;
@@ -183,7 +187,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             config
                 .save()
                 .map_err(|e| format!("Failed to save configuration: {}", e))?;
-            println!("Logged out successfully. Configuration and session cleared.");
+            println!("Logged out successfully. Configuration, session, and local cache cleared.");
         }
         Commands::Sync => {
             let token = config
@@ -194,10 +198,57 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             let api_client = ApiClient::new(&config.server_url);
             println!("Syncing ciphers from server {}...", config.server_url);
 
+            let password = rpassword::prompt_password("Master Password (to decrypt vault keys): ")
+                .map_err(|e| format!("Password prompt failed: {}", e))?;
+
+            let email = config.email.as_ref().ok_or_else(|| {
+                "Email address missing from config. Please log in again.".to_string()
+            })?;
+
+            println!("Fetching KDF settings...");
+            let prelogin = api_client.prelogin(email).await?;
+
+            println!("Deriving keys...");
+            let master_key = match prelogin.kdf {
+                0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations)?,
+                1 => {
+                    let mem = prelogin
+                        .kdf_memory
+                        .ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
+                    let para = prelogin
+                        .kdf_parallelism
+                        .ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
+                    crypto::derive_master_key_argon2(
+                        &password,
+                        email,
+                        prelogin.kdf_iterations,
+                        mem,
+                        para,
+                    )?
+                }
+                t => return Err(format!("Unsupported KDF type: {}", t)),
+            };
+
+            let salt = config
+                .cache_salt
+                .as_ref()
+                .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+            let db_key = storage::derive_db_key(&password, salt)?;
+
             let sync_data = api_client.sync(token).await?;
-            println!("Fetched {} ciphers successfully.", sync_data.ciphers.len());
+
+            let (enc_key, mac_key) =
+                crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key)?;
+
+            println!("Decrypting and filtering SSH keys...");
+            let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+
+            println!("Saving encrypted cache to disk...");
+            storage::save_db(&ssh_keys, &db_key)?;
+
             println!(
-                "(Encryption keys and local database storage will be implemented in Phase 3.)"
+                "Sync completed successfully. Synced {} SSH keys.",
+                ssh_keys.len()
             );
         }
         Commands::Settings(args) => {
@@ -234,7 +285,29 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
         }
         Commands::Keys(args) => match args.command {
             KeysCommands::List => {
-                println!("Listing keys... (Will be implemented in Phase 3)");
+                let password = rpassword::prompt_password("Master Password: ")
+                    .map_err(|e| format!("Password prompt failed: {}", e))?;
+
+                let salt = config
+                    .cache_salt
+                    .as_ref()
+                    .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                let db_key = storage::derive_db_key(&password, salt)?;
+
+                let keys = storage::load_db(&db_key)?;
+                if keys.is_empty() {
+                    println!(
+                        "No SSH keys found in local cache. Run 'sshwarden sync' to fetch them."
+                    );
+                } else {
+                    println!("Available SSH Keys ({}):", keys.len());
+                    for (i, key) in keys.iter().enumerate() {
+                        println!("{}. {} [ID: {}]", i + 1, key.name, key.id);
+                        if let Some(ref note) = key.note {
+                            println!("   Note: {}", note);
+                        }
+                    }
+                }
             }
             KeysCommands::Add => {
                 println!("Adding new key... (Will be implemented in Phase 3)");
