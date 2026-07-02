@@ -790,15 +790,18 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
 }
 
 fn get_current_time_string() -> String {
+    // SAFETY: We use thread-safe libc calls `localtime_r` and `strftime` with local stack allocations.
+    // Zero-initializing `tm` is safe as it is a Plain Old Data (POD) struct and is written to by `localtime_r`.
     unsafe {
         let t = libc::time(std::ptr::null_mut());
-        let tm = libc::localtime(&t);
+        let mut tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
         let mut buf = [0u8; 64];
         let len = libc::strftime(
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
             b"%Y-%m-%d %H:%M:%S\0".as_ptr() as *const libc::c_char,
-            tm,
+            &tm,
         );
         if len > 0 {
             String::from_utf8_lossy(&buf[..len]).into_owned()

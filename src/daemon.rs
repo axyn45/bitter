@@ -153,7 +153,9 @@ pub fn stop_agent() -> Result<(), String> {
 
     info!("Stopping agent with PID {}...", pid);
 
-    // Send SIGTERM
+    // SAFETY: `libc::kill` is a standard Unix system call. We pass `pid` (parsed from the local
+    // pid file) and a standard signal constant `libc::SIGTERM`. This call is memory safe as it only
+    // interacts with the OS scheduler and process control and does not perform memory dereferences.
     unsafe {
         if libc::kill(pid, libc::SIGTERM) != 0 {
             let err = std::io::Error::last_os_error();
@@ -229,7 +231,9 @@ pub fn is_agent_running() -> bool {
     }
 
     if let Ok(pid) = pid_str.trim().parse::<i32>() {
-        // libc::kill with signal 0 checks if the pid exists and can receive signals
+        // SAFETY: `libc::kill` with signal `0` is a standard, memory-safe POSIX system call
+        // used to check for the existence of the process with the given PID. It does not send
+        // a terminating signal or dereference memory.
         unsafe {
             return libc::kill(pid, 0) == 0;
         }
@@ -1248,14 +1252,20 @@ async fn prompt_tty_for_unlock(
         .open(&tty_path)
         .map_err(|e| format!("Failed to open TTY: {}", e))?;
 
-    // Disable terminal echo
     let fd = tty.as_raw_fd();
+    // SAFETY: `libc::termios` is a Plain Old Data (POD) struct containing only primitive fields.
+    // Zero-initializing it is safe and it is immediately fully populated by `tcgetattr`.
     let mut termios = unsafe { std::mem::zeroed() };
+    
+    // SAFETY: `fd` is a valid open file descriptor for the user's controlling TTY,
+    // and `&mut termios` points to a valid local stack allocation.
     let has_termios = unsafe { libc::tcgetattr(fd, &mut termios) == 0 };
     if has_termios {
         let mut no_echo = termios;
         no_echo.c_lflag &= !libc::ECHO;
         no_echo.c_lflag &= !libc::ECHONL;
+        // SAFETY: `fd` is a valid open file descriptor, and `&no_echo` points to a valid
+        // termios struct configured to temporarily disable screen echo.
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) };
     }
 
@@ -1269,6 +1279,8 @@ async fn prompt_tty_for_unlock(
 
     // Restore echo immediately
     if has_termios {
+        // SAFETY: `fd` is a valid open file descriptor, and `&termios` points to the
+        // original termios settings we read on function entry, restoring user terminal state.
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
     }
     tty.write_all(b"\n").map_err(|e| e.to_string())?;
