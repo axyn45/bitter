@@ -1169,6 +1169,22 @@ async fn prompt_tty_for_unlock(
         return Ok(());
     }
 
+    // Load config to check if logged in and cache database exists
+    let config = crate::config::Config::load()
+        .map_err(|e| format!("Failed to load config: {}", e))?;
+
+    if config.email.is_none() {
+        return Err("Not logged in".to_string());
+    }
+
+    let db_exists = crate::storage::db_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+
+    if !db_exists {
+        return Err("Local database cache is empty".to_string());
+    }
+
     let tty_path = get_tty_path_for_pid(peer_pid)
         .ok_or_else(|| "Could not resolve client TTY path".to_string())?;
 
@@ -1210,9 +1226,7 @@ async fn prompt_tty_for_unlock(
         return Err("Empty password".to_string());
     }
 
-    // Load config to get email/salt
-    let config = crate::config::Config::load()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+
 
     let salt = config.cache_salt.as_ref()
         .ok_or_else(|| "No cache salt found in configuration".to_string())?;
