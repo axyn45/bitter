@@ -431,8 +431,9 @@ async fn run_daemon_loops(
             Ok((stream, _)) = agent_listener.accept() => {
                 let kr = keyring.clone();
                 let la = last_activity.clone();
+                let kc = keys_context.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ssh_agent_connection(stream, kr, la).await {
+                    if let Err(e) = handle_ssh_agent_connection(stream, kr, la, kc).await {
                         error!("SSH Agent connection error: {}", e);
                     }
                 });
@@ -465,6 +466,7 @@ async fn handle_ssh_agent_connection(
     mut stream: UnixStream,
     keyring: KeyRing,
     last_activity: Arc<RwLock<Instant>>,
+    keys_context: SharedKeysContext,
 ) -> Result<(), std::io::Error> {
     debug!("New SSH Agent connection accepted.");
     loop {
@@ -483,6 +485,16 @@ async fn handle_ssh_agent_connection(
 
         // Update inactivity timer
         *last_activity.write().await = Instant::now();
+
+        // Check if vault is locked (keyring empty) and it's a request that needs keys
+        let msg_type = payload.first().copied().unwrap_or(0);
+        if keyring.read().await.is_empty() && (msg_type == 11 || msg_type == 13) {
+            if let Some(peer_pid) = stream.peer_cred().ok().and_then(|cred| cred.pid()) {
+                if let Err(err) = prompt_tty_for_unlock(peer_pid, &keyring, &keys_context).await {
+                    error!("TTY unlock failed: {}", err);
+                }
+            }
+        }
 
         // Process request
         let keys = keyring.read().await;
@@ -1125,4 +1137,109 @@ fn get_map_val<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
         }
     }
     None
+}
+
+fn get_tty_path_for_pid(pid: i32) -> Option<PathBuf> {
+    for fd in &[2, 0, 1] {
+        let fd_path = format!("/proc/{}/fd/{}", pid, fd);
+        if let Ok(target) = std::fs::read_link(&fd_path) {
+            let target_str = target.to_string_lossy();
+            if target_str.starts_with("/dev/pts/") || target_str == "/dev/tty" {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+async fn prompt_tty_for_unlock(
+    peer_pid: i32,
+    keyring: &KeyRing,
+    keys_context: &SharedKeysContext,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    let tty_path = get_tty_path_for_pid(peer_pid)
+        .ok_or_else(|| "Could not resolve client TTY path".to_string())?;
+
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&tty_path)
+        .map_err(|e| format!("Failed to open TTY: {}", e))?;
+
+    // Disable terminal echo
+    let fd = tty.as_raw_fd();
+    let mut termios = unsafe { std::mem::zeroed() };
+    let has_termios = unsafe { libc::tcgetattr(fd, &mut termios) == 0 };
+    if has_termios {
+        let mut no_echo = termios;
+        no_echo.c_lflag &= !libc::ECHO;
+        no_echo.c_lflag &= !libc::ECHONL;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) };
+    }
+
+    tty.write_all(b"\r\n[sshwarden] SSH Agent request received, but vault is locked.\r\nMaster Password: ")
+        .map_err(|e| e.to_string())?;
+    let _ = tty.flush();
+
+    let mut reader = BufReader::new(&mut tty);
+    let mut password = String::new();
+    let read_res = reader.read_line(&mut password);
+
+    // Restore echo immediately
+    if has_termios {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+    }
+    tty.write_all(b"\n").map_err(|e| e.to_string())?;
+
+    read_res.map_err(|e| format!("Failed to read password from TTY: {}", e))?;
+    let password = password.trim().to_string();
+
+    if password.is_empty() {
+        return Err("Empty password".to_string());
+    }
+
+    // Load config to get email/salt
+    let config = crate::config::Config::load()
+        .map_err(|e| format!("Failed to load config: {}", e))?;
+
+    let salt = config.cache_salt.as_ref()
+        .ok_or_else(|| "No cache salt found in configuration".to_string())?;
+
+    // Derive DB key
+    tty.write_all(b"[sshwarden] Deriving encryption key (Argon2)... ").map_err(|e| e.to_string())?;
+    let _ = tty.flush();
+    let db_key = crate::storage::derive_db_key(&password, salt)
+        .map_err(|e| format!("KDF failed: {}", e))?;
+    tty.write_all(b"Done.\r\n").map_err(|e| e.to_string())?;
+
+    // Load local database
+    let items = crate::storage::load_db(&db_key)
+        .map_err(|e| format!("Password incorrect or local database decryption failed: {}", e))?;
+
+    // Parse SSH keys
+    let mut parsed_keys = Vec::new();
+    for item in &items {
+        if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(&item.private_key) {
+            pkey.set_comment(&item.name);
+            parsed_keys.push(pkey);
+        }
+    }
+
+    let count = parsed_keys.len();
+    *keyring.write().await = parsed_keys;
+    *keys_context.write().await = Some(KeysContext {
+        enc_key: [0u8; 32],
+        mac_key: [0u8; 32],
+        db_key,
+    });
+
+    tty.write_all(format!("[sshwarden] Vault unlocked successfully. Loaded {} keys.\r\n\n", count).as_bytes())
+        .map_err(|e| e.to_string())?;
+    let _ = tty.flush();
+
+    Ok(())
 }
