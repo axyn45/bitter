@@ -559,8 +559,7 @@ async fn handle_control_connection(
     let mut request_bytes = Vec::new();
     stream.read_to_end(&mut request_bytes).await?;
 
-    // Update inactivity timer
-    *last_activity.write().await = Instant::now();
+
 
     let req: ControlRequest = match serde_json::from_slice(&request_bytes) {
         Ok(r) => r,
