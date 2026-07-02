@@ -51,6 +51,8 @@ pub struct Config {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub cache_salt: Option<String>,
+    pub last_sync_time: Option<String>,
+    pub local_key_count: Option<usize>,
 }
 
 fn generate_device_id() -> String {
@@ -82,6 +84,8 @@ impl Default for Config {
             access_token: None,
             refresh_token: None,
             cache_salt: Some(generate_cache_salt()),
+            last_sync_time: None,
+            local_key_count: None,
         }
     }
 }

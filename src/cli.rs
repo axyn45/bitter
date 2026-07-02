@@ -34,6 +34,9 @@ pub enum Commands {
 
     /// Unlock the agent by supplying the master password
     Unlock,
+
+    /// View global status of sshwarden
+    Status,
 }
 
 #[derive(Debug, Args)]
