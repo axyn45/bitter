@@ -771,13 +771,10 @@ async fn run_websocket_sync_loop(
     keys_context: SharedKeysContext,
     keyring: KeyRing,
 ) -> Result<(), String> {
-    let config =
+    let mut config =
         crate::config::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
 
-    let token = config
-        .access_token
-        .as_ref()
-        .ok_or_else(|| "No session token in configuration".to_string())?;
+    let token = config.get_valid_token().await?;
 
     let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
     let client = ApiClient::new(&config.server_url);
@@ -845,14 +842,18 @@ async fn run_websocket_sync_loop(
                                         if let Some(cipher_id) = cipher_id {
                                             info!("WebSocket: Received cipher update event for ID: {}. Processing surgically...", cipher_id);
                                             let client_clone = client.clone();
-                                            let token_clone = token.clone();
                                             let kc_clone = keys_context.clone();
                                             let kr_clone = keyring.clone();
                                             let cipher_id_str = cipher_id.to_string();
                                             tokio::spawn(async move {
+                                                let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
+                                                    cfg.get_valid_token().await.unwrap_or_default()
+                                                } else {
+                                                    String::new()
+                                                };
                                                 if let Err(e) = handle_surgical_cipher_update(
                                                     &client_clone,
-                                                    &token_clone,
+                                                    &current_token,
                                                     &cipher_id_str,
                                                     &kc_clone,
                                                     &kr_clone,
@@ -870,7 +871,12 @@ async fn run_websocket_sync_loop(
                                             ut
                                         );
 
-                                        match client.sync(token).await {
+                                        let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
+                                            cfg.get_valid_token().await.unwrap_or_else(|_| token.clone())
+                                        } else {
+                                            token.clone()
+                                        };
+                                        match client.sync(&current_token).await {
                                             Ok(sync_data) => {
                                                 let ctx_opt = keys_context.read().await;
                                                 if let Some(ref ctx) = *ctx_opt {
@@ -976,14 +982,18 @@ async fn run_websocket_sync_loop(
                                                         if let Some(cipher_id) = cipher_id {
                                                             info!("WebSocket (binary): Received cipher update event for ID: {}. Processing surgically...", cipher_id);
                                                             let client_clone = client.clone();
-                                                            let token_clone = token.clone();
                                                             let kc_clone = keys_context.clone();
                                                             let kr_clone = keyring.clone();
                                                             let cipher_id_str = cipher_id.to_string();
                                                             tokio::spawn(async move {
+                                                                let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
+                                                                    cfg.get_valid_token().await.unwrap_or_default()
+                                                                } else {
+                                                                    String::new()
+                                                                };
                                                                 if let Err(e) = handle_surgical_cipher_update(
                                                                     &client_clone,
-                                                                    &token_clone,
+                                                                    &current_token,
                                                                     &cipher_id_str,
                                                                     &kc_clone,
                                                                     &kr_clone,
@@ -997,7 +1007,12 @@ async fn run_websocket_sync_loop(
                                                     } else if ut_val == 0 || ut_val == 4 || ut_val == 5 {
                                                         // Full Sync
                                                         info!("WebSocket (binary): Received vault update event (Type {}). Syncing...", ut_val);
-                                                        match client.sync(token).await {
+                                                        let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
+                                                            cfg.get_valid_token().await.unwrap_or_else(|_| token.clone())
+                                                        } else {
+                                                            token.clone()
+                                                        };
+                                                        match client.sync(&current_token).await {
                                                             Ok(sync_data) => {
                                                                 let ctx_opt = keys_context.read().await;
                                                                 if let Some(ref ctx) = *ctx_opt {

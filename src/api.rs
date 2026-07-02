@@ -257,6 +257,39 @@ impl ApiClient {
         Ok(token_resp)
     }
 
+    /// Refreshes access token using a refresh token
+    pub async fn refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<TokenResponse, String> {
+        let url = format!("{}/connect/token", self.identity_url);
+
+        let mut params = HashMap::new();
+        params.insert("grant_type", "refresh_token".to_string());
+        params.insert("client_id", "web".to_string());
+        params.insert("refresh_token", refresh_token.to_string());
+
+        let response = self
+            .client
+            .post(&url)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("Token refresh request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(format!("Token refresh failed ({}): {}", url, err_text));
+        }
+
+        let resp: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+        Ok(resp)
+    }
+
     /// Authenticates using Personal API Key client credentials
     pub async fn login_api_key(
         &self,

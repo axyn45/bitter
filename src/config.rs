@@ -8,6 +8,8 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use crate::api::ApiClient;
+use tracing;
 
 const APP_NAME: &str = "sshwarden";
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -47,6 +49,7 @@ pub struct Config {
     #[serde(default = "generate_device_id")]
     pub device_id: String,
     pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
     pub cache_salt: Option<String>,
 }
 
@@ -77,6 +80,7 @@ impl Default for Config {
             vault_cache_path: None,
             device_id: generate_device_id(),
             access_token: None,
+            refresh_token: None,
             cache_salt: Some(generate_cache_salt()),
         }
     }
@@ -198,5 +202,66 @@ impl Config {
         file.flush()?;
 
         Ok(())
+    }
+
+    /// Checks if the stored access token is expired or close to expiring
+    pub fn is_token_expired(&self) -> bool {
+        let token = match &self.access_token {
+            Some(t) => t,
+            None => return true,
+        };
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() < 2 {
+            return true;
+        }
+        let payload_b64 = parts[1];
+        let mut pad = payload_b64.to_string();
+        while pad.len() % 4 != 0 {
+            pad.push('=');
+        }
+        let pad = pad.replace('-', "+").replace('_', "/");
+        if let Ok(decoded) = BASE64_STANDARD.decode(pad) {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+                if let Some(exp) = val.get("exp").and_then(|e| e.as_i64()) {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    // Expired if current time is past (exp - 60s buffer)
+                    return now >= (exp - 60);
+                }
+            }
+        }
+        true
+    }
+
+    /// Returns a valid access token, refreshing it if expired and refresh token is available
+    pub async fn get_valid_token(&mut self) -> Result<String, String> {
+        let access_token = self.access_token.as_ref().ok_or_else(|| "Not logged in".to_string())?;
+
+        if self.is_token_expired() {
+            if let Some(ref refresh_token) = self.refresh_token {
+                tracing::info!("Access token is expired. Refreshing token...");
+                let client = ApiClient::new(&self.server_url);
+                match client.refresh_token(refresh_token).await {
+                    Ok(token_resp) => {
+                        self.access_token = Some(token_resp.access_token.clone());
+                        if let Some(ref rt) = token_resp.refresh_token {
+                            self.refresh_token = Some(rt.clone());
+                        }
+                        self.save().map_err(|e| format!("Failed to save refreshed token: {}", e))?;
+                        tracing::info!("Token refreshed successfully.");
+                        return Ok(token_resp.access_token);
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to refresh token: {}", e));
+                    }
+                }
+            } else {
+                return Err("Access token is expired and no refresh token is available.".to_string());
+            }
+        }
+
+        Ok(access_token.clone())
     }
 }

@@ -192,6 +192,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             // Store token and configurations
             config.server_url = server_url;
             config.access_token = Some(token_resp.access_token.clone());
+            config.refresh_token = token_resp.refresh_token.clone();
             config.email = Some(email);
             config
                 .save()
@@ -283,15 +284,12 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             println!("Logged out successfully. Configuration, session, and local cache cleared.");
         }
         Commands::Sync => {
-            let token = config
-                .access_token
-                .as_ref()
-                .ok_or_else(|| "Not logged in. Please run 'sshwarden login' first.".to_string())?;
+            let token = config.get_valid_token().await?;
 
             let api_client = ApiClient::new(&config.server_url);
             println!("Syncing ciphers from server {}...", config.server_url);
 
-            let sync_data = api_client.sync(token).await?;
+            let sync_data = api_client.sync(&token).await?;
 
             let mut cached_keys = None;
             if config.timeout.trim().to_lowercase() == "never" {
