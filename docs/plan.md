@@ -1,6 +1,6 @@
-# sshwarden: Headless Bitwarden SSH Agent Client
+# sshwarden: Headless Bitwarden SSH Agent & Terminal Vault Client
 
-`sshwarden` is a headless, server-friendly Bitwarden client implemented in Rust that acts as a local SSH agent. It allows users to securely use SSH keys stored in their Bitwarden vaults on headless Linux servers without requiring the official graphical Bitwarden Desktop client.
+`sshwarden` is a headless, server-friendly Bitwarden client implemented in Rust that acts as a local SSH agent and terminal vault client. It allows users to securely use SSH keys stored in their Bitwarden vaults on headless Linux servers without requiring the official graphical Bitwarden Desktop client, while providing a full terminal interface for vault interaction.
 
 ---
 
@@ -8,23 +8,23 @@
 
 ### In-Scope
 - **Headless SSH Agent Daemon**: Listens on a Unix domain socket and serves SSH keys to SSH clients.
-- **Bitwarden Synchronization**: Connects to Bitwarden (official or self-hosted like Vaultwarden), downloads vault items, filters out everything except SSH keys, and stores them in a secure local cache.
-- **Credential Management**: Commands to list, add/create, edit, and delete SSH keys within the Bitwarden vault.
-- **Flexible Authentication**: Supports Personal API Keys (`client_id` + `client_secret`) and traditional Email + Password logins. (SSO is deferred for future implementation).
+- **Bitwarden Synchronization**: Connects to Bitwarden (official or self-hosted like Vaultwarden), downloads vault items, filters out SSH keys for the agent, and caches them in a secure local database.
+- **Session/Profile Separation**: Stores user credentials and access tokens separately from application settings to allow safe dotfiles sharing.
+- **Flexible Authentication**: Supports Personal API Keys (`client_id` + `client_secret`), traditional Email + Password, SSO (OAuth callback), and Device Approval (Push Notifications on another device).
 - **Custom Servers**: Full support for self-hosted instances (e.g., Vaultwarden).
 - **Session Security**:
   - Configurable session timeout (immediately, 1m, 5m, 15m, 30m, 1h, 4h, on logout, never, custom).
   - Timeout actions: `lock` (requires master password to decrypt vault) and `logout` (wipes credentials and cache).
-- **Target Platform**: Linux (x86_64 and AArch64).
+- **Interactive TUI (Terminal User Interface)**:
+  - Interactive, keyboard-driven dashboard using `ratatui`.
+  - Vault search, fuzzy filtering, item detail viewing, folder management, and full CRUD (Create, Read, Update, Delete) vault item management.
+  - Secure clipboards with automatic memory cleanup.
+- **Multi-Vault & Organization Support**: Access and manage personal vaults alongside organization collection vaults.
+- **Target Platform**: Linux (x86_64 and AArch64) and macOS.
 
 ### Out-of-Scope
-- Graphic User Interface (GUI).
-- General password/credentials management (non-SSH items).
-- Non-Linux OS support (initial release target is strictly Linux).
-
-### Future Work / Deferred Features
-- **SSO Authentication**: Supporting single-sign-on (SSO) authentication.
-- **TUI Configuration Interface**: A Terminal User Interface (TUI) for interactive, guided configuration of sshwarden settings directly in a headless terminal, to be implemented after the core features are stable.
+- Desktop Graphical User Interface (GUI) like Electron.
+- Integrations with OS keychains (e.g., Apple Keychain or GNOME Keyring) to maintain independent command-line self-containment.
 
 ---
 
@@ -40,52 +40,51 @@ graph TD
     Daemon -->|Loads encrypted keys| SecureMem[Secure Memory / Kernel Keyring]
     Core -->|Syncs/Updates| BW_API[Bitwarden API / Self-hosted]
     Core -->|Encrypts/Decrypts| DB[Local Encrypted Vault Cache]
-    Config -->|Reads/Writes| DB
+    Config -->|Reads/Writes Settings| DB
+    Session[Session Registry] -->|Stores tokens/profile| SessionStore[session.json 0600]
+    TUI[TUI Interface / Ratatui] -->|Visual CRUD/Settings| Core
 ```
 
 ### Module Structure (Rust Crate)
 
 A single cargo crate with clear module separation:
-- `src/main.rs`: Entry point, runs CLI command routing.
-- `src/cli.rs`: CLI definition using `clap`. Defines all subcommands (`login`, `logout`, `sync`, `settings`, `keys`, `daemon`).
-- `src/api/`: Bitwarden REST API client (authentication, syncing, editing ciphers).
+- `src/main.rs`: Entry point, runs CLI command routing and boots TUI if launched in interactive mode.
+- `src/cli.rs`: CLI definition using `clap`. Defines all subcommands (`login`, `logout`, `sync`, `settings`, `keys`, `daemon`, `status`).
+- `src/api/`: Bitwarden REST API client (authentication, syncing, editing ciphers, and notification hub).
 - `src/crypto/`: Vault cryptography (KDF generation, Master Key derivation, AES-256-CBC/GCM decryption of Bitwarden payloads, local cache encryption).
-- `src/storage/`: Manages configuration files, cache storage (`~/.config/sshwarden/` and `~/.cache/sshwarden/`).
+- `src/storage/`: Manages configuration files (`config.toml`), session credentials (`session.json`), and local cache databases (`vault.db`).
 - `src/agent/`: SSH agent socket listener, protocol parsing, and key serving.
-- `src/daemon/`: Daemonization helper, process life-cycle, background timeout monitoring.
-- `src/keyring/`: Interfacing with the Linux Kernel Keyring (`keyutils`) to store keys/passphrases securely in memory.
+- `src/daemon/`: Daemonization helper, process life-cycle, background timeout monitoring, and active user session checks.
+- `src/tui/`: Full TUI implementation using `ratatui` and `crossterm` (forms, lists, fuzzy finders, folders, collections, settings).
 
 ---
 
 ## 3. Detailed Component Designs
 
 ### A. Authentication & Cryptography
-To interact with Bitwarden, `sshwarden` must implement the client-side cryptographic standard of Bitwarden:
+To interact with Bitwarden, `sshwarden` implements the client-side cryptographic standard of Bitwarden:
 1. **Key Derivation (KDF)**:
    - On login, fetch the user's KDF settings (PBKDF2 or Argon2id) from the API using their email.
    - Derives the **Master Key** using the password, salt (email), and KDF parameters.
    - Derives the **Master Key Hash** (sent to the server for authentication).
 2. **Session Key & Token**:
-   - Authenticate via API key (`client_id` + `client_secret`) or email/password.
-   - Receive the Identity JWT access token.
+   - Authenticates via password, API key, SSO, or device approval.
+   - Receives the Identity JWT access token and refresh token.
 3. **Local Cache Encryption**:
-   - The synced SSH keys are encrypted locally using a key derived from the user's master password (using Argon2id with a locally generated salt).
-   - This ensures that if the machine is powered off, the keys cannot be retrieved without the master password.
+   - The synced SSH keys and generic ciphers are encrypted locally using a key derived from the user's master password (using Argon2id with a locally generated salt).
 
-### B. Storage Design
+### B. Storage Design (Session vs Config)
 All files are stored according to the XDG Base Directory Specification:
-- **Configuration**: `~/.config/sshwarden/config.toml` (contains API server URL, KDF parameters, username, timeout configurations, and path to socket).
-- **Encrypted Cache**: `~/.cache/sshwarden/vault.db` (contains synced SSH key ciphers encrypted using local key).
-- **Socket Path**: `~/.run/sshwarden.sock` (or `/tmp/sshwarden_<uid>.sock`).
+- **Configuration (`~/.config/sshwarden/config.toml`)**: Contains server URL, KDF parameters, username, timeout configurations, and custom socket paths. Contains no secrets.
+- **Session Credentials (`~/.config/sshwarden/session.json`)**: Contains `email`, `device_id`, `access_token`, and `refresh_token`. Initialized with strict `0600` owner permissions.
+- **Encrypted Cache (`~/.cache/sshwarden/vault.db`)**: Contains synced SSH key ciphers and general credentials encrypted using the local DB key.
+- **Socket Path**: `~/.cache/sshwarden/ssh-agent.sock` (and control socket at `.control`).
 
-### C. SSH Agent Daemon
+### C. SSH Agent Daemon & TTY Hijacking
 The SSH agent runs as a background daemon process.
 - **Protocol**: Implements the standard SSH Agent Protocol over a Unix socket.
-- **Memory Security**:
-  - The daemon holds the decrypted private keys in memory.
-  - On `lock` (due to timeout or manual command), the decrypted keys are securely wiped from memory (`zeroize` crate).
-  - The daemon uses the Linux Kernel Keyring (`keyctl`) or protected memory pages (`mlock`) to prevent keys from being swapped to disk or read by other users.
-- **Interactive Unlock**: If a client requests a signature and the agent is locked, the agent will fail the request. The user can run `sshwarden unlock` from another terminal to provide the master password, which unlocks the daemon.
+- **TTY Hijacking**: If a client requests a signature and the agent is locked, the agent reads the client process's active TTY descriptor (`/proc/<pid>/fd/0`), disables terminal echo via `libc::tcsetattr`, securely prompts for the master password, derives the Argon2 keys, and unlocks itself directly on the active client session.
+- **Active User Session Check**: The daemon queries the POSIX `who` command every 30 seconds. If the user has 0 active terminal sessions for 60 consecutive seconds, the agent deletes its socket/PID files and terminates gracefully.
 
 ### D. Settings & Timeout Lifecycle
 The timeout daemon keeps track of the time elapsed since the last SSH signature request or user interaction:
@@ -95,101 +94,96 @@ The timeout daemon keeps track of the time elapsed since the last SSH signature 
 - **Logout Action**:
   - Wipes decrypted SSH keys from memory.
   - Deletes `~/.cache/sshwarden/vault.db` (encrypted cache).
-  - Deletes the identity tokens from config.
+  - Deletes the session token file `session.json`.
   - Requires full `sshwarden login` and `sshwarden sync` to be used again.
 
-### E. Hot Reloading & Daemon IPC Control
-To handle hot-reloading configurations (e.g., changing timeout settings via `sshwarden settings`) and vault cache updates (e.g., manually syncing via `sshwarden sync`), `sshwarden` implements a Unix socket IPC control mechanism:
-1. **Control IPC Socket**:
-   - The daemon creates a separate control socket at `<socket_path>.control` (e.g., `~/.run/sshwarden.sock.control`).
-   - The CLI connects to this control socket to notify the daemon of configuration changes, lock/unlock events, or cache invalidations.
-   - This socket is also used to securely transfer the derived master key from the CLI to the daemon during interactive `unlock` commands.
-2. **Dynamic Reloading**:
-   - When the daemon receives a reload command from the control socket:
-     - For configuration updates: It re-reads `config.toml` and updates active settings (such as the timeout duration) in-memory.
-     - For vault cache updates: If the daemon is unlocked, it re-reads the encrypted cache `vault.db` from disk and decrypts the new SSH keys into memory.
+### E. Advanced Login Methods
+1. **SSO Authentication**:
+   - Spin up a temporary local HTTP server on a random port (e.g. `127.0.0.1:45678`).
+   - Open the browser pointing to the Bitwarden SSO page with the localhost callback as redirect URI.
+   - Capture the response parameters, perform token exchanges, and terminate the server.
+2. **Device Approval**:
+   - Initiate a login approval request on the Bitwarden server.
+   - Display the verification code on the terminal.
+   - Poll the server notification endpoint until the user approves the prompt on their registered phone or other active device.
 
-### F. Real-time Live Sync (WebSocket & SignalR Hub)
-To keep the local vault cache up-to-date without continuously pulling the entire vault (via `/sync`), `sshwarden` evaluates and implements real-time notifications:
-1. **Feasibility**:
-   - Both the official Bitwarden server and Vaultwarden support a notification hub.
-   - **Bitwarden Official**: Uses ASP.NET Core SignalR JSON protocol over WebSockets on the `/notifications/hub` endpoint.
-   - **Vaultwarden**: Standard WebSocket connections on the same `/notifications/hub` endpoint (integrated directly on Rocket in modern versions).
-   - This makes implementing a unified real-time websocket consumer in Rust highly feasible.
-2. **Connection Lifecycle**:
-   - On startup, the daemon initiates a negotiation request (`POST /api/notifications/hub/negotiate`) using the JWT access token to get a connection ID.
-   - It establishes a WebSocket connection to `wss://<server>/notifications/hub?access_token=<token>`.
-   - If connected to an official Bitwarden server, it sends the SignalR protocol handshake message: `{"protocol":"json","version":1}0x1E` (where `0x1E` is the record separator).
-   - Keeps the connection alive using standard WebSocket/SignalR ping/pong frames.
-3. **Payload Handling**:
-   - The daemon listens for `ReceiveUpdate` target events.
-   - When a notification arrives, it parses the payload arguments.
-   - If the update type represents a **full sync** (`SyncVault`), it schedules a full `/api/sync` run.
-   - If the update type is **cipher-specific** (`SyncCipherCreate`, `SyncCipherUpdate`), it reads the cipher ID (UUID) from the message and triggers a targeted fetch: `GET /api/ciphers/<id>/details`.
-   - The fetched cipher is decrypted, checked to see if it contains SSH key data, and then merged/updated locally in the encrypted cache.
-   - If the update type is **cipher deletion** (`SyncCipherDelete`), it deletes the corresponding cipher from the local cache.
-
-### F. Official SDK Evaluation (Bitwarden Secrets Manager SDK)
-We evaluated using the official `bitwarden` crate (available on [crates.io](https://crates.io/crates/bitwarden)):
-- **Conclusion**: We will **not** use the official `bitwarden` SDK.
-- **Rationale**:
-  - The official SDK crate is exclusively designed and supported for **Bitwarden Secrets Manager**. It uses a machine-account access token model and does not expose standard Password Manager (Personal Vault) APIs (e.g., user email/password login, client-side KDF master key derivation, standard cipher sync `/api/sync` or decryption).
-  - Standard users keep their SSH keys in their standard Password Manager vault (Logins, Secure Notes) rather than the developer-focused Secrets Manager product.
-  - Relying on the official SDK would make it impossible to connect to standard personal accounts or self-hosted Vaultwarden instances.
-- **Approach**: We will implement the standard Bitwarden Client REST API protocol in `src/api/` and `src/crypto/` modules directly.
+### F. Terminal User Interface (TUI)
+- **Engine**: Developed using `ratatui` and `crossterm`.
+- **Fuzzy Filtering**: Incorporates a fast fuzzy-matching library (e.g., `nucleo` or `fuzzy-matcher`) to filter vault ciphers instantly.
+- **Safe Clipboard**: Enables copying passwords/keys to clipboard with an asynchronous background thread that automatically clears the clipboard after 20 seconds.
+- **CRUD Operations**: Form-based editing for vault ciphers, folders, and custom fields.
 
 ---
 
 ## 4. SSH Key Representation in Bitwarden
 
-Bitwarden supports SSH keys natively and via custom fields. `sshwarden` will support:
-1. **Native SSH Key Items**: Bitwarden's standard SSH key type (type `100` or equivalent depending on API schema).
+Bitwarden supports SSH keys natively and via custom fields. `sshwarden` supports:
+1. **Native SSH Key Items**: Bitwarden's standard SSH key type (type `100`).
 2. **Secure Notes with Attachments**: Secure notes with standard names containing private keys.
 3. **Login / Note Items with Custom Fields**: Items where the private key is stored in a custom field named `ssh_private_key` or similar.
-
-During the `sync` process, `sshwarden` iterates through the decrypted payload, extracts these SSH keys, parses them (using `ssh-key` or `openssh-keys` crates), and organizes them into its local encrypted database.
 
 ---
 
 ## 5. Development Roadmap
 
-### Phase 1: Project Setup & CLI Skeleton
+### Phase 1: Project Setup & CLI Skeleton (Complete)
 - Initialize cargo workspace.
 - Setup CLI commands and arguments using `clap`.
 - Implement local configuration storage (`config.toml`).
 
-### Phase 2: Cryptography & Bitwarden API
+### Phase 2: Cryptography & Bitwarden API (Complete)
 - Implement Bitwarden client cryptography (KDF, PBKDF2, Argon2id, Master Key derivation).
 - Implement Bitwarden Login API (Password, API key auth, self-hosted endpoints).
 - Implement Vault Sync API (`/sync`).
 - Write CLI command `sshwarden login` and `sshwarden sync`.
 
-### Phase 3: Secure Local Storage & Cache
+### Phase 3: Secure Local Storage & Cache (Complete)
 - Implement secure encryption/decryption of the local vault cache.
 - Implement the filtering logic to store only SSH keys.
 - Write CLI command `sshwarden keys list/add/delete/edit` to manipulate vault ciphers.
 
-### Phase 4: SSH Agent Protocol & Unix Socket
+### Phase 4: SSH Agent Protocol & Unix Socket (Complete)
 - Implement SSH Agent Protocol parser.
 - Create Unix domain socket listener.
 - Implement signing operations with SSH private keys (RSA, Ed25519, ECDSA).
 - Implement daemonization of the agent process (`daemonize` crate).
 
-### Phase 5: Session Timeout & Security Hardening
+### Phase 5: Session Timeout & Security Hardening (Complete)
 - Implement background timeout monitoring in the daemon.
-- Integrate Linux Kernel Keyring (`keyctl`) for secure passphrase storage.
-- Implement memory protection (using `zeroize` and `secrecy` crates).
+- Implement TTY-hijacking for terminal unlock prompts.
+- Implement active user session monitoring (auto-quit on zero sessions).
 - Implement lock and logout behaviors.
 
-### Phase 6: WebSocket Live Sync Implementation
-- Implement the SignalR protocol negotiation and connection handshakes.
-- Build the WebSocket event listener task in the daemon using `tokio-tungstenite`.
-- Implement incremental cipher fetching (`GET /api/ciphers/<id>/details`) and incremental cache merging.
+### Phase 6: WebSocket Live Sync (Complete)
+- Implement SignalR protocol negotiation.
+- Build WebSocket event listener task in the daemon.
+- Implement incremental cipher details fetching and merging.
 
-### Phase 7: Testing & Packaging
-- Comprehensive unit tests for crypto and API mock-ups.
-- Integration testing of the SSH agent with `ssh-add` and standard OpenSSH clients.
-- Package as a statically linked binary for Linux.
+### Phase 7: Testing & Packaging (Complete)
+- Unit tests for KDF and cipher decryption.
+- Verify agent socket integration with standard OpenSSH clients.
+- Add statically linked musl target packaging.
+
+### Phase 8: User Profile & Session Isolation (Planned)
+- Extract session variables from `config.toml`.
+- Create `session.json` storage with strict `0600` permissions.
+- Update `storage` layer and CLI handlers to utilize the decoupled files.
+
+### Phase 9: API Key, SSO, and Device Push Login (Planned)
+- Implement API Key Login flow.
+- Add local callback HTTP server for OAuth SSO flow.
+- Implement Device Push Approval polling.
+
+### Phase 10: TUI Dashboard & CRUD (Planned)
+- Integrate `ratatui` and `crossterm`.
+- Design fuzzy-searchable list view, item details screen, and form editors.
+- Implement folder creation, folder editing, and folder assignment.
+- Build secure clipboard clearers and automatic lock overlay tasks.
+
+### Phase 11: Multi-Vault Organization Support (Planned)
+- Extend `storage` database to support collections and multiple organization vaults.
+- Implement decryption of organization ciphers using decrypted organization keys.
+- Add organization filter options in TUI and CLI views.
 
 ---
 
@@ -206,23 +200,24 @@ During the `sync` process, `sshwarden` iterates through the decrypted payload, e
 | `ssh-agent-lib` | SSH Agent protocol implementation |
 | `ssh-key` | Decoding and encoding SSH private/public keys |
 | `zeroize` | Securely clearing keys from memory |
-| `dirs` | standard XDG directory lookup |
+| `dirs` | Standard XDG directory lookup |
 | `daemonize` | Daemonizing the SSH agent process on Linux |
-| `keyutils` / `linux-keyutils` | Linux kernel keyring bindings |
 | `tokio-tungstenite` | WebSocket client for live sync notifications |
+| `ratatui` | Modern engine for building terminal user interfaces (TUI) |
+| `crossterm` | Cross-platform terminal raw mode manipulation |
+| `fuzzy-matcher` | High performance fuzzy-matching for TUI lists |
+| `copypasta` | Clipboard interaction for TUI copying |
+| `tiny_http` | Tiny HTTP server for capturing SSO OAuth callback redirects |
 
 ---
 
 ## 7. Architectural Guidelines & Coding Standards
 
 ### A. Code Standards & Style
-- **Rust Style Guide**: The codebase must strictly follow the official [Rust Style Guide](https://doc.rust-lang.org/style-guide/).
+- **Rust Style Guide**: Follow the official Rust Style Guide.
 - **Formatting**: Run `cargo fmt` to enforce uniform code styling.
-- **Linting**: Run `cargo clippy` and fix all warnings before merging features to ensure code quality.
+- **Safety Comments**: Every `unsafe` block must include a preceding `// SAFETY:` comment justifying its correctness and safety boundaries.
 
 ### B. Modularization & Decoupling
-To ensure high maintainability, reuse, and testing capability:
-- **Decoupled Components**: Separate concerns clearly. For instance, the cryptography code (`crypto/`) should not depend directly on XDG filesystem directories or REST HTTP requests. Similarly, the SSH Agent protocol parsing and logic (`agent/`) must be agnostic to the database/config serialization format.
-- **Reusable Utility Helpers**: Common patterns (e.g., zeroizing secrets in memory, cryptographic padding, custom error mappings) should be factored out into helper traits/modules to keep repetitive code minimal.
-- **Dependency Injection**: Utilize traits for abstracting storage (e.g., a `VaultCache` trait) and HTTP request backends to enable easy unit testing and mocking.
-
+- **Decoupled Components**: Keep the cryptography, database storage, and SSH agent logic decoupled. TUI views should strictly follow an Elm-like Model-View-Update (MVU) pattern to keep logic separate from render layouts.
+- **Security Invariance**: Raw master passwords or intermediate derived keys must never be logged or persist to disk under non-never timeout configurations.
