@@ -638,6 +638,9 @@ async fn handle_control_connection(
                         let mut kr = keyring.write().await;
                         *kr = parsed_keys;
 
+                        // Reset inactivity timer on successful unlock!
+                        *last_activity.write().await = Instant::now();
+
                          ControlResponse {
                             status: "ok".to_string(),
                             error: None,

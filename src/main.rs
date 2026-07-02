@@ -655,9 +655,13 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                                         Ok((enc_key, mac_key)) => {
                                             let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
                                             println!("Sync successful. Saving encrypted cache to disk...");
-                                            if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
-                                                eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
-                                            }
+                                             if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
+                                                 eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
+                                             } else {
+                                                 config.last_sync_time = Some(get_current_time_string());
+                                                 config.local_key_count = Some(ssh_keys.len());
+                                                 let _ = config.save();
+                                             }
                                             enc_hex = hex::encode(enc_key);
                                             mac_hex = hex::encode(mac_key);
                                             keys_to_load = ssh_keys;
