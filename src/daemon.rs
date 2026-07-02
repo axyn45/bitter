@@ -63,7 +63,7 @@ type KeyRing = Arc<RwLock<Vec<PrivateKey>>>;
 type SharedKeysContext = Arc<RwLock<Option<KeysContext>>>;
 
 /// Starts the agent background process
-pub async fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
+pub async fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
     let cache_dir =
         storage::cache_dir().ok_or_else(|| "Could not determine cache directory".to_string())?;
     fs::create_dir_all(&cache_dir)
@@ -85,7 +85,7 @@ pub async fn start_agent(foreground: bool, custom_socket_path: Option<PathBuf>) 
     info!("Starting sshwarden agent...");
     info!("SSH_AUTH_SOCK={}", socket_path.display());
 
-    if foreground {
+    if !background {
         let pid = std::process::id();
         fs::write(&pid_path, pid.to_string())
             .map_err(|e| format!("Failed to write pid file: {}", e))?;

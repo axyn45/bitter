@@ -121,9 +121,9 @@ pub enum KeysCommands {
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
-    /// Run the process in the foreground rather than daemonizing
+    /// Run the agent in the background (daemonize)
     #[arg(short, long)]
-    pub foreground: bool,
+    pub background: bool,
 
     /// Path to the Unix domain socket for the SSH agent listener
     #[arg(short, long)]

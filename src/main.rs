@@ -577,7 +577,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
         },
         Commands::Agent(args) => match args.command {
             AgentCommands::Start(start_args) => {
-                daemon::start_agent(start_args.foreground, start_args.socket).await?;
+                daemon::start_agent(start_args.background, start_args.socket).await?;
             }
             AgentCommands::Stop => {
                 daemon::stop_agent()?;
