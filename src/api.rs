@@ -81,7 +81,18 @@ pub struct TokenResponse {
     pub kdf_parallelism: Option<u32>,
     pub user_decryption_options: Option<UserDecryptionOptionsJson>,
 }
-
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+pub struct RefreshTokenResponse {
+    #[serde(rename = "access_token")]
+    pub access_token: String,
+    #[serde(rename = "expires_in")]
+    pub expires_in: u32,
+    #[serde(rename = "token_type")]
+    pub token_type: String,
+    #[serde(rename = "refresh_token")]
+    pub refresh_token: Option<String>,
+}
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileSync {
@@ -261,7 +272,7 @@ impl ApiClient {
     pub async fn refresh_token(
         &self,
         refresh_token: &str,
-    ) -> Result<TokenResponse, String> {
+    ) -> Result<RefreshTokenResponse, String> {
         let url = format!("{}/connect/token", self.identity_url);
 
         let mut params = HashMap::new();
@@ -282,7 +293,7 @@ impl ApiClient {
             return Err(format!("Token refresh failed ({}): {}", url, err_text));
         }
 
-        let resp: TokenResponse = response
+        let resp: RefreshTokenResponse = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse token response: {}", e))?;
