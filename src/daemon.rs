@@ -353,15 +353,45 @@ async fn run_daemon_loops(
     let mut sigterm = signal(SignalKind::terminate()).unwrap();
     let mut sigint = signal(SignalKind::interrupt()).unwrap();
 
-    // Spawn the inactivity watchdog task
+    // Spawn the inactivity watchdog and user session watcher task
     let kr = keyring.clone();
     let la = last_activity.clone();
     let st = shared_timeout.clone();
     let sta = shared_timeout_action.clone();
     let kc = keys_context.clone();
+    let sp_clone = socket_path.clone();
+    let cp_clone = control_socket_path.clone();
+    let pp_clone = pid_path.clone();
     tokio::spawn(async move {
+        let username = get_current_username();
+        let mut zero_session_checks = 0;
+        let mut check_counter = 0;
+
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            // Session check runs every 30 seconds (6 * 5 seconds loop)
+            check_counter += 1;
+            if check_counter >= 6 {
+                check_counter = 0;
+                if !username.is_empty() {
+                    let active_sessions = count_active_user_sessions(&username);
+                    if active_sessions == 0 {
+                        zero_session_checks += 1;
+                        info!("No active sessions detected for user '{}'. Check: {}/2", username, zero_session_checks);
+                        if zero_session_checks >= 2 {
+                            info!("No active login sessions found for user '{}' for 60 seconds. Stopping agent daemon.", username);
+                            let _ = fs::remove_file(&sp_clone);
+                            let _ = fs::remove_file(&cp_clone);
+                            let _ = fs::remove_file(&pp_clone);
+                            std::process::exit(0);
+                        }
+                    } else {
+                        zero_session_checks = 0;
+                    }
+                }
+            }
+
             let timeout_dur_opt = *st.read().await;
             if let Some(timeout_dur) = timeout_dur_opt {
                 let last_act = *la.read().await;
@@ -1264,4 +1294,42 @@ async fn prompt_tty_for_unlock(
     let _ = tty.flush();
 
     Ok(())
+}
+
+fn get_current_username() -> String {
+    if let Ok(user) = std::env::var("USER") {
+        if !user.is_empty() {
+            return user;
+        }
+    }
+    if let Ok(user) = std::env::var("LOGNAME") {
+        if !user.is_empty() {
+            return user;
+        }
+    }
+    if let Ok(output) = std::process::Command::new("id").args(&["-un"]).output() {
+        let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !user.is_empty() {
+            return user;
+        }
+    }
+    String::new()
+}
+
+fn count_active_user_sessions(username: &str) -> usize {
+    let output = match std::process::Command::new("who").output() {
+        Ok(out) => out,
+        Err(_) => return 1,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut count = 0;
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(&user) = parts.first() {
+            if user == username {
+                count += 1;
+            }
+        }
+    }
+    count
 }
