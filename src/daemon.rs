@@ -731,7 +731,12 @@ async fn handle_surgical_cipher_update(
         }
     }
 
+    let existed = updated_items.iter().any(|item| item.id == cipher_id);
     if is_deleted {
+        if !existed {
+            // Early exit if it's not an SSH key (or is deleted) and didn't exist in our cache
+            return Ok(());
+        }
         // Remove from list
         updated_items.retain(|item| item.id != cipher_id);
     } else if let Some(item) = new_key_item {
