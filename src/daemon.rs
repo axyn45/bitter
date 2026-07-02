@@ -63,7 +63,7 @@ type KeyRing = Arc<RwLock<Vec<PrivateKey>>>;
 type SharedKeysContext = Arc<RwLock<Option<KeysContext>>>;
 
 /// Starts the agent background process
-pub async fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
+pub fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
     let cache_dir =
         storage::cache_dir().ok_or_else(|| "Could not determine cache directory".to_string())?;
     fs::create_dir_all(&cache_dir)
@@ -90,9 +90,16 @@ pub async fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) 
         fs::write(&pid_path, pid.to_string())
             .map_err(|e| format!("Failed to write pid file: {}", e))?;
 
-        if let Err(e) = run_daemon_loops(socket_path, control_socket_path, pid_path).await {
-            error!("Agent error: {}", e);
-        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to start Tokio runtime: {}", e))?;
+
+        rt.block_on(async {
+            if let Err(e) = run_daemon_loops(socket_path, control_socket_path, pid_path).await {
+                error!("Agent error: {}", e);
+            }
+        });
         Ok(())
     } else {
         let daemonize = Daemonize::new()
@@ -102,8 +109,10 @@ pub async fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) 
         match daemonize.start() {
             Ok(_) => {
                 // Inside the daemon process
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| format!("Failed to start Tokio runtime: {}", e))?;
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to start Tokio runtime");
 
                 rt.block_on(async {
                     if let Err(e) =

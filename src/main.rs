@@ -13,8 +13,7 @@ use config::{Config, TimeoutAction};
 use std::io::{self, Write};
 use std::str::FromStr;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let max_level = if std::env::var("RUST_LOG").unwrap_or_default().to_lowercase() == "debug" {
         tracing::Level::DEBUG
     } else {
@@ -28,6 +27,15 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // Check if it's the start agent command
+    if let Commands::Agent(cli::AgentArgs { command: cli::AgentCommands::Start(ref start_args) }) = cli.command {
+        if let Err(e) = daemon::start_agent(start_args.background, start_args.socket.clone()) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let mut config = match Config::load() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -37,7 +45,12 @@ async fn main() {
     };
 
     // Route commands
-    if let Err(e) = run_command(cli.command, &mut config).await {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to build Tokio runtime");
+
+    if let Err(e) = rt.block_on(run_command(cli.command, &mut config)) {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -576,8 +589,8 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             }
         },
         Commands::Agent(args) => match args.command {
-            AgentCommands::Start(start_args) => {
-                daemon::start_agent(start_args.background, start_args.socket).await?;
+            AgentCommands::Start(_) => {
+                unreachable!("Start command handled synchronously in main()");
             }
             AgentCommands::Stop => {
                 daemon::stop_agent()?;
