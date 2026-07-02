@@ -227,6 +227,9 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                     if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
                         eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
                     } else {
+                        config.last_sync_time = Some(get_current_time_string());
+                        config.local_key_count = Some(ssh_keys.len());
+                        let _ = config.save();
                         println!("Sync completed. Synced {} SSH keys.", ssh_keys.len());
                         for key in &ssh_keys {
                             println!("  - {}", key.name);
@@ -363,6 +366,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
 
             println!("Saving cache to disk...");
             storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key))?;
+
+            config.last_sync_time = Some(get_current_time_string());
+            config.local_key_count = Some(ssh_keys.len());
+            let _ = config.save();
 
             println!(
                 "Sync completed successfully. Synced {} SSH keys:",
@@ -719,6 +726,80 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 ));
             }
         }
+        Commands::Status => {
+            println!("sshwarden Status:");
+            println!("  Server URL:     {}", config.server_url);
+            
+            if let Some(ref email) = config.email {
+                println!("  Login Status:   Logged In");
+                println!("  Logged in User: {}", email);
+                
+                let method = if config.client_id.is_some() {
+                    "API Key"
+                } else {
+                    "Master Password"
+                };
+                println!("  Login Method:   {}", method);
+            } else {
+                println!("  Login Status:   Not Logged In");
+            }
+
+            let agent_running = daemon::is_agent_running();
+            println!("  Agent Status:   {}", if agent_running { "Running" } else { "Not Running" });
+
+            if agent_running {
+                match daemon::send_control_request(daemon::ControlRequest::Status).await {
+                    Ok(resp) => {
+                        let unlocked = resp.unlocked.unwrap_or(false);
+                        println!("  Agent Vault:    {}", if unlocked { "Unlocked" } else { "Locked" });
+                        println!("  Keys in Memory: {}", resp.key_count.unwrap_or(0));
+                        if let Some(ttl) = resp.time_to_lock {
+                            let mins = ttl / 60;
+                            let secs = ttl % 60;
+                            if mins > 0 {
+                                println!("  Time to Auto-Lock: {}m {}s", mins, secs);
+                            } else {
+                                println!("  Time to Auto-Lock: {}s", secs);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("  Agent Details:  Could not query (Error: {})", e);
+                    }
+                }
+            }
+
+            println!("  Timeout Setting: {}", config.timeout);
+            println!("  Timeout Action:  {:?}", config.timeout_action);
+
+            if let Some(ref sync_time) = config.last_sync_time {
+                println!("  Last Synced:    {}", sync_time);
+            } else {
+                println!("  Last Synced:    Never");
+            }
+
+            let local_keys = config.local_key_count.unwrap_or(0);
+            println!("  Total Keys (stored locally): {}", local_keys);
+        }
     }
     Ok(())
+}
+
+fn get_current_time_string() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let tm = libc::localtime(&t);
+        let mut buf = [0u8; 64];
+        let len = libc::strftime(
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            b"%Y-%m-%d %H:%M:%S\0".as_ptr() as *const libc::c_char,
+            tm,
+        );
+        if len > 0 {
+            String::from_utf8_lossy(&buf[..len]).into_owned()
+        } else {
+            "Unknown".to_string()
+        }
+    }
 }

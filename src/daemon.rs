@@ -57,6 +57,8 @@ pub struct ControlResponse {
     pub unlocked: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_to_lock: Option<u64>,
 }
 
 type KeyRing = Arc<RwLock<Vec<PrivateKey>>>;
@@ -568,6 +570,7 @@ async fn handle_control_connection(
                 error: Some(format!("JSON parsing error: {}", e)),
                 unlocked: None,
                 key_count: None,
+                time_to_lock: None,
             };
             let resp_bytes = serde_json::to_vec(&resp).unwrap();
             stream.write_all(&resp_bytes).await?;
@@ -607,6 +610,7 @@ async fn handle_control_connection(
                     error: Some(err_msg),
                     unlocked: Some(!keyring.read().await.is_empty()),
                     key_count: Some(keyring.read().await.len()),
+                    time_to_lock: None,
                 }
             } else {
                 // Decode hex keys
@@ -635,11 +639,12 @@ async fn handle_control_connection(
                         let mut kr = keyring.write().await;
                         *kr = parsed_keys;
 
-                        ControlResponse {
+                         ControlResponse {
                             status: "ok".to_string(),
                             error: None,
                             unlocked: Some(true),
                             key_count: Some(count),
+                            time_to_lock: None,
                         }
                     } else {
                         ControlResponse {
@@ -647,6 +652,7 @@ async fn handle_control_connection(
                             error: Some("Security keys must be exactly 32 bytes".to_string()),
                             unlocked: Some(!keyring.read().await.is_empty()),
                             key_count: Some(keyring.read().await.len()),
+                            time_to_lock: None,
                         }
                     }
                 } else {
@@ -655,6 +661,7 @@ async fn handle_control_connection(
                         error: Some("Invalid hex format for security keys".to_string()),
                         unlocked: Some(!keyring.read().await.is_empty()),
                         key_count: Some(keyring.read().await.len()),
+                        time_to_lock: None,
                     }
                 }
             }
@@ -663,20 +670,33 @@ async fn handle_control_connection(
             let mut kr = keyring.write().await;
             kr.clear();
             *keys_context.write().await = None;
-            ControlResponse {
+             ControlResponse {
                 status: "ok".to_string(),
                 error: None,
                 unlocked: Some(false),
                 key_count: Some(0),
+                time_to_lock: None,
             }
         }
         ControlRequest::Status => {
             let kr = keyring.read().await;
+            let timeout_dur_opt = *shared_timeout.read().await;
+            let time_to_lock = if let Some(timeout_dur) = timeout_dur_opt {
+                if !kr.is_empty() {
+                    let last_act = *last_activity.read().await;
+                    Some(timeout_dur.saturating_sub(last_act.elapsed()).as_secs())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             ControlResponse {
                 status: "ok".to_string(),
                 error: None,
                 unlocked: Some(!kr.is_empty()),
                 key_count: Some(kr.len()),
+                time_to_lock,
             }
         }
         ControlRequest::Reload => {
@@ -706,6 +726,7 @@ async fn handle_control_connection(
                         error: None,
                         unlocked: Some(!keyring.read().await.is_empty()),
                         key_count: Some(keyring.read().await.len()),
+                        time_to_lock: None,
                     }
                 }
                 Err(e) => ControlResponse {
@@ -713,6 +734,7 @@ async fn handle_control_connection(
                     error: Some(format!("Failed to reload config: {}", e)),
                     unlocked: Some(!keyring.read().await.is_empty()),
                     key_count: Some(keyring.read().await.len()),
+                    time_to_lock: None,
                 },
             }
         }
