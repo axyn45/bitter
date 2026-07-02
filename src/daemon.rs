@@ -1161,6 +1161,14 @@ async fn prompt_tty_for_unlock(
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
 
+    static UNLOCK_MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let mutex = UNLOCK_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = mutex.lock().await;
+
+    if !keyring.read().await.is_empty() {
+        return Ok(());
+    }
+
     let tty_path = get_tty_path_for_pid(peer_pid)
         .ok_or_else(|| "Could not resolve client TTY path".to_string())?;
 
