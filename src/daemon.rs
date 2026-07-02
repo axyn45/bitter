@@ -687,14 +687,11 @@ async fn handle_surgical_cipher_update(
     if ctx.enc_key == [0u8; 32] {
         return Err("Decryption keys missing (agent was auto-unlocked from cache)".to_string());
     }
-    // Load existing items from cache database
-    let existing_items = storage::load_db(&ctx.db_key).unwrap_or_default();
-    let mut updated_items = existing_items;
-
-    // Fetch individual cipher details from server
+    // Fetch individual cipher details from server first
     let fetch_result = client.get_cipher_details(token, cipher_id).await;
 
     let mut is_deleted = false;
+    let mut is_other_type = false;
     let mut new_key_item = None;
 
     match fetch_result {
@@ -722,7 +719,7 @@ async fn handle_surgical_cipher_update(
                 }
             } else {
                 // Not a type 5 cipher (not an SSH key)
-                is_deleted = true;
+                is_other_type = true;
             }
         }
         Err(e) => {
@@ -730,6 +727,16 @@ async fn handle_surgical_cipher_update(
             is_deleted = true;
         }
     }
+
+    // If it is another type of vault item (e.g. login credentials, card),
+    // it was never stored in our database, so we can exit early without any disk reads.
+    if is_other_type {
+        return Ok(());
+    }
+
+    // Load existing items from cache database
+    let existing_items = storage::load_db(&ctx.db_key).unwrap_or_default();
+    let mut updated_items = existing_items;
 
     let existed = updated_items.iter().any(|item| item.id == cipher_id);
     if is_deleted {
