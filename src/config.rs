@@ -180,7 +180,7 @@ impl Config {
                 io::ErrorKind::InvalidData,
                 format!("Failed to serialize config: {}", e),
             )
-        })?;
+        })? + "\n";
 
         // Create file with owner read/write permissions only (0600)
         let mut options = fs::OpenOptions::new();
@@ -284,7 +284,7 @@ impl Session {
                 io::ErrorKind::InvalidData,
                 format!("Failed to serialize session: {}", e),
             )
-        })?;
+        })? + "\n";
 
         // Create file with owner read/write permissions only (0600)
         let mut options = fs::OpenOptions::new();
