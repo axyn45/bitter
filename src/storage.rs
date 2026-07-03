@@ -304,6 +304,23 @@ pub fn wipe_db() -> Result<(), String> {
     Ok(())
 }
 
+/// Delete only the unencrypted raw cache database and cached key files (used when timeout changes from "never")
+pub fn wipe_unencrypted_cache() -> Result<(), String> {
+    if let Some(raw_path) = unencrypted_db_path() {
+        if raw_path.exists() {
+            fs::remove_file(&raw_path)
+                .map_err(|e| format!("Failed to delete unencrypted cache database file: {}", e))?;
+        }
+    }
+    if let Some(k_path) = keys_path() {
+        if k_path.exists() {
+            fs::remove_file(&k_path)
+                .map_err(|e| format!("Failed to delete keys cache file: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
 /// Load unencrypted SSH keys from raw cache database if timeout is "never"
 pub fn load_unencrypted_db() -> Option<Vec<ssh_key::private::PrivateKey>> {
     let raw_path = unencrypted_db_path()?;

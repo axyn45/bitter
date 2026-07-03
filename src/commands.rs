@@ -563,6 +563,9 @@ async fn handle_settings(
         } else {
             config.timeout = t.clone();
             println!("Timeout updated to: {}", t);
+            if let Err(e) = storage::wipe_unencrypted_cache() {
+                eprintln!("Warning: Failed to clean up unencrypted cache files: {}", e);
+            }
             updated = true;
         }
     }
