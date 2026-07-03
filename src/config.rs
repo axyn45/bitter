@@ -1,3 +1,4 @@
+use crate::api::ApiClient;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use directories::ProjectDirs;
@@ -8,7 +9,6 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
-use crate::api::ApiClient;
 use tracing;
 
 const APP_NAME: &str = "sshwarden";
@@ -45,8 +45,6 @@ pub struct Config {
     pub timeout_action: TimeoutAction,
     pub socket_path: Option<PathBuf>,
     pub vault_cache_path: Option<PathBuf>,
-    pub last_sync_time: Option<String>,
-    pub local_key_count: Option<usize>,
     #[serde(default = "default_ssh_agent_auto_start")]
     pub ssh_agent_auto_start: bool,
 }
@@ -79,8 +77,6 @@ impl Default for Config {
             timeout_action: TimeoutAction::Lock,
             socket_path: None,
             vault_cache_path: None,
-            last_sync_time: None,
-            local_key_count: None,
             ssh_agent_auto_start: false,
         }
     }
@@ -180,7 +176,7 @@ impl Config {
                 io::ErrorKind::InvalidData,
                 format!("Failed to serialize config: {}", e),
             )
-        })? + "\n";
+        })?;
 
         // Create file with owner read/write permissions only (0600)
         let mut options = fs::OpenOptions::new();
@@ -198,7 +194,6 @@ impl Config {
 
         Ok(())
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +204,8 @@ pub struct Session {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub cache_salt: Option<String>,
+    pub last_sync_time: Option<String>,
+    pub server_url: Option<String>,
 }
 
 impl Default for Session {
@@ -219,6 +216,8 @@ impl Default for Session {
             access_token: None,
             refresh_token: None,
             cache_salt: Some(generate_cache_salt()),
+            last_sync_time: None,
+            server_url: None,
         }
     }
 }
@@ -336,19 +335,24 @@ impl Session {
 
     /// Returns a valid access token, refreshing it if expired and refresh token is available
     pub async fn get_valid_token(&mut self, server_url: &str) -> Result<String, String> {
-        let access_token = self.access_token.as_ref().ok_or_else(|| "Not logged in".to_string())?;
+        let active_url = self.server_url.as_deref().unwrap_or(server_url);
+        let access_token = self
+            .access_token
+            .as_ref()
+            .ok_or_else(|| "Not logged in".to_string())?;
 
         if self.is_token_expired() {
             if let Some(ref refresh_token) = self.refresh_token {
                 tracing::info!("Access token is expired. Refreshing token...");
-                let client = ApiClient::new(server_url);
+                let client = ApiClient::new(active_url);
                 match client.refresh_token(refresh_token).await {
                     Ok(token_resp) => {
                         self.access_token = Some(token_resp.access_token.clone());
                         if let Some(ref rt) = token_resp.refresh_token {
                             self.refresh_token = Some(rt.clone());
                         }
-                        self.save().map_err(|e| format!("Failed to save refreshed token: {}", e))?;
+                        self.save()
+                            .map_err(|e| format!("Failed to save refreshed token: {}", e))?;
                         tracing::info!("Token refreshed successfully.");
                         return Ok(token_resp.access_token);
                     }
@@ -357,7 +361,9 @@ impl Session {
                     }
                 }
             } else {
-                return Err("Access token is expired and no refresh token is available.".to_string());
+                return Err(
+                    "Access token is expired and no refresh token is available.".to_string()
+                );
             }
         }
 
