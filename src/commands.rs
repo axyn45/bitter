@@ -37,7 +37,6 @@ pub async fn perform_sync_and_reload(
 
     // 3. Decrypt all ciphers
     let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
-    let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
 
     // 4. Update session fields and save first
     session.last_sync_time = Some(get_current_time_string());
@@ -51,6 +50,7 @@ pub async fn perform_sync_and_reload(
 
     // 6. Automatically unlock running agent daemon if it is running
     if daemon::is_agent_running() {
+        let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
         let enc_hex = hex::encode(&enc_key);
         let mac_hex = hex::encode(&mac_key);
         let db_hex = hex::encode(*db_key);
@@ -422,15 +422,7 @@ async fn handle_sync(config: &mut Config, session: &mut Session) -> Result<(), S
 
     match perform_sync_and_reload(&api_client, &token, key_source, &db_key, session).await {
         Ok(ciphers) => {
-            let ssh_keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
-            println!(
-                "Sync completed successfully. Synced {} items ({} SSH keys):",
-                ciphers.len(),
-                ssh_keys.len()
-            );
-            for key in &ssh_keys {
-                println!("  - {}", key.name);
-            }
+            println!("Synced {} items.", ciphers.len());
         }
         Err(e) => return Err(e),
     }
@@ -625,31 +617,11 @@ async fn handle_settings(
     Ok(())
 }
 
+// Deprecated: This function is a placeholder for future key management features. Refactoration may be needed.
 async fn handle_keys(command: KeysCommands, session: &Session) -> Result<(), String> {
     match command {
         KeysCommands::List => {
-            let password = rpassword::prompt_password("Master Password: ")
-                .map_err(|e| format!("Password prompt failed: {}", e))?;
-
-            let salt = session
-                .cache_salt
-                .as_ref()
-                .ok_or_else(|| "Local database salt missing from session.".to_string())?;
-            let db_key = storage::derive_db_key(&password, salt)?;
-
-            let ciphers = storage::load_db(&db_key)?;
-            let keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
-            if keys.is_empty() {
-                println!("No SSH keys found in local cache. Run 'sshwarden sync' to fetch them.");
-            } else {
-                println!("Available SSH Keys ({}):", keys.len());
-                for (i, key) in keys.iter().enumerate() {
-                    println!("{}. {} [ID: {}]", i + 1, key.name, key.id);
-                    if let Some(ref note) = key.note {
-                        println!("   Note: {}", note);
-                    }
-                }
-            }
+            println!("Listing keys... (Will be implemented in Phase 3)");
         }
         KeysCommands::Add => {
             println!("Adding new key... (Will be implemented in Phase 3)");
