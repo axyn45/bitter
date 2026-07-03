@@ -9,7 +9,7 @@ mod storage;
 use api::ApiClient;
 use clap::Parser;
 use cli::{Cli, Commands, KeysCommands};
-use config::{Config, TimeoutAction};
+use config::{Config, TimeoutAction, Session};
 use std::io::{self, Write};
 use std::str::FromStr;
 
@@ -57,6 +57,7 @@ fn main() {
 }
 
 async fn run_command(command: Commands, config: &mut Config) -> Result<(), String> {
+    let mut session = Session::load().map_err(|e| format!("Failed to load session: {}", e))?;
     match command {
         Commands::Login(args) => {
             let server_url = args
@@ -73,14 +74,14 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 println!("Logging in using Personal API Key client credentials...");
 
                 let resp = api_client
-                    .login_api_key(&cid, &csec, &config.device_id, "sshwarden_client")
+                    .login_api_key(&cid, &csec, &session.device_id, "sshwarden_client")
                     .await?;
 
                 // Save credentials in config
                 config.client_id = Some(cid.clone());
                 config.client_secret = Some(csec.clone());
 
-                let email = match args.email.clone().or_else(|| config.email.clone()) {
+                let email = match args.email.clone().or_else(|| session.email.clone()) {
                     Some(e) => e,
                     None => {
                         print!("Email Address: ");
@@ -140,7 +141,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 (resp, master_key, sym_keys, password, email)
             } else {
                 // Password Login
-                let email = match args.email.or_else(|| config.email.clone()) {
+                let email = match args.email.or_else(|| session.email.clone()) {
                     Some(email) => email,
                     None => {
                         print!("Email: ");
@@ -192,7 +193,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 println!("Authenticating with server...");
 
                 let resp = api_client
-                    .login_password(&email, &login_hash, &config.device_id, "sshwarden_client")
+                    .login_password(&email, &login_hash, &session.device_id, "sshwarden_client")
                     .await?;
 
                 println!("Decrypting vault symmetric keys...");
@@ -204,12 +205,16 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
 
             // Store token and configurations
             config.server_url = server_url;
-            config.access_token = Some(token_resp.access_token.clone());
-            config.refresh_token = token_resp.refresh_token.clone();
-            config.email = Some(email);
             config
                 .save()
                 .map_err(|e| format!("Failed to save configuration: {}", e))?;
+
+            session.access_token = Some(token_resp.access_token.clone());
+            session.refresh_token = token_resp.refresh_token.clone();
+            session.email = Some(email);
+            session
+                .save()
+                .map_err(|e| format!("Failed to save session: {}", e))?;
 
             println!("Logged in successfully. Session token stored locally.");
 
@@ -217,10 +222,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             println!("Automatically syncing ciphers from server...");
             match api_client.sync(&token_resp.access_token).await {
                 Ok(sync_data) => {
-                    let salt = config
+                    let salt = session
                         .cache_salt
                         .as_ref()
-                        .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                        .ok_or_else(|| "Local database salt missing from session.".to_string())?;
                     let db_key = storage::derive_db_key(&password, salt)?;
 
                     let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
@@ -291,17 +296,20 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             if let Err(e) = storage::wipe_db() {
                 eprintln!("Warning: Failed to delete local database cache: {}", e);
             }
-            config.email = None;
             config.client_id = None;
             config.client_secret = None;
-            config.access_token = None;
             config
                 .save()
                 .map_err(|e| format!("Failed to save configuration: {}", e))?;
+
+            let session = Session::default();
+            session
+                .save()
+                .map_err(|e| format!("Failed to save session: {}", e))?;
             println!("Logged out successfully. Configuration, session, and local cache cleared.");
         }
         Commands::Sync => {
-            let token = config.get_valid_token().await?;
+            let token = session.get_valid_token(&config.server_url).await?;
 
             let api_client = ApiClient::new(&config.server_url);
             println!("Syncing ciphers from server {}...", config.server_url);
@@ -322,8 +330,8 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                     let password = rpassword::prompt_password("Master Password (to decrypt vault keys): ")
                         .map_err(|e| format!("Password prompt failed: {}", e))?;
 
-                    let email = config.email.as_ref().ok_or_else(|| {
-                        "Email address missing from config. Please log in again.".to_string()
+                    let email = session.email.as_ref().ok_or_else(|| {
+                        "Email address missing from session. Please log in again.".to_string()
                     })?;
 
                     println!("Fetching KDF settings...");
@@ -350,10 +358,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                         t => return Err(format!("Unsupported KDF type: {}", t)),
                     };
 
-                    let salt = config
+                    let salt = session
                         .cache_salt
                         .as_ref()
-                        .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                        .ok_or_else(|| "Local database salt missing from session.".to_string())?;
                     let db_key = storage::derive_db_key(&password, salt)?;
 
                     let (enc, mac) =
@@ -424,19 +432,19 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
 
             if let Some(t) = args.timeout {
                 if t.trim().to_lowercase() == "never" {
-                    if let Some(ref email) = config.email {
-                        let token = config
+                    if let Some(ref email) = session.email {
+                        let token = session
                             .access_token
                             .as_ref()
-                            .ok_or_else(|| "Access token missing from config".to_string())?;
+                            .ok_or_else(|| "Access token missing from session".to_string())?;
 
                         let password = rpassword::prompt_password("Enter Master Password to verify and enable 'never' timeout: ")
                             .map_err(|e| format!("Password prompt failed: {}", e))?;
 
-                        let salt = config
+                        let salt = session
                             .cache_salt
                             .as_ref()
-                            .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                            .ok_or_else(|| "Local database salt missing from session.".to_string())?;
                         let db_key = storage::derive_db_key(&password, salt)?;
 
                         // Try verifying with local cache first
@@ -566,7 +574,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 println!("  Server URL:     {}", config.server_url);
                 println!(
                     "  Email:          {}",
-                    config.email.as_deref().unwrap_or("<not logged in>")
+                    session.email.as_deref().unwrap_or("<not logged in>")
                 );
                 println!("  Session Timeout: {}", config.timeout);
                 println!("  Timeout Action:  {:?}", config.timeout_action);
@@ -578,10 +586,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 let password = rpassword::prompt_password("Master Password: ")
                     .map_err(|e| format!("Password prompt failed: {}", e))?;
 
-                let salt = config
+                let salt = session
                     .cache_salt
                     .as_ref()
-                    .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                    .ok_or_else(|| "Local database salt missing from session.".to_string())?;
                 let db_key = storage::derive_db_key(&password, salt)?;
 
                 let ciphers = storage::load_db(&db_key)?;
@@ -641,10 +649,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             }
         }
         Commands::Unlock => {
-            let email = config.email.as_ref().ok_or_else(|| {
-                "Email address missing from config. Please log in first.".to_string()
+            let email = session.email.as_ref().ok_or_else(|| {
+                "Email address missing from session. Please log in first.".to_string()
             })?;
-            let token = config
+            let token = session
                 .access_token
                 .as_ref()
                 .ok_or_else(|| "Not logged in. Please run 'sshwarden login' first.".to_string())?;
@@ -652,10 +660,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             let password = rpassword::prompt_password("Master Password: ")
                 .map_err(|e| format!("Password prompt failed: {}", e))?;
 
-            let salt = config
+            let salt = session
                 .cache_salt
                 .as_ref()
-                .ok_or_else(|| "Local database salt missing from config.".to_string())?;
+                .ok_or_else(|| "Local database salt missing from session.".to_string())?;
             let db_key = storage::derive_db_key(&password, salt)?;
 
             let api_client = ApiClient::new(&config.server_url);
@@ -770,7 +778,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
             println!("sshwarden Status:");
             println!("  Server URL:     {}", config.server_url);
             
-            if let Some(ref email) = config.email {
+            if let Some(ref email) = session.email {
                 println!("  Login Status:   Logged In");
                 println!("  Logged in User: {}", email);
                 

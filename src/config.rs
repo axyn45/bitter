@@ -39,18 +39,12 @@ impl FromStr for TimeoutAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
-    pub email: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub timeout: String,
     pub timeout_action: TimeoutAction,
     pub socket_path: Option<PathBuf>,
     pub vault_cache_path: Option<PathBuf>,
-    #[serde(default = "generate_device_id")]
-    pub device_id: String,
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
-    pub cache_salt: Option<String>,
     pub last_sync_time: Option<String>,
     pub local_key_count: Option<usize>,
     #[serde(default = "default_ssh_agent_auto_start")]
@@ -79,17 +73,12 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             server_url: "https://api.bitwarden.com".to_string(),
-            email: None,
             client_id: None,
             client_secret: None,
             timeout: "15m".to_string(),
             timeout_action: TimeoutAction::Lock,
             socket_path: None,
             vault_cache_path: None,
-            device_id: generate_device_id(),
-            access_token: None,
-            refresh_token: None,
-            cache_salt: Some(generate_cache_salt()),
             last_sync_time: None,
             local_key_count: None,
             ssh_agent_auto_start: false,
@@ -160,17 +149,12 @@ impl Config {
         }
 
         let content = fs::read_to_string(&path)?;
-        let mut config: Config = toml::from_str(&content).map_err(|e| {
+        let config: Config = toml::from_str(&content).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to parse config: {}", e),
             )
         })?;
-
-        if config.cache_salt.is_none() {
-            config.cache_salt = Some(generate_cache_salt());
-            config.save()?;
-        }
 
         Ok(config)
     }
@@ -195,6 +179,110 @@ impl Config {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to serialize config: {}", e),
+            )
+        })?;
+
+        // Create file with owner read/write permissions only (0600)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+
+        let mut file = options.open(&path)?;
+
+        // Apply UNIX file permissions (0600)
+        let mut perms = file.metadata()?.permissions();
+        perms.set_mode(0o600);
+        file.set_permissions(perms)?;
+
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+
+        Ok(())
+    }
+
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Session {
+    pub email: Option<String>,
+    #[serde(default = "generate_device_id")]
+    pub device_id: String,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub cache_salt: Option<String>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            email: None,
+            device_id: generate_device_id(),
+            access_token: None,
+            refresh_token: None,
+            cache_salt: Some(generate_cache_salt()),
+        }
+    }
+}
+
+const SESSION_FILE_NAME: &str = "session.json";
+
+impl Session {
+    /// Gets the path to the session.json file
+    pub fn session_path() -> Option<PathBuf> {
+        Config::config_dir().map(|dir| dir.join(SESSION_FILE_NAME))
+    }
+
+    /// Loads the session from disk, returning default if file doesn't exist
+    pub fn load() -> io::Result<Self> {
+        let path = match Self::session_path() {
+            Some(p) => p,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Could not determine session path",
+                ));
+            }
+        };
+
+        if !path.exists() {
+            return Ok(Session::default());
+        }
+
+        let content = fs::read_to_string(&path)?;
+        let mut session: Session = serde_json::from_str(&content).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to parse session: {}", e),
+            )
+        })?;
+
+        if session.cache_salt.is_none() {
+            session.cache_salt = Some(generate_cache_salt());
+            session.save()?;
+        }
+
+        Ok(session)
+    }
+
+    /// Saves the session to disk, ensuring directory exists and permissions are secure (0600)
+    pub fn save(&self) -> io::Result<()> {
+        let dir = match Config::config_dir() {
+            Some(d) => d,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Could not determine config path",
+                ));
+            }
+        };
+
+        // Ensure directory exists
+        fs::create_dir_all(&dir)?;
+
+        let path = dir.join(SESSION_FILE_NAME);
+        let content = serde_json::to_string_pretty(self).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Failed to serialize session: {}", e),
             )
         })?;
 
@@ -247,13 +335,13 @@ impl Config {
     }
 
     /// Returns a valid access token, refreshing it if expired and refresh token is available
-    pub async fn get_valid_token(&mut self) -> Result<String, String> {
+    pub async fn get_valid_token(&mut self, server_url: &str) -> Result<String, String> {
         let access_token = self.access_token.as_ref().ok_or_else(|| "Not logged in".to_string())?;
 
         if self.is_token_expired() {
             if let Some(ref refresh_token) = self.refresh_token {
                 tracing::info!("Access token is expired. Refreshing token...");
-                let client = ApiClient::new(&self.server_url);
+                let client = ApiClient::new(server_url);
                 match client.refresh_token(refresh_token).await {
                     Ok(token_resp) => {
                         self.access_token = Some(token_resp.access_token.clone());

@@ -89,11 +89,11 @@ This document tracks the step-by-step progress of the `sshwarden` project, inclu
 ---
 
 ## Phase 8: User Profile & Session Isolation
-- [ ] Decouple configuration from credentials
-  - [ ] Keep `config.toml` strictly for user/app preferences (server URL, timeout, custom socket paths)
-  - [ ] Store login credentials (`email`, `device_id`, `access_token`, `refresh_token`) in a separate `session.json`
-- [ ] Set strict `0600` owner permissions on `session.json`
-- [ ] Refactor `storage` and CLI endpoints (`login`, `logout`, `sync`) to use separated files
+- [x] Decouple configuration from credentials
+  - [x] Keep `config.toml` strictly for user/app preferences (server URL, timeout, custom socket paths)
+  - [x] Store login credentials (`email`, `device_id`, `access_token`, `refresh_token`) in a separate `session.json`
+- [x] Set strict `0600` owner permissions on `session.json`
+- [x] Refactor `storage` and CLI endpoints (`login`, `logout`, `sync`) to use separated files
 
 ## Phase 9: API Key, SSO, and Device Push Login
 - [ ] Implement API Key Login CLI commands and backend validation

@@ -164,7 +164,7 @@ Bitwarden supports SSH keys natively and via custom fields. `sshwarden` supports
 - Verify agent socket integration with standard OpenSSH clients.
 - Add statically linked musl target packaging.
 
-### Phase 8: User Profile & Session Isolation (Planned)
+### Phase 8: User Profile & Session Isolation (Complete)
 - Extract session variables from `config.toml`.
 - Create `session.json` storage with strict `0600` permissions.
 - Update `storage` layer and CLI handlers to utilize the decoupled files.

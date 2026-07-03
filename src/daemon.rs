@@ -404,10 +404,8 @@ async fn run_daemon_loops(
                             kr.write().await.clear();
                             *kc.write().await = None;
                             let _ = storage::wipe_db();
-                            if let Ok(mut config) = crate::config::Config::load() {
-                                config.access_token = None;
-                                let _ = config.save();
-                            }
+                            let session = crate::config::Session::default();
+                            let _ = session.save();
                             info!("Logged out due to inactivity.");
                         }
                     }
@@ -898,10 +896,12 @@ async fn run_websocket_sync_loop(
     keys_context: SharedKeysContext,
     keyring: KeyRing,
 ) -> Result<(), String> {
-    let mut config =
+    let config =
         crate::config::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
+    let mut session =
+        crate::config::Session::load().map_err(|e| format!("Failed to load session: {}", e))?;
 
-    let token = config.get_valid_token().await?;
+    let token = session.get_valid_token(&config.server_url).await?;
 
     let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
     let client = ApiClient::new(&config.server_url);
@@ -973,8 +973,8 @@ async fn run_websocket_sync_loop(
                                             let kr_clone = keyring.clone();
                                             let cipher_id_str = cipher_id.to_string();
                                             tokio::spawn(async move {
-                                                let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
-                                                    cfg.get_valid_token().await.unwrap_or_default()
+                                                let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
+                                                    sess.get_valid_token(&cfg.server_url).await.unwrap_or_default()
                                                 } else {
                                                     String::new()
                                                 };
@@ -998,8 +998,8 @@ async fn run_websocket_sync_loop(
                                             ut
                                         );
 
-                                        let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
-                                            cfg.get_valid_token().await.unwrap_or_else(|_| token.clone())
+                                        let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
+                                            sess.get_valid_token(&cfg.server_url).await.unwrap_or_else(|_| token.clone())
                                         } else {
                                             token.clone()
                                         };
@@ -1115,8 +1115,8 @@ async fn run_websocket_sync_loop(
                                                             let kr_clone = keyring.clone();
                                                             let cipher_id_str = cipher_id.to_string();
                                                             tokio::spawn(async move {
-                                                                let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
-                                                                    cfg.get_valid_token().await.unwrap_or_default()
+                                                                let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
+                                                                    sess.get_valid_token(&cfg.server_url).await.unwrap_or_default()
                                                                 } else {
                                                                     String::new()
                                                                 };
@@ -1136,8 +1136,8 @@ async fn run_websocket_sync_loop(
                                                     } else if ut_val == 0 || ut_val == 4 || ut_val == 5 {
                                                         // Full Sync
                                                         info!("WebSocket (binary): Received vault update event (Type {}). Syncing...", ut_val);
-                                                        let current_token = if let Ok(mut cfg) = crate::config::Config::load() {
-                                                            cfg.get_valid_token().await.unwrap_or_else(|_| token.clone())
+                                                        let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
+                                                            sess.get_valid_token(&cfg.server_url).await.unwrap_or_else(|_| token.clone())
                                                         } else {
                                                             token.clone()
                                                         };
@@ -1266,11 +1266,11 @@ async fn prompt_tty_for_unlock(
         return Ok(());
     }
 
-    // Load config to check if logged in and cache database exists
-    let config = crate::config::Config::load()
-        .map_err(|e| format!("Failed to load config: {}", e))?;
+    // Load session to check if logged in
+    let session = crate::config::Session::load()
+        .map_err(|e| format!("Failed to load session: {}", e))?;
 
-    if config.email.is_none() {
+    if session.email.is_none() {
         return Err("Not logged in".to_string());
     }
 
@@ -1333,8 +1333,8 @@ async fn prompt_tty_for_unlock(
 
 
 
-    let salt = config.cache_salt.as_ref()
-        .ok_or_else(|| "No cache salt found in configuration".to_string())?;
+    let salt = session.cache_salt.as_ref()
+        .ok_or_else(|| "No cache salt found in session".to_string())?;
 
     // Derive DB key
     tty.write_all(b"[sshwarden] Deriving encryption key (Argon2)... ").map_err(|e| e.to_string())?;
