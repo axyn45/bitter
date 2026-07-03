@@ -370,31 +370,18 @@ async fn run_daemon_loops(
     let pp_clone = pid_path.clone();
     tokio::spawn(async move {
         let username = get_current_username();
-        let mut zero_session_checks = 0;
-        let mut check_counter = 0;
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 
-            // Session check runs every 30 seconds (6 * 5 seconds loop)
-            check_counter += 1;
-            if check_counter >= 6 {
-                check_counter = 0;
-                if !username.is_empty() {
-                    let active_sessions = count_active_user_sessions(&username);
-                    if active_sessions == 0 {
-                        zero_session_checks += 1;
-                        info!("No active sessions detected for user '{}'. Check: {}/2", username, zero_session_checks);
-                        if zero_session_checks >= 2 {
-                            info!("No active login sessions found for user '{}' for 60 seconds. Stopping agent daemon.", username);
-                            let _ = fs::remove_file(&sp_clone);
-                            let _ = fs::remove_file(&cp_clone);
-                            let _ = fs::remove_file(&pp_clone);
-                            std::process::exit(0);
-                        }
-                    } else {
-                        zero_session_checks = 0;
-                    }
+            if !username.is_empty() {
+                let active_sessions = count_active_user_sessions(&username);
+                if active_sessions == 0 {
+                    info!("No active login sessions found for user '{}'. Stopping agent daemon.", username);
+                    let _ = fs::remove_file(&sp_clone);
+                    let _ = fs::remove_file(&cp_clone);
+                    let _ = fs::remove_file(&pp_clone);
+                    std::process::exit(0);
                 }
             }
 
