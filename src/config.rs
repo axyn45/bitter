@@ -53,6 +53,12 @@ pub struct Config {
     pub cache_salt: Option<String>,
     pub last_sync_time: Option<String>,
     pub local_key_count: Option<usize>,
+    #[serde(default = "default_ssh_agent_auto_start")]
+    pub ssh_agent_auto_start: bool,
+}
+
+fn default_ssh_agent_auto_start() -> bool {
+    false
 }
 
 fn generate_device_id() -> String {
@@ -86,6 +92,7 @@ impl Default for Config {
             cache_salt: Some(generate_cache_salt()),
             last_sync_time: None,
             local_key_count: None,
+            ssh_agent_auto_start: false,
         }
     }
 }
