@@ -8,7 +8,7 @@ mod storage;
 
 use api::ApiClient;
 use clap::Parser;
-use cli::{AgentCommands, Cli, Commands, KeysCommands};
+use cli::{Cli, Commands, KeysCommands};
 use config::{Config, TimeoutAction};
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -27,8 +27,8 @@ fn main() {
 
     let cli = Cli::parse();
 
-    // Check if it's the start agent command
-    if let Commands::Agent(cli::AgentArgs { command: cli::AgentCommands::Start(ref start_args) }) = cli.command {
+    // Check if it's the start command
+    if let Commands::Start(ref start_args) = cli.command {
         if let Err(e) = daemon::start_agent(start_args.background, start_args.socket.clone()) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
@@ -223,8 +223,9 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                         .ok_or_else(|| "Local database salt missing from config.".to_string())?;
                     let db_key = storage::derive_db_key(&password, salt)?;
 
-                    let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
-                    if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
+                    let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
+                    let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
+                    if let Err(e) = storage::save_db(&decrypted_ciphers, &db_key, Some(&enc_key), Some(&mac_key)) {
                         eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
                     } else {
                         config.last_sync_time = Some(get_current_time_string());
@@ -361,11 +362,12 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 }
             };
 
-            println!("Decrypting and filtering SSH keys...");
-            let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+            println!("Decrypting and parsing vault items...");
+            let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
+            let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
 
             println!("Saving cache to disk...");
-            storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key))?;
+            storage::save_db(&decrypted_ciphers, &db_key, Some(&enc_key), Some(&mac_key))?;
 
             config.last_sync_time = Some(get_current_time_string());
             config.local_key_count = Some(ssh_keys.len());
@@ -475,7 +477,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                                             match crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key) {
                                                 Ok((enc_key, mac_key)) => {
                                                     verified = true;
-                                                    loaded_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+                                                    loaded_keys = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
                                                     enc_opt = Some(enc_key);
                                                     mac_opt = Some(mac_key);
                                                 }
@@ -534,6 +536,17 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 updated = true;
             }
 
+            if let Some(ref auto_start_str) = args.ssh_agent_auto_start {
+                let val = match auto_start_str.trim().to_lowercase().as_str() {
+                    "true" | "yes" | "1" => true,
+                    "false" | "no" | "0" => false,
+                    _ => return Err("Invalid value for ssh_agent_auto_start. Use 'true' or 'false'.".to_string()),
+                };
+                config.ssh_agent_auto_start = val;
+                println!("SSH Agent auto-start updated to: {}", val);
+                updated = true;
+            }
+
             if updated {
                 config
                     .save()
@@ -557,6 +570,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 );
                 println!("  Session Timeout: {}", config.timeout);
                 println!("  Timeout Action:  {:?}", config.timeout_action);
+                println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
             }
         }
         Commands::Keys(args) => match args.command {
@@ -570,7 +584,8 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                     .ok_or_else(|| "Local database salt missing from config.".to_string())?;
                 let db_key = storage::derive_db_key(&password, salt)?;
 
-                let keys = storage::load_db(&db_key)?;
+                let ciphers = storage::load_db(&db_key)?;
+                let keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
                 if keys.is_empty() {
                     println!(
                         "No SSH keys found in local cache. Run 'sshwarden sync' to fetch them."
@@ -595,17 +610,36 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                 println!("Deleting key {}... (Will be implemented in Phase 3)", id);
             }
         },
-        Commands::Agent(args) => match args.command {
-            AgentCommands::Start(_) => {
-                unreachable!("Start command handled synchronously in main()");
+        Commands::Start(_) => {
+            unreachable!("Start command handled synchronously in main()");
+        }
+        Commands::Stop => {
+            daemon::stop_agent()?;
+        }
+        Commands::StartSsh => {
+            if !daemon::is_agent_running() {
+                return Err("Agent daemon is not running. Please start the daemon first using 'sshwarden start'.".to_string());
             }
-            AgentCommands::Stop => {
-                daemon::stop_agent()?;
+            println!("Requesting running daemon to start SSH agent loop...");
+            let resp = daemon::send_control_request(daemon::ControlRequest::StartSshAgent).await?;
+            if resp.status == "ok" {
+                println!("SSH agent loop started successfully.");
+            } else {
+                return Err(format!("Failed to start SSH agent: {}", resp.error.unwrap_or_default()));
             }
-            AgentCommands::Status => {
-                daemon::print_status().await?;
+        }
+        Commands::StopSsh => {
+            if !daemon::is_agent_running() {
+                return Err("Agent daemon is not running.".to_string());
             }
-        },
+            println!("Requesting running daemon to stop SSH agent loop...");
+            let resp = daemon::send_control_request(daemon::ControlRequest::StopSshAgent).await?;
+            if resp.status == "ok" {
+                println!("SSH agent loop stopped successfully.");
+            } else {
+                return Err(format!("Failed to stop SSH agent: {}", resp.error.unwrap_or_default()));
+            }
+        }
         Commands::Unlock => {
             let email = config.email.as_ref().ok_or_else(|| {
                 "Email address missing from config. Please log in first.".to_string()
@@ -653,9 +687,10 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
                                 Ok(sync_data) => {
                                     match crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key) {
                                         Ok((enc_key, mac_key)) => {
-                                            let ssh_keys = storage::parse_and_extract_ssh_keys(&sync_data, &enc_key, &mac_key);
+                                            let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
+                                            let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
                                             println!("Sync successful. Saving encrypted cache to disk...");
-                                             if let Err(e) = storage::save_db(&ssh_keys, &db_key, Some(&enc_key), Some(&mac_key)) {
+                                             if let Err(e) = storage::save_db(&decrypted_ciphers, &db_key, Some(&enc_key), Some(&mac_key)) {
                                                  eprintln!("Warning: Failed to save synced keys to database cache: {}", e);
                                              } else {
                                                  config.last_sync_time = Some(get_current_time_string());
@@ -689,7 +724,8 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
 
             if !synced_successfully {
                 println!("Falling back to decrypting local cache database...");
-                let cache_keys = storage::load_db(&db_key)?;
+                let ciphers = storage::load_db(&db_key)?;
+                let cache_keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
                 if cache_keys.is_empty() {
                     return Err(
                         "No keys found in local cache database. Please check your network and try again."
@@ -775,6 +811,7 @@ async fn run_command(command: Commands, config: &mut Config) -> Result<(), Strin
 
             println!("  Timeout Setting: {}", config.timeout);
             println!("  Timeout Action:  {:?}", config.timeout_action);
+            println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
 
             if let Some(ref sync_time) = config.last_sync_time {
                 println!("  Last Synced:    {}", sync_time);

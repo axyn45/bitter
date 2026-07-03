@@ -5,7 +5,7 @@ use ssh_key::private::PrivateKey;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +39,8 @@ pub enum ControlRequest {
     Lock,
     Status,
     Reload,
+    StartSshAgent,
+    StopSshAgent,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +61,8 @@ pub struct ControlResponse {
     pub key_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_to_lock: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_agent_active: Option<bool>,
 }
 
 type KeyRing = Arc<RwLock<Vec<PrivateKey>>>;
@@ -178,38 +182,6 @@ pub fn stop_agent() -> Result<(), String> {
     )
 }
 
-/// Checks the status of the background agent process
-pub async fn print_status() -> Result<(), String> {
-    let cache_dir =
-        storage::cache_dir().ok_or_else(|| "Could not determine cache directory".to_string())?;
-    let socket_path = cache_dir.join("ssh-agent.sock");
-    let control_socket_path = cache_dir.join("ssh-agent.sock.control");
-
-    if is_agent_running() {
-        info!("sshwarden agent: running");
-        info!("SSH_AUTH_SOCK:   {}", socket_path.display());
-
-        // Connect to control socket to fetch key statistics
-        match query_agent_status(&control_socket_path).await {
-            Ok(resp) => {
-                let status_str = if resp.unlocked.unwrap_or(false) {
-                    "Unlocked"
-                } else {
-                    "Locked"
-                };
-                info!("Vault Status:    {}", status_str);
-                info!("Keys Loaded:     {}", resp.key_count.unwrap_or(0));
-            }
-            Err(e) => {
-                info!("Vault Status:    Error contacting control socket ({})", e);
-            }
-        }
-    } else {
-        info!("sshwarden agent: stopped");
-    }
-    Ok(())
-}
-
 /// Helper to check if the agent process is alive
 pub fn is_agent_running() -> bool {
     let cache_dir = match storage::cache_dir() {
@@ -241,31 +213,6 @@ pub fn is_agent_running() -> bool {
     false
 }
 
-async fn query_agent_status(control_socket: &Path) -> Result<ControlResponse, String> {
-    let mut stream = UnixStream::connect(control_socket)
-        .await
-        .map_err(|e| format!("Failed to connect to control socket: {}", e))?;
-
-    let req = ControlRequest::Status;
-    let req_bytes = serde_json::to_vec(&req).unwrap();
-    stream
-        .write_all(&req_bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-    stream.shutdown().await.map_err(|e| e.to_string())?;
-
-    let mut resp_bytes = Vec::new();
-    stream
-        .read_to_end(&mut resp_bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let resp: ControlResponse = serde_json::from_slice(&resp_bytes)
-        .map_err(|e| format!("Invalid control response: {}", e))?;
-
-    Ok(resp)
-}
-
 /// Sends control command to unlock/lock agent
 pub async fn send_control_request(req: ControlRequest) -> Result<ControlResponse, String> {
     let cache_dir =
@@ -274,7 +221,7 @@ pub async fn send_control_request(req: ControlRequest) -> Result<ControlResponse
 
     if !is_agent_running() {
         return Err(
-            "Agent is not running. Start it first with 'sshwarden agent start'".to_string(),
+            "Agent is not running. Start it first with 'sshwarden start'".to_string(),
         );
     }
 
@@ -299,6 +246,52 @@ pub async fn send_control_request(req: ControlRequest) -> Result<ControlResponse
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     Ok(resp)
+}
+
+async fn start_ssh_agent_task(
+    socket_path: PathBuf,
+    keyring: KeyRing,
+    last_activity: Arc<RwLock<Instant>>,
+    keys_context: SharedKeysContext,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let _ = fs::remove_file(&socket_path);
+
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| format!("Failed to bind SSH agent socket: {}", e))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("Failed to set socket permissions: {}", e))?;
+
+    info!("SSH Agent listener started at {}", socket_path.display());
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                break;
+            }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((stream, _)) => {
+                        let kr = keyring.clone();
+                        let la = last_activity.clone();
+                        let kc = keys_context.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_ssh_agent_connection(stream, kr, la, kc).await {
+                                error!("SSH Agent connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("SSH Agent accept error: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_file(&socket_path);
+    info!("SSH Agent listener stopped.");
+    Ok(())
 }
 
 /// Runs the background loops for agent socket and control socket
@@ -345,11 +338,21 @@ async fn run_daemon_loops(
 
     let shared_timeout = Arc::new(RwLock::new(timeout));
     let shared_timeout_action = Arc::new(RwLock::new(timeout_action));
+    let active_ssh_agent: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>> = Arc::new(RwLock::new(None));
 
-    let agent_listener = UnixListener::bind(&socket_path)
-        .map_err(|e| format!("Failed to bind SSH agent socket: {}", e))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("Failed to set socket permissions: {}", e))?;
+    if config.ssh_agent_auto_start {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let sp = socket_path.clone();
+        let kr = keyring.clone();
+        let la = last_activity.clone();
+        let kc = keys_context.clone();
+        tokio::spawn(async move {
+            if let Err(e) = start_ssh_agent_task(sp, kr, la, kc, rx).await {
+                error!("SSH Agent task error: {}", e);
+            }
+        });
+        *active_ssh_agent.write().await = Some(tx);
+    }
 
     let control_listener = UnixListener::bind(&control_socket_path)
         .map_err(|e| format!("Failed to bind control socket: {}", e))?;
@@ -450,17 +453,6 @@ async fn run_daemon_loops(
             _ = sigint.recv() => {
                 break;
             }
-            // SSH Agent protocol connection
-            Ok((stream, _)) = agent_listener.accept() => {
-                let kr = keyring.clone();
-                let la = last_activity.clone();
-                let kc = keys_context.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_ssh_agent_connection(stream, kr, la, kc).await {
-                        error!("SSH Agent connection error: {}", e);
-                    }
-                });
-            }
             // Control socket connection
             Ok((stream, _)) = control_listener.accept() => {
                 let kr = keyring.clone();
@@ -468,8 +460,10 @@ async fn run_daemon_loops(
                 let st = shared_timeout.clone();
                 let sta = shared_timeout_action.clone();
                 let kc = keys_context.clone();
+                let active_agent = active_ssh_agent.clone();
+                let sp = socket_path.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_control_connection(stream, kr, la, st, sta, kc).await {
+                    if let Err(e) = handle_control_connection(stream, kr, la, st, sta, kc, active_agent, sp).await {
                         error!("Control connection error: {}", e);
                     }
                 });
@@ -546,11 +540,11 @@ async fn handle_control_connection(
     shared_timeout: Arc<RwLock<Option<std::time::Duration>>>,
     shared_timeout_action: Arc<RwLock<crate::config::TimeoutAction>>,
     keys_context: SharedKeysContext,
+    active_ssh_agent: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
+    socket_path: PathBuf,
 ) -> Result<(), std::io::Error> {
     let mut request_bytes = Vec::new();
     stream.read_to_end(&mut request_bytes).await?;
-
-
 
     let req: ControlRequest = match serde_json::from_slice(&request_bytes) {
         Ok(r) => r,
@@ -561,6 +555,7 @@ async fn handle_control_connection(
                 unlocked: None,
                 key_count: None,
                 time_to_lock: None,
+                ssh_agent_active: None,
             };
             let resp_bytes = serde_json::to_vec(&resp).unwrap();
             stream.write_all(&resp_bytes).await?;
@@ -601,6 +596,7 @@ async fn handle_control_connection(
                     unlocked: Some(!keyring.read().await.is_empty()),
                     key_count: Some(keyring.read().await.len()),
                     time_to_lock: None,
+                    ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                 }
             } else {
                 // Decode hex keys
@@ -638,6 +634,7 @@ async fn handle_control_connection(
                             unlocked: Some(true),
                             key_count: Some(count),
                             time_to_lock: None,
+                            ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                         }
                     } else {
                         ControlResponse {
@@ -646,6 +643,7 @@ async fn handle_control_connection(
                             unlocked: Some(!keyring.read().await.is_empty()),
                             key_count: Some(keyring.read().await.len()),
                             time_to_lock: None,
+                            ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                         }
                     }
                 } else {
@@ -655,6 +653,7 @@ async fn handle_control_connection(
                         unlocked: Some(!keyring.read().await.is_empty()),
                         key_count: Some(keyring.read().await.len()),
                         time_to_lock: None,
+                        ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                     }
                 }
             }
@@ -669,6 +668,7 @@ async fn handle_control_connection(
                 unlocked: Some(false),
                 key_count: Some(0),
                 time_to_lock: None,
+                ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
             }
         }
         ControlRequest::Status => {
@@ -690,6 +690,7 @@ async fn handle_control_connection(
                 unlocked: Some(!kr.is_empty()),
                 key_count: Some(kr.len()),
                 time_to_lock,
+                ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
             }
         }
         ControlRequest::Reload => {
@@ -720,6 +721,7 @@ async fn handle_control_connection(
                         unlocked: Some(!keyring.read().await.is_empty()),
                         key_count: Some(keyring.read().await.len()),
                         time_to_lock: None,
+                        ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                     }
                 }
                 Err(e) => ControlResponse {
@@ -728,7 +730,64 @@ async fn handle_control_connection(
                     unlocked: Some(!keyring.read().await.is_empty()),
                     key_count: Some(keyring.read().await.len()),
                     time_to_lock: None,
+                    ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                 },
+            }
+        }
+        ControlRequest::StartSshAgent => {
+            let mut active = active_ssh_agent.write().await;
+            if active.is_some() {
+                ControlResponse {
+                    status: "error".to_string(),
+                    error: Some("SSH agent is already running".to_string()),
+                    unlocked: Some(!keyring.read().await.is_empty()),
+                    key_count: Some(keyring.read().await.len()),
+                    time_to_lock: None,
+                    ssh_agent_active: Some(true),
+                }
+            } else {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let sp = socket_path.clone();
+                let kr = keyring.clone();
+                let la = last_activity.clone();
+                let kc = keys_context.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = start_ssh_agent_task(sp, kr, la, kc, rx).await {
+                        error!("SSH Agent task error: {}", e);
+                    }
+                });
+                *active = Some(tx);
+                ControlResponse {
+                    status: "ok".to_string(),
+                    error: None,
+                    unlocked: Some(!keyring.read().await.is_empty()),
+                    key_count: Some(keyring.read().await.len()),
+                    time_to_lock: None,
+                    ssh_agent_active: Some(true),
+                }
+            }
+        }
+        ControlRequest::StopSshAgent => {
+            let mut active = active_ssh_agent.write().await;
+            if let Some(tx) = active.take() {
+                let _ = tx.send(());
+                ControlResponse {
+                    status: "ok".to_string(),
+                    error: None,
+                    unlocked: Some(!keyring.read().await.is_empty()),
+                    key_count: Some(keyring.read().await.len()),
+                    time_to_lock: None,
+                    ssh_agent_active: Some(false),
+                }
+            } else {
+                ControlResponse {
+                    status: "error".to_string(),
+                    error: Some("SSH agent is not running".to_string()),
+                    unlocked: Some(!keyring.read().await.is_empty()),
+                    key_count: Some(keyring.read().await.len()),
+                    time_to_lock: None,
+                    ssh_agent_active: Some(false),
+                }
             }
         }
     };
@@ -757,16 +816,15 @@ async fn handle_surgical_cipher_update(
     let fetch_result = client.get_cipher_details(token, cipher_id).await;
 
     let mut is_deleted = false;
-    let mut is_other_type = false;
     let mut new_key_item = None;
 
     match fetch_result {
         Ok(cipher) => {
             if cipher.deleted_date.is_some() {
                 is_deleted = true;
-            } else if cipher.r#type == 5 {
+            } else {
                 // Decrypt this cipher
-                let decrypted_list = storage::parse_and_extract_ssh_keys(
+                let decrypted_list = storage::parse_and_decrypt_all_ciphers(
                     &crate::api::SyncResponse {
                         profile: crate::api::ProfileSync {
                             id: String::new(),
@@ -783,21 +841,12 @@ async fn handle_surgical_cipher_update(
                 } else {
                     is_deleted = true;
                 }
-            } else {
-                // Not a type 5 cipher (not an SSH key)
-                is_other_type = true;
             }
         }
         Err(e) => {
             info!("Failed to fetch cipher details for {}: {}. Assuming deleted.", cipher_id, e);
             is_deleted = true;
         }
-    }
-
-    // If it is another type of vault item (e.g. login credentials, card),
-    // it was never stored in our database, so we can exit early without any disk reads.
-    if is_other_type {
-        return Ok(());
     }
 
     // Load existing items from cache database
@@ -807,7 +856,6 @@ async fn handle_surgical_cipher_update(
     let existed = updated_items.iter().any(|item| item.id == cipher_id);
     if is_deleted {
         if !existed {
-            // Early exit if it's not an SSH key (or is deleted) and didn't exist in our cache
             return Ok(());
         }
         // Remove from list
@@ -825,8 +873,9 @@ async fn handle_surgical_cipher_update(
     storage::save_db(&updated_items, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key))?;
 
     // Reload keyring memory
+    let ssh_items = storage::extract_ssh_keys_from_ciphers(&updated_items);
     let mut parsed_keys = Vec::new();
-    for item in &updated_items {
+    for item in &ssh_items {
         if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
             pkey.set_comment(&item.name);
             parsed_keys.push(pkey);
@@ -962,12 +1011,14 @@ async fn run_websocket_sync_loop(
                                                         info!("WebSocket: Agent was auto-unlocked from cache; skipping real-time full sync decryption since decryption keys are missing.");
                                                         continue;
                                                     }
-                                                    let new_items =
-                                                        storage::parse_and_extract_ssh_keys(
+                                                                                    let decrypted_ciphers =
+                                                        storage::parse_and_decrypt_all_ciphers(
                                                             &sync_data,
                                                             &ctx.enc_key,
                                                             &ctx.mac_key,
                                                         );
+                                                    let new_items =
+                                                        storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
 
                                                     let mut parsed_keys = Vec::new();
                                                     for item in &new_items {
@@ -986,7 +1037,7 @@ async fn run_websocket_sync_loop(
                                                     *kr = parsed_keys;
 
                                                     if let Err(err) = storage::save_db(
-                                                        &new_items,
+                                                        &decrypted_ciphers,
                                                         &ctx.db_key,
                                                         Some(&ctx.enc_key),
                                                         Some(&ctx.mac_key),
@@ -1098,11 +1149,12 @@ async fn run_websocket_sync_loop(
                                                                         info!("WebSocket: Agent was auto-unlocked from cache; skipping real-time full sync decryption since decryption keys are missing.");
                                                                         continue;
                                                                     }
-                                                                    let new_items = storage::parse_and_extract_ssh_keys(
+                                                                    let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(
                                                                         &sync_data,
                                                                         &ctx.enc_key,
                                                                         &ctx.mac_key,
                                                                     );
+                                                                    let new_items = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
                                                                     let mut parsed_keys = Vec::new();
                                                                     for item in &new_items {
                                                                         if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
@@ -1112,7 +1164,7 @@ async fn run_websocket_sync_loop(
                                                                     }
                                                                     let count = parsed_keys.len();
                                                                     *keyring.write().await = parsed_keys;
-                                                                    if let Err(err) = storage::save_db(&new_items, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
+                                                                    if let Err(err) = storage::save_db(&decrypted_ciphers, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
                                                                         error!("WebSocket background sync failed to save db: {}", err);
                                                                     } else {
                                                                         info!("WebSocket (binary): Background sync completed. Synced and reloaded {} keys.", count);
@@ -1296,8 +1348,9 @@ async fn prompt_tty_for_unlock(
         .map_err(|e| format!("Password incorrect or local database decryption failed: {}", e))?;
 
     // Parse SSH keys
+    let ssh_items = crate::storage::extract_ssh_keys_from_ciphers(&items);
     let mut parsed_keys = Vec::new();
-    for item in &items {
+    for item in &ssh_items {
         if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(&item.private_key) {
             pkey.set_comment(&item.name);
             parsed_keys.push(pkey);

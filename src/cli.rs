@@ -29,31 +29,22 @@ pub enum Commands {
     /// Manage SSH keys
     Keys(KeysArgs),
 
-    /// Manage the background SSH agent
-    Agent(AgentArgs),
+    /// Start the background daemon process
+    Start(DaemonArgs),
+
+    /// Stop the running background daemon process
+    Stop,
+
+    /// Start the SSH agent listener loop inside the running daemon
+    StartSsh,
+
+    /// Stop the SSH agent listener loop inside the running daemon
+    StopSsh,
 
     /// Unlock the agent by supplying the master password
     Unlock,
 
     /// View global status of sshwarden
-    Status,
-}
-
-#[derive(Debug, Args)]
-pub struct AgentArgs {
-    #[command(subcommand)]
-    pub command: AgentCommands,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AgentCommands {
-    /// Start the background agent
-    Start(DaemonArgs),
-
-    /// Stop the running background agent
-    Stop,
-
-    /// View the status of the background agent
     Status,
 }
 
@@ -93,6 +84,10 @@ pub struct SettingsArgs {
     /// Set custom Bitwarden server URL (e.g. self-hosted Vaultwarden)
     #[arg(short, long)]
     pub server_url: Option<String>,
+
+    /// Enable or disable SSH agent auto-start with the daemon ('true' or 'false')
+    #[arg(long)]
+    pub ssh_agent_auto_start: Option<String>,
 }
 
 #[derive(Debug, Args)]

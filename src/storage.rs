@@ -27,6 +27,37 @@ pub struct SshKeyItem {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecryptedField {
+    pub name: String,
+    pub value: Option<String>,
+    pub r#type: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecryptedLogin {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecryptedSshKey {
+    pub private_key: Option<String>,
+    pub public_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CipherItem {
+    pub id: String,
+    pub r#type: i32,
+    pub name: String,
+    pub notes: Option<String>,
+    pub login: Option<DecryptedLogin>,
+    pub fields: Option<Vec<DecryptedField>>,
+    pub ssh_key: Option<DecryptedSshKey>,
+}
+
 /// Gets the standard cache directory for sshwarden
 pub fn cache_dir() -> Option<PathBuf> {
     ProjectDirs::from("com", "", APP_NAME).map(|proj| proj.cache_dir().to_path_buf())
@@ -76,7 +107,7 @@ pub fn derive_db_key(password: &str, salt_b64: &str) -> Result<[u8; 32], String>
 }
 
 /// Load and decrypt the local cache database from disk
-pub fn load_db(db_key: &[u8; 32]) -> Result<Vec<SshKeyItem>, String> {
+pub fn load_db(db_key: &[u8; 32]) -> Result<Vec<CipherItem>, String> {
     let path = db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
 
     if !path.exists() {
@@ -104,7 +135,7 @@ pub fn load_db(db_key: &[u8; 32]) -> Result<Vec<SshKeyItem>, String> {
         "Failed to decrypt local database cache. Did your master password change?".to_string()
     })?;
 
-    let items: Vec<SshKeyItem> = serde_json::from_slice(&plaintext)
+    let items: Vec<CipherItem> = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("Failed to parse decrypted database JSON: {}", e))?;
 
     Ok(items)
@@ -168,7 +199,7 @@ pub fn load_saved_keys() -> Option<([u8; 32], [u8; 32], [u8; 32])> {
 
 /// Encrypt and save the local cache database to disk with 0600 permissions
 pub fn save_db(
-    items: &[SshKeyItem],
+    items: &[CipherItem],
     db_key: &[u8; 32],
     enc_key: Option<&[u8; 32]>,
     mac_key: Option<&[u8; 32]>,
@@ -284,9 +315,11 @@ pub fn load_unencrypted_db() -> Option<Vec<ssh_key::private::PrivateKey>> {
     let mut data = Vec::new();
     file.read_to_end(&mut data).ok()?;
 
-    let items: Vec<SshKeyItem> = serde_json::from_slice(&data).ok()?;
+    let items: Vec<CipherItem> = serde_json::from_slice(&data).ok()?;
+    let ssh_items = extract_ssh_keys_from_ciphers(&items);
+
     let mut parsed_keys = Vec::new();
-    for item in items {
+    for item in ssh_items {
         if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(&item.private_key) {
             pkey.set_comment(&item.name);
             parsed_keys.push(pkey);
@@ -295,17 +328,80 @@ pub fn load_unencrypted_db() -> Option<Vec<ssh_key::private::PrivateKey>> {
     Some(parsed_keys)
 }
 
-/// Parses the full sync response, decrypts ciphers, filters out non-SSH keys, and returns a list of SSH keys.
-pub fn parse_and_extract_ssh_keys(
+/// Extracts SSH keys from generic decrypted ciphers list
+pub fn extract_ssh_keys_from_ciphers(ciphers: &[CipherItem]) -> Vec<SshKeyItem> {
+    let mut ssh_keys = Vec::new();
+    let is_ssh_private_key = |text: &str| -> bool { text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") };
+
+    for cipher in ciphers {
+        // Scenario 1: Native SSH Key Item (type 100)
+        if let Some(ref ssh_key) = cipher.ssh_key {
+            if let Some(ref priv_key) = ssh_key.private_key {
+                if is_ssh_private_key(priv_key) {
+                    ssh_keys.push(SshKeyItem {
+                        id: cipher.id.clone(),
+                        name: cipher.name.clone(),
+                        private_key: priv_key.clone(),
+                        public_key: ssh_key.public_key.clone(),
+                        note: cipher.notes.clone(),
+                    });
+                    continue;
+                }
+            }
+        }
+
+        // Scenario 2: Custom fields (e.g. login or note items containing custom fields for SSH keys)
+        if let Some(ref fields) = cipher.fields {
+            for field in fields {
+                let field_name = field.name.to_lowercase();
+                if field_name == "ssh_private_key"
+                    || field_name == "ssh-private-key"
+                    || field_name.contains("ssh_key")
+                {
+                    if let Some(ref val) = field.value {
+                        if is_ssh_private_key(val) {
+                            ssh_keys.push(SshKeyItem {
+                                id: cipher.id.clone(),
+                                name: format!("{} ({})", cipher.name, field.name),
+                                private_key: val.clone(),
+                                public_key: None,
+                                note: cipher.notes.clone(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scenario 3: Secure Note containing OpenSSH / PEM private key in notes body
+        if cipher.r#type == 2 {
+            if let Some(ref notes) = cipher.notes {
+                if is_ssh_private_key(notes) {
+                    ssh_keys.push(SshKeyItem {
+                        id: cipher.id.clone(),
+                        name: cipher.name.clone(),
+                        private_key: notes.clone(),
+                        public_key: None,
+                        note: Some("Extracted from secure note text body".to_string()),
+                    });
+                }
+            }
+        }
+    }
+    ssh_keys
+}
+
+/// Parses the full sync response and decrypts all ciphers without filtering out non-SSH keys.
+pub fn parse_and_decrypt_all_ciphers(
     sync_response: &SyncResponse,
     enc_key: &[u8; 32],
     mac_key: &[u8; 32],
-) -> Vec<SshKeyItem> {
-    let mut ssh_keys = Vec::new();
+) -> Vec<CipherItem> {
+    let mut ciphers = Vec::new();
 
     for cipher in &sync_response.ciphers {
-        if let Err(e) = process_cipher(cipher, enc_key, mac_key, &mut ssh_keys) {
-            // Log decryption errors or parse errors, but continue processing other ciphers
+        if let Err(e) = decrypt_single_cipher(cipher, enc_key, mac_key, &mut ciphers) {
             eprintln!(
                 "Warning: Skipping cipher ID {} due to error: {}",
                 cipher.id, e
@@ -313,14 +409,14 @@ pub fn parse_and_extract_ssh_keys(
         }
     }
 
-    ssh_keys
+    ciphers
 }
 
-fn process_cipher(
+fn decrypt_single_cipher(
     cipher: &CipherSync,
     user_enc_key: &[u8; 32],
     user_mac_key: &[u8; 32],
-    ssh_keys: &mut Vec<SshKeyItem>,
+    ciphers: &mut Vec<CipherItem>,
 ) -> Result<(), String> {
     if cipher.deleted_date.is_some() {
         return Ok(());
@@ -367,88 +463,90 @@ fn process_cipher(
         None => None,
     };
 
-    // Helper to check if a decrypted string looks like an SSH private key
-    let is_ssh_private_key =
-        |text: &str| -> bool { text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") };
-
-    // Scenario 1: Native SSH Key Item (has ssh_key and private_key populated)
-    if let Some(enc_priv_key) = cipher.ssh_key.as_ref().and_then(|k| k.private_key.as_ref()) {
-        let priv_key_bytes = crypto::decrypt_cipher_string(enc_priv_key, enc_key, mac_key)?;
-        let plain_priv_key = String::from_utf8(priv_key_bytes)
-            .map_err(|e| format!("Decrypted private key not valid UTF-8: {}", e))?;
-
-        if is_ssh_private_key(&plain_priv_key) {
-            let plain_pub_key = match cipher.ssh_key.as_ref().and_then(|k| k.public_key.as_ref()) {
-                Some(enc_pub_key) => {
-                    let pub_key_bytes =
-                        crypto::decrypt_cipher_string(enc_pub_key, enc_key, mac_key)?;
-                    String::from_utf8(pub_key_bytes).ok()
-                }
-                None => None,
-            };
-
-            ssh_keys.push(SshKeyItem {
-                id: cipher.id.clone(),
-                name: plain_name,
-                private_key: plain_priv_key,
-                public_key: plain_pub_key,
-                note: plain_notes,
-            });
-            return Ok(());
-        }
-    }
-
-    // Scenario 2: Custom fields (e.g. login or note items containing custom fields for SSH keys)
-    if let Some(ref fields) = cipher.fields {
+    // Decrypt fields
+    let decrypted_fields = if let Some(ref fields) = cipher.fields {
+        let mut dfs = Vec::new();
         for field in fields {
-            // Decrypt field name
             let field_name_bytes = crypto::decrypt_cipher_string(&field.name, enc_key, mac_key)?;
             let field_name = String::from_utf8(field_name_bytes)
-                .unwrap_or_default()
-                .to_lowercase();
+                .map_err(|e| format!("Decrypted field name is not valid UTF-8: {}", e))?;
 
-            let enc_field_val = field.value.as_ref().filter(|_| {
-                field_name == "ssh_private_key"
-                    || field_name == "ssh-private-key"
-                    || field_name.contains("ssh_key")
+            let field_value = if let Some(ref enc_val) = field.value {
+                let val_bytes = crypto::decrypt_cipher_string(enc_val, enc_key, mac_key)?;
+                Some(String::from_utf8(val_bytes)
+                    .map_err(|e| format!("Decrypted field value is not valid UTF-8: {}", e))?)
+            } else {
+                None
+            };
+            dfs.push(DecryptedField {
+                name: field_name,
+                value: field_value,
+                r#type: field.r#type,
             });
-
-            if let Some(enc_val) = enc_field_val {
-                let field_val_bytes = crypto::decrypt_cipher_string(enc_val, enc_key, mac_key)?;
-                let field_val = String::from_utf8(field_val_bytes)
-                    .map_err(|e| format!("Decrypted field value is not valid UTF-8: {}", e))?;
-
-                if is_ssh_private_key(&field_val) {
-                    ssh_keys.push(SshKeyItem {
-                        id: cipher.id.clone(),
-                        name: format!("{} ({})", plain_name, field_name),
-                        private_key: field_val,
-                        public_key: None,
-                        note: plain_notes.clone(),
-                    });
-                    return Ok(());
-                }
-            }
         }
-    }
-
-    // Scenario 3: Secure Note containing OpenSSH / PEM private key in notes body
-    let secure_note_key = if cipher.r#type == 2 {
-        plain_notes.as_ref().filter(|n| is_ssh_private_key(n))
+        Some(dfs)
     } else {
         None
     };
 
-    if let Some(notes) = secure_note_key {
-        ssh_keys.push(SshKeyItem {
-            id: cipher.id.clone(),
-            name: plain_name,
-            private_key: notes.clone(),
-            public_key: None,
-            note: Some("Extracted from secure note text body".to_string()),
-        });
-        return Ok(());
-    }
+    // Decrypt login
+    let decrypted_login = if let Some(ref login) = cipher.login {
+        let username = if let Some(ref enc_user) = login.username {
+            let user_bytes = crypto::decrypt_cipher_string(enc_user, enc_key, mac_key)?;
+            Some(String::from_utf8(user_bytes)
+                .map_err(|e| format!("Decrypted username is not valid UTF-8: {}", e))?)
+        } else {
+            None
+        };
+        let password = if let Some(ref enc_pass) = login.password {
+            let pass_bytes = crypto::decrypt_cipher_string(enc_pass, enc_key, mac_key)?;
+            Some(String::from_utf8(pass_bytes)
+                .map_err(|e| format!("Decrypted password is not valid UTF-8: {}", e))?)
+        } else {
+            None
+        };
+        Some(DecryptedLogin {
+            username,
+            password,
+            uri: login.uri.clone(),
+        })
+    } else {
+        None
+    };
+
+    // Decrypt ssh key
+    let decrypted_ssh_key = if let Some(ref ssh_key) = cipher.ssh_key {
+        let private_key = if let Some(ref enc_priv) = ssh_key.private_key {
+            let priv_bytes = crypto::decrypt_cipher_string(enc_priv, enc_key, mac_key)?;
+            Some(String::from_utf8(priv_bytes)
+                .map_err(|e| format!("Decrypted private key is not valid UTF-8: {}", e))?)
+        } else {
+            None
+        };
+        let public_key = if let Some(ref enc_pub) = ssh_key.public_key {
+            let pub_bytes = crypto::decrypt_cipher_string(enc_pub, enc_key, mac_key)?;
+            Some(String::from_utf8(pub_bytes)
+                .map_err(|e| format!("Decrypted public key is not valid UTF-8: {}", e))?)
+        } else {
+            None
+        };
+        Some(DecryptedSshKey {
+            private_key,
+            public_key,
+        })
+    } else {
+        None
+    };
+
+    ciphers.push(CipherItem {
+        id: cipher.id.clone(),
+        r#type: cipher.r#type,
+        name: plain_name,
+        notes: plain_notes,
+        login: decrypted_login,
+        fields: decrypted_fields,
+        ssh_key: decrypted_ssh_key,
+    });
 
     Ok(())
 }
