@@ -814,31 +814,14 @@ async fn handle_surgical_cipher_update(
     let fetch_result = client.get_cipher_details(token, cipher_id).await;
 
     let mut is_deleted = false;
-    let mut new_key_item = None;
+    let mut fetched_cipher = None;
 
     match fetch_result {
         Ok(cipher) => {
             if cipher.deleted_date.is_some() {
                 is_deleted = true;
             } else {
-                // Decrypt this cipher
-                let decrypted_list = storage::parse_and_decrypt_all_ciphers(
-                    &crate::api::SyncResponse {
-                        profile: crate::api::ProfileSync {
-                            id: String::new(),
-                            email: String::new(),
-                            key: String::new(),
-                        },
-                        ciphers: vec![cipher],
-                    },
-                    &ctx.enc_key,
-                    &ctx.mac_key,
-                );
-                if let Some(decrypted_item) = decrypted_list.into_iter().next() {
-                    new_key_item = Some(decrypted_item);
-                } else {
-                    is_deleted = true;
-                }
+                fetched_cipher = Some(cipher);
             }
         }
         Err(e) => {
@@ -847,31 +830,49 @@ async fn handle_surgical_cipher_update(
         }
     }
 
-    // Load existing items from cache database
-    let existing_items = storage::load_db(&ctx.db_key).unwrap_or_default();
-    let mut updated_items = existing_items;
+    // Load existing SyncResponse from cache database
+    let mut sync_resp = match storage::load_db(&ctx.db_key) {
+        Ok(resp) => resp,
+        Err(e) => {
+            info!("Failed to load cache database: {}. Initializing empty database.", e);
+            storage::SyncResponse {
+                profile: storage::ProfileSync {
+                    id: String::new(),
+                    email: String::new(),
+                    key: String::new(),
+                    extra: std::collections::HashMap::new(),
+                },
+                ciphers: Vec::new(),
+                user_decryption: None,
+                extra: std::collections::HashMap::new(),
+            }
+        }
+    };
 
-    let existed = updated_items.iter().any(|item| item.id == cipher_id);
+    let existed = sync_resp.ciphers.iter().any(|c| c.id == cipher_id);
     if is_deleted {
         if !existed {
             return Ok(());
         }
         // Remove from list
-        updated_items.retain(|item| item.id != cipher_id);
-    } else if let Some(item) = new_key_item {
+        sync_resp.ciphers.retain(|c| c.id != cipher_id);
+    } else if let Some(cipher) = fetched_cipher {
         // Upsert item
-        if let Some(pos) = updated_items.iter().position(|x| x.id == cipher_id) {
-            updated_items[pos] = item;
+        if let Some(pos) = sync_resp.ciphers.iter().position(|x| x.id == cipher_id) {
+            sync_resp.ciphers[pos] = cipher;
         } else {
-            updated_items.push(item);
+            sync_resp.ciphers.push(cipher);
         }
     }
 
-    // Save updated items back to database cache
-    storage::save_db(&updated_items, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key))?;
+    // Save updated SyncResponse back to database cache
+    storage::save_db(&sync_resp, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key))?;
+
+    // Decrypt all ciphers
+    let decrypted_items = storage::parse_and_decrypt_all_ciphers(&sync_resp, &ctx.enc_key, &ctx.mac_key);
 
     // Reload keyring memory
-    let ssh_items = storage::extract_ssh_keys_from_ciphers(&updated_items);
+    let ssh_items = storage::extract_ssh_keys_from_ciphers(&decrypted_items);
     let mut parsed_keys = Vec::new();
     for item in &ssh_items {
         if let Ok(mut pkey) = PrivateKey::from_openssh(&item.private_key) {
@@ -1037,7 +1038,7 @@ async fn run_websocket_sync_loop(
                                                     *kr = parsed_keys;
 
                                                     if let Err(err) = storage::save_db(
-                                                        &decrypted_ciphers,
+                                                        &sync_data,
                                                         &ctx.db_key,
                                                         Some(&ctx.enc_key),
                                                         Some(&ctx.mac_key),
@@ -1164,7 +1165,7 @@ async fn run_websocket_sync_loop(
                                                                     }
                                                                     let count = parsed_keys.len();
                                                                     *keyring.write().await = parsed_keys;
-                                                                    if let Err(err) = storage::save_db(&decrypted_ciphers, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
+                                                                    if let Err(err) = storage::save_db(&sync_data, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
                                                                         error!("WebSocket background sync failed to save db: {}", err);
                                                                     } else {
                                                                         info!("WebSocket (binary): Background sync completed. Synced and reloaded {} keys.", count);
@@ -1344,8 +1345,12 @@ async fn prompt_tty_for_unlock(
     tty.write_all(b"Done.\r\n").map_err(|e| e.to_string())?;
 
     // Load local database
-    let items = crate::storage::load_db(&db_key)
+    let sync_resp = crate::storage::load_db(&db_key)
         .map_err(|e| format!("Password incorrect or local database decryption failed: {}", e))?;
+
+    // Decrypt ciphers offline using master password
+    let (items, enc_key, mac_key) = crate::storage::decrypt_sync_response_offline(&sync_resp, &password)
+        .map_err(|e| format!("Failed to decrypt local database offline: {}", e))?;
 
     // Parse SSH keys
     let ssh_items = crate::storage::extract_ssh_keys_from_ciphers(&items);
@@ -1360,8 +1365,8 @@ async fn prompt_tty_for_unlock(
     let count = parsed_keys.len();
     *keyring.write().await = parsed_keys;
     *keys_context.write().await = Some(KeysContext {
-        enc_key: [0u8; 32],
-        mac_key: [0u8; 32],
+        enc_key,
+        mac_key,
         db_key,
     });
 

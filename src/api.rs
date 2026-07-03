@@ -99,6 +99,8 @@ pub struct ProfileSync {
     pub id: String,
     pub email: String,
     pub key: String, // MasterKeyWrappedUserKey
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -145,6 +147,31 @@ pub struct CipherSync {
     pub ssh_key: Option<SshKeySync>,
     pub deleted_date: Option<String>,
     pub key: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct KdfSync {
+    pub kdf_type: u32,
+    pub iterations: u32,
+    pub memory: Option<u32>,
+    pub parallelism: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPasswordUnlockSync {
+    pub kdf: KdfSync,
+    pub master_key_wrapped_user_key: String,
+    pub salt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDecryptionSync {
+    pub master_password_unlock: Option<MasterPasswordUnlockSync>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -152,6 +179,9 @@ pub struct CipherSync {
 pub struct SyncResponse {
     pub profile: ProfileSync,
     pub ciphers: Vec<CipherSync>,
+    pub user_decryption: Option<UserDecryptionSync>,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

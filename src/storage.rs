@@ -4,6 +4,7 @@ use aes_gcm::{
 };
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+#[cfg(not(test))]
 use directories::ProjectDirs;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -12,9 +13,10 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-use crate::api::{CipherSync, SyncResponse};
+pub use crate::api::{CipherSync, SyncResponse, ProfileSync};
 use crate::crypto;
 
+#[cfg(not(test))]
 const APP_NAME: &str = "sshwarden";
 const DB_FILE_NAME: &str = "vault.db.enc";
 
@@ -58,9 +60,15 @@ pub struct CipherItem {
     pub ssh_key: Option<DecryptedSshKey>,
 }
 
-/// Gets the standard cache directory for sshwarden
 pub fn cache_dir() -> Option<PathBuf> {
-    ProjectDirs::from("com", "", APP_NAME).map(|proj| proj.cache_dir().to_path_buf())
+    #[cfg(test)]
+    {
+        Some(std::env::temp_dir().join("sshwarden_test"))
+    }
+    #[cfg(not(test))]
+    {
+        ProjectDirs::from("com", "", APP_NAME).map(|proj| proj.cache_dir().to_path_buf())
+    }
 }
 
 /// Gets the path to the vault.db.enc file
@@ -107,11 +115,11 @@ pub fn derive_db_key(password: &str, salt_b64: &str) -> Result<[u8; 32], String>
 }
 
 /// Load and decrypt the local cache database from disk
-pub fn load_db(db_key: &[u8; 32]) -> Result<Vec<CipherItem>, String> {
+pub fn load_db(db_key: &[u8; 32]) -> Result<SyncResponse, String> {
     let path = db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
 
     if !path.exists() {
-        return Ok(Vec::new());
+        return Err("Cache database file does not exist. Please run 'sshwarden sync' to fetch your vault first.".to_string());
     }
 
     let mut file =
@@ -135,10 +143,10 @@ pub fn load_db(db_key: &[u8; 32]) -> Result<Vec<CipherItem>, String> {
         "Failed to decrypt local database cache. Did your master password change?".to_string()
     })?;
 
-    let items: Vec<CipherItem> = serde_json::from_slice(&plaintext)
+    let sync_resp: SyncResponse = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("Failed to parse decrypted database JSON: {}", e))?;
 
-    Ok(items)
+    Ok(sync_resp)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,7 +207,7 @@ pub fn load_saved_keys() -> Option<([u8; 32], [u8; 32], [u8; 32])> {
 
 /// Encrypt and save the local cache database to disk with 0600 permissions
 pub fn save_db(
-    items: &[CipherItem],
+    sync_response: &SyncResponse,
     db_key: &[u8; 32],
     enc_key: Option<&[u8; 32]>,
     mac_key: Option<&[u8; 32]>,
@@ -212,7 +220,7 @@ pub fn save_db(
             .map_err(|e| format!("Failed to create cache directory: {}", e))?;
     }
 
-    let plaintext = serde_json::to_vec(items)
+    let plaintext = serde_json::to_vec(sync_response)
         .map_err(|e| format!("Failed to serialize database to JSON: {}", e))?;
 
     // Generate random 12-byte nonce
@@ -248,17 +256,20 @@ pub fn save_db(
     if let Ok(config) = crate::config::Config::load() {
         if config.timeout.trim().to_lowercase() == "never" {
             if let Some(raw_path) = unencrypted_db_path() {
-                let pretty_json = serde_json::to_vec_pretty(items)
-                    .map_err(|e| format!("Failed to serialize unencrypted database: {}", e))?;
-                fs::write(&raw_path, &pretty_json)
-                    .map_err(|e| format!("Failed to write unencrypted cache: {}", e))?;
-                
-                let file = File::open(&raw_path)
-                    .map_err(|e| format!("Failed to open unencrypted cache file to set permissions: {}", e))?;
-                let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
-                perms.set_mode(0o600);
-                file.set_permissions(perms)
-                    .map_err(|e| format!("Failed to set permissions on unencrypted cache: {}", e))?;
+                if let (Some(enc), Some(mac)) = (enc_key, mac_key) {
+                    let decrypted_items = parse_and_decrypt_all_ciphers(sync_response, enc, mac);
+                    let pretty_json = serde_json::to_vec_pretty(&decrypted_items)
+                        .map_err(|e| format!("Failed to serialize unencrypted database: {}", e))?;
+                    fs::write(&raw_path, &pretty_json)
+                        .map_err(|e| format!("Failed to write unencrypted cache: {}", e))?;
+                    
+                    let file = File::open(&raw_path)
+                        .map_err(|e| format!("Failed to open unencrypted cache file to set permissions: {}", e))?;
+                    let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
+                    perms.set_mode(0o600);
+                    file.set_permissions(perms)
+                        .map_err(|e| format!("Failed to set permissions on unencrypted cache: {}", e))?;
+                }
             }
 
             // Save encryption keys if provided
@@ -266,16 +277,7 @@ pub fn save_db(
                 let _ = save_keys(enc, mac, db_key);
             }
         } else {
-            if let Some(raw_path) = unencrypted_db_path() {
-                if raw_path.exists() {
-                    let _ = fs::remove_file(raw_path);
-                }
-            }
-            if let Some(k_path) = keys_path() {
-                if k_path.exists() {
-                    let _ = fs::remove_file(k_path);
-                }
-            }
+            let _ = wipe_unencrypted_cache();
         }
     }
 
@@ -566,4 +568,135 @@ fn decrypt_single_cipher(
     });
 
     Ok(())
+}
+
+/// Offline decryption helper to extract encryption keys and decrypt all ciphers using master password
+pub fn decrypt_sync_response_offline(
+    sync_resp: &SyncResponse,
+    password: &str,
+) -> Result<(Vec<CipherItem>, [u8; 32], [u8; 32]), String> {
+    // 1. Get KDF parameters from user_decryption
+    let (kdf_type, iterations, memory, parallelism, salt_email) = if let Some(ref ud) = sync_resp.user_decryption {
+        if let Some(ref mpu) = ud.master_password_unlock {
+            (
+                mpu.kdf.kdf_type,
+                mpu.kdf.iterations,
+                mpu.kdf.memory,
+                mpu.kdf.parallelism,
+                mpu.salt.clone(),
+            )
+        } else {
+            return Err("Offline KDF data missing from local cache".to_string());
+        }
+    } else {
+        return Err("Offline decryption settings missing from local cache. Please sync online first.".to_string());
+    };
+
+    // 2. Derive master key
+    let master_key = match kdf_type {
+        0 => crate::crypto::derive_master_key_pbkdf2(password, &salt_email, iterations)?,
+        1 => {
+            let mem = memory.ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
+            let para = parallelism.ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
+            crate::crypto::derive_master_key_argon2(password, &salt_email, iterations, mem, para)?
+        }
+        t => return Err(format!("Unsupported KDF type: {}", t)),
+    };
+
+    // 3. Decrypt user symmetric keys
+    let (enc_key, mac_key) = crate::crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)?;
+
+    // 4. Decrypt ciphers
+    let ciphers = parse_and_decrypt_all_ciphers(sync_resp, &enc_key, &mac_key);
+
+    Ok((ciphers, enc_key, mac_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serde_sync_response_integration() {
+        // Load the actual example sync response capture
+        let path = std::path::Path::new("docs/example-sync.json");
+        if !path.exists() {
+            // Skip the test if example-sync.json is missing in CI
+            return;
+        }
+
+        let content = std::fs::read_to_string(path).expect("Failed to read docs/example-sync.json");
+        let sync_resp: SyncResponse = serde_json::from_str(&content).expect("Failed to deserialize SyncResponse");
+
+        // Verify key fields
+        assert_eq!(sync_resp.profile.email, "alex@okkk.cc");
+        assert!(!sync_resp.ciphers.is_empty());
+        assert_eq!(sync_resp.ciphers[0].id, "0075d6b8-7e7c-4a93-8131-39102849d2ca");
+
+        // Verify user decryption KDF data
+        let ud = sync_resp.user_decryption.as_ref().expect("Missing user_decryption");
+        let mpu = ud.master_password_unlock.as_ref().expect("Missing master_password_unlock");
+        assert_eq!(mpu.kdf.kdf_type, 1);
+        assert_eq!(mpu.kdf.iterations, 2);
+        assert_eq!(mpu.kdf.memory, Some(32));
+        assert_eq!(mpu.kdf.parallelism, Some(2));
+        assert_eq!(mpu.salt, "alex@okkk.cc");
+
+        // Verify that flattened extra fields are captured
+        assert!(sync_resp.extra.contains_key("folders"));
+        assert!(sync_resp.extra.contains_key("object"));
+        assert!(sync_resp.profile.extra.contains_key("name"));
+        assert!(sync_resp.ciphers[0].extra.contains_key("favorite"));
+
+        // Round-trip serialization
+        let serialized = serde_json::to_string(&sync_resp).expect("Failed to serialize");
+        let sync_resp_2: SyncResponse = serde_json::from_str(&serialized).expect("Failed to deserialize second time");
+
+        // Verify round-tripped extra fields
+        assert!(sync_resp_2.extra.contains_key("folders"));
+        assert!(sync_resp_2.extra.contains_key("object"));
+        assert_eq!(sync_resp_2.profile.email, "alex@okkk.cc");
+    }
+
+    #[test]
+    fn test_save_load_db_roundtrip() {
+        // Clean up any existing test cache directory first
+        let cache_d = cache_dir().expect("Missing cache dir");
+        let _ = std::fs::remove_dir_all(&cache_d);
+
+        let mut extra_profile = std::collections::HashMap::new();
+        extra_profile.insert("name".to_string(), serde_json::json!("Test User"));
+
+        let mut extra_sync = std::collections::HashMap::new();
+        extra_sync.insert("object".to_string(), serde_json::json!("sync"));
+
+        let sync_resp = SyncResponse {
+            profile: ProfileSync {
+                id: "user-123".to_string(),
+                email: "test@example.com".to_string(),
+                key: "wrapped-key".to_string(),
+                extra: extra_profile,
+            },
+            ciphers: Vec::new(),
+            user_decryption: None,
+            extra: extra_sync,
+        };
+
+        let db_key = [7u8; 32];
+
+        // Save it
+        save_db(&sync_resp, &db_key, None, None).expect("save_db failed");
+
+        // Load it back
+        let loaded = load_db(&db_key).expect("load_db failed");
+
+        assert_eq!(loaded.profile.id, "user-123");
+        assert_eq!(loaded.profile.email, "test@example.com");
+        assert_eq!(loaded.profile.key, "wrapped-key");
+        assert_eq!(loaded.profile.extra.get("name").unwrap(), "Test User");
+        assert_eq!(loaded.extra.get("object").unwrap(), "sync");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&cache_d);
+    }
 }

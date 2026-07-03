@@ -45,7 +45,7 @@ pub async fn perform_sync_and_reload(
         .map_err(|e| format!("Failed to save session: {}", e))?;
 
     // 5. Save to database cache
-    storage::save_db(&decrypted_ciphers, db_key, Some(&enc_key), Some(&mac_key))
+    storage::save_db(&sync_data, db_key, Some(&enc_key), Some(&mac_key))
         .map_err(|e| format!("Failed to save cache database: {}", e))?;
 
     // 6. Automatically unlock running agent daemon if it is running
@@ -460,13 +460,17 @@ async fn handle_settings(
                 let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
                 let mut verified = false;
                 let mut verified_locally = false;
-                let mut loaded_keys = Vec::new();
+                let mut loaded_sync_resp = None;
+                let mut decrypted_keys = None;
 
                 if path.exists() {
-                    if let Ok(keys) = storage::load_db(&db_key) {
-                        verified = true;
-                        verified_locally = true;
-                        loaded_keys = keys;
+                    if let Ok(sync_resp) = storage::load_db(&db_key) {
+                        if let Ok((_ciphers, enc, mac)) = storage::decrypt_sync_response_offline(&sync_resp, &password) {
+                            verified = true;
+                            verified_locally = true;
+                            loaded_sync_resp = Some(sync_resp);
+                            decrypted_keys = Some((enc, mac));
+                        }
                     }
                 }
 
@@ -509,7 +513,7 @@ async fn handle_settings(
                                 KeySource::MasterKey(master_key),
                                 &db_key,
                                 session,
-                            )
+                             )
                             .await
                             {
                                 Ok(_) => {
@@ -539,9 +543,9 @@ async fn handle_settings(
                         .save()
                         .map_err(|e| format!("Failed to save configuration: {}", e))?;
 
-                    if !loaded_keys.is_empty() {
+                    if let (Some(sync_resp), Some((enc, mac))) = (loaded_sync_resp, decrypted_keys) {
                         println!("Generating unencrypted cache database...");
-                        if let Err(e) = storage::save_db(&loaded_keys, &db_key, None, None) {
+                        if let Err(e) = storage::save_db(&sync_resp, &db_key, Some(&enc), Some(&mac)) {
                             eprintln!("Warning: Failed to generate unencrypted cache: {}", e);
                         }
                     }
@@ -618,7 +622,7 @@ async fn handle_settings(
 }
 
 // Deprecated: This function is a placeholder for future key management features. Refactoration may be needed.
-async fn handle_keys(command: KeysCommands, session: &Session) -> Result<(), String> {
+async fn handle_keys(command: KeysCommands, _session: &Session) -> Result<(), String> {
     match command {
         KeysCommands::List => {
             println!("Listing keys... (Will be implemented in Phase 3)");
@@ -714,7 +718,8 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
 
     if !synced_successfully {
         println!("Falling back to decrypting local cache database...");
-        let ciphers = storage::load_db(&db_key)?;
+        let sync_resp = storage::load_db(&db_key)?;
+        let (ciphers, enc_key, mac_key) = storage::decrypt_sync_response_offline(&sync_resp, &password)?;
         let cache_keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
         if cache_keys.is_empty() {
             return Err(
@@ -725,6 +730,8 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         println!("Warning: Running in offline mode. Live background sync will be unavailable.");
 
         let db_hex = hex::encode(db_key);
+        let enc_hex = hex::encode(enc_key);
+        let mac_hex = hex::encode(mac_key);
         let daemon_keys: Vec<daemon::SshKeyData> = cache_keys
             .into_iter()
             .map(|k| daemon::SshKeyData {
@@ -736,8 +743,8 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         println!("Sending keys to background agent daemon...");
         let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
             keys: daemon_keys,
-            enc_key: String::new(),
-            mac_key: String::new(),
+            enc_key: enc_hex,
+            mac_key: mac_hex,
             db_key: db_hex,
         })
         .await?;
