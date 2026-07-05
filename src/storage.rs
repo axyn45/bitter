@@ -598,10 +598,17 @@ fn decrypt_single_cipher(
         } else {
             None
         };
+        let uri = if let Some(ref enc_uri) = login.uri {
+            let uri_bytes = crypto::decrypt_cipher_string(enc_uri, enc_key, mac_key)?;
+            Some(String::from_utf8(uri_bytes)
+                .map_err(|e| format!("Decrypted URI is not valid UTF-8: {}", e))?)
+        } else {
+            None
+        };
         Some(DecryptedLogin {
             username,
             password,
-            uri: login.uri.clone(),
+            uri,
         })
     } else {
         None
