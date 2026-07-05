@@ -353,12 +353,12 @@ impl VaultRepository {
 
         let res = stmt.query_row((), |row| {
             Ok(Session {
-                email: row.get(0)?,
-                device_id: row.get(1)?,
-                access_token: row.get(2)?,
-                refresh_token: row.get(3)?,
-                last_sync_time: row.get(4)?,
-                server_url: row.get(5)?,
+                email: row.get("email")?,
+                device_id: row.get("device_id")?,
+                access_token: row.get("access_token")?,
+                refresh_token: row.get("refresh_token")?,
+                last_sync_time: row.get("last_sync_time")?,
+                server_url: row.get("server_url")?,
             })
         });
 
@@ -385,8 +385,8 @@ impl VaultRepository {
         ).map_err(|e| e.to_string())?;
 
         let res = stmt.query_row((), |row| {
-            let enc: Option<String> = row.get(0)?;
-            let mac: Option<String> = row.get(1)?;
+            let enc: Option<String> = row.get("enc_key")?;
+            let mac: Option<String> = row.get("mac_key")?;
             Ok((enc, mac))
         });
 
@@ -461,24 +461,24 @@ impl VaultRepository {
         ).map_err(|e| e.to_string())?;
 
         let res = stmt.query_row(rusqlite::params![id], |row| {
-            let id: String = row.get(0)?;
-            let org_id: Option<String> = row.get(1)?;
-            let folder_id: Option<String> = row.get(2)?;
-            let r#type: i32 = row.get(3)?;
-            let name: Option<String> = row.get(4)?;
-            let notes: Option<String> = row.get(5)?;
-            let favorite = row.get::<_, i32>(6)? != 0;
-            let reprompt: i32 = row.get(7)?;
-            let organization_use_totp = row.get::<_, i32>(8)? != 0;
-            let edit = row.get::<_, i32>(9)? != 0;
-            let view_password = row.get::<_, i32>(10)? != 0;
-            let creation_date: String = row.get(11)?;
-            let revision_date: String = row.get(12)?;
-            let deleted_date: Option<String> = row.get(13)?;
-            let archived_date: Option<String> = row.get(14)?;
-            let key: Option<String> = row.get(15)?;
-            let object: String = row.get(16)?;
-            let extra_json: String = row.get(17)?;
+            let id: String = row.get("id")?;
+            let org_id: Option<String> = row.get("organization_id")?;
+            let folder_id: Option<String> = row.get("folder_id")?;
+            let r#type: i32 = row.get("type")?;
+            let name: Option<String> = row.get("name")?;
+            let notes: Option<String> = row.get("notes")?;
+            let favorite = row.get::<_, i32>("favorite")? != 0;
+            let reprompt: i32 = row.get("reprompt")?;
+            let organization_use_totp = row.get::<_, i32>("organization_use_totp")? != 0;
+            let edit = row.get::<_, i32>("edit")? != 0;
+            let view_password = row.get::<_, i32>("view_password")? != 0;
+            let creation_date: String = row.get("creation_date")?;
+            let revision_date: String = row.get("revision_date")?;
+            let deleted_date: Option<String> = row.get("deleted_date")?;
+            let archived_date: Option<String> = row.get("archived_date")?;
+            let key: Option<String> = row.get("key")?;
+            let object: String = row.get("object")?;
+            let extra_json: String = row.get("extra")?;
             let extra: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
 
             Ok((id, org_id, folder_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra))
@@ -494,9 +494,9 @@ impl VaultRepository {
         let mut login_stmt = self.conn.prepare("SELECT username, password, uri FROM cipher_logins WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
         let login = match login_stmt.query_row(rusqlite::params![id], |row| {
             Ok(LoginSync {
-                username: row.get(0)?,
-                password: row.get(1)?,
-                uri: row.get(2)?,
+                username: row.get("username")?,
+                password: row.get("password")?,
+                uri: row.get("uri")?,
             })
         }) {
             Ok(l) => Some(l),
@@ -507,8 +507,8 @@ impl VaultRepository {
         let mut ssh_stmt = self.conn.prepare("SELECT private_key, public_key FROM cipher_ssh_keys WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
         let ssh_key = match ssh_stmt.query_row(rusqlite::params![id], |row| {
             Ok(SshKeySync {
-                private_key: row.get(0)?,
-                public_key: row.get(1)?,
+                private_key: row.get("private_key")?,
+                public_key: row.get("public_key")?,
             })
         }) {
             Ok(s) => Some(s),
@@ -519,9 +519,9 @@ impl VaultRepository {
         let mut field_stmt = self.conn.prepare("SELECT name, value, type FROM cipher_fields WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
         let field_iter = field_stmt.query_map(rusqlite::params![id], |row| {
             Ok(FieldSync {
-                name: row.get(0)?,
-                value: row.get(1)?,
-                r#type: row.get(2)?,
+                name: row.get("name")?,
+                value: row.get("value")?,
+                r#type: row.get("type")?,
             })
         }).map_err(|e| e.to_string())?;
         let mut fields = Vec::new();
@@ -534,9 +534,9 @@ impl VaultRepository {
         let mut att_stmt = self.conn.prepare("SELECT id, file_name, size FROM attachments WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
         let att_iter = att_stmt.query_map(rusqlite::params![id], |row| {
             Ok(AttachmentSync {
-                id: row.get(0)?,
-                file_name: row.get(1)?,
-                size: row.get(2)?,
+                id: row.get("id")?,
+                file_name: row.get("file_name")?,
+                size: row.get("size")?,
             })
         }).map_err(|e| e.to_string())?;
         let mut attachments = Vec::new();
@@ -589,11 +589,11 @@ impl VaultRepository {
         let mut login_stmt = self.conn.prepare("SELECT cipher_id, username, password, uri FROM cipher_logins").map_err(|e| e.to_string())?;
         let mut logins_map = std::collections::HashMap::new();
         let login_iter = login_stmt.query_map((), |row| {
-            let cid: String = row.get(0)?;
+            let cid: String = row.get("cipher_id")?;
             Ok((cid, LoginSync {
-                username: row.get(1)?,
-                password: row.get(2)?,
-                uri: row.get(3)?,
+                username: row.get("username")?,
+                password: row.get("password")?,
+                uri: row.get("uri")?,
             }))
         }).map_err(|e| e.to_string())?;
         for item in login_iter {
@@ -605,10 +605,10 @@ impl VaultRepository {
         let mut ssh_stmt = self.conn.prepare("SELECT cipher_id, private_key, public_key FROM cipher_ssh_keys").map_err(|e| e.to_string())?;
         let mut ssh_map = std::collections::HashMap::new();
         let ssh_iter = ssh_stmt.query_map((), |row| {
-            let cid: String = row.get(0)?;
+            let cid: String = row.get("cipher_id")?;
             Ok((cid, SshKeySync {
-                private_key: row.get(1)?,
-                public_key: row.get(2)?,
+                private_key: row.get("private_key")?,
+                public_key: row.get("public_key")?,
             }))
         }).map_err(|e| e.to_string())?;
         for item in ssh_iter {
@@ -620,11 +620,11 @@ impl VaultRepository {
         let mut field_stmt = self.conn.prepare("SELECT cipher_id, name, value, type FROM cipher_fields").map_err(|e| e.to_string())?;
         let mut fields_map: std::collections::HashMap<String, Vec<FieldSync>> = std::collections::HashMap::new();
         let field_iter = field_stmt.query_map((), |row| {
-            let cid: String = row.get(0)?;
+            let cid: String = row.get("cipher_id")?;
             Ok((cid, FieldSync {
-                name: row.get(1)?,
-                value: row.get(2)?,
-                r#type: row.get(3)?,
+                name: row.get("name")?,
+                value: row.get("value")?,
+                r#type: row.get("type")?,
             }))
         }).map_err(|e| e.to_string())?;
         for item in field_iter {
@@ -636,12 +636,12 @@ impl VaultRepository {
         let mut att_stmt = self.conn.prepare("SELECT id, cipher_id, file_name, size FROM attachments").map_err(|e| e.to_string())?;
         let mut att_map: std::collections::HashMap<String, Vec<AttachmentSync>> = std::collections::HashMap::new();
         let att_iter = att_stmt.query_map((), |row| {
-            let id: String = row.get(0)?;
-            let cid: String = row.get(1)?;
+            let id: String = row.get("id")?;
+            let cid: String = row.get("cipher_id")?;
             Ok((cid, AttachmentSync {
                 id,
-                file_name: row.get(2)?,
-                size: row.get(3)?,
+                file_name: row.get("file_name")?,
+                size: row.get("size")?,
             }))
         }).map_err(|e| e.to_string())?;
         for item in att_iter {
@@ -653,8 +653,8 @@ impl VaultRepository {
         let mut folder_stmt = self.conn.prepare("SELECT cipher_id, folder_id FROM folders_ciphers").map_err(|e| e.to_string())?;
         let mut folders_map = std::collections::HashMap::new();
         let folder_iter = folder_stmt.query_map((), |row| {
-            let cid: String = row.get(0)?;
-            let fid: String = row.get(1)?;
+            let cid: String = row.get("cipher_id")?;
+            let fid: String = row.get("folder_id")?;
             Ok((cid, fid))
         }).map_err(|e| e.to_string())?;
         for item in folder_iter {
@@ -664,23 +664,23 @@ impl VaultRepository {
 
         // Query base ciphers and build the final list
         let cipher_iter = stmt.query_map((), |row| {
-            let id: String = row.get(0)?;
-            let org_id: Option<String> = row.get(1)?;
-            let r#type: i32 = row.get(2)?;
-            let name: Option<String> = row.get(3)?;
-            let notes: Option<String> = row.get(4)?;
-            let favorite = row.get::<_, i32>(5)? != 0;
-            let reprompt: i32 = row.get(6)?;
-            let organization_use_totp = row.get::<_, i32>(7)? != 0;
-            let edit = row.get::<_, i32>(8)? != 0;
-            let view_password = row.get::<_, i32>(9)? != 0;
-            let creation_date: String = row.get(10)?;
-            let revision_date: String = row.get(11)?;
-            let deleted_date: Option<String> = row.get(12)?;
-            let archived_date: Option<String> = row.get(13)?;
-            let key: Option<String> = row.get(14)?;
-            let object: String = row.get(15)?;
-            let extra_json: String = row.get(16)?;
+            let id: String = row.get("id")?;
+            let org_id: Option<String> = row.get("organization_id")?;
+            let r#type: i32 = row.get("type")?;
+            let name: Option<String> = row.get("name")?;
+            let notes: Option<String> = row.get("notes")?;
+            let favorite = row.get::<_, i32>("favorite")? != 0;
+            let reprompt: i32 = row.get("reprompt")?;
+            let organization_use_totp = row.get::<_, i32>("organization_use_totp")? != 0;
+            let edit = row.get::<_, i32>("edit")? != 0;
+            let view_password = row.get::<_, i32>("view_password")? != 0;
+            let creation_date: String = row.get("creation_date")?;
+            let revision_date: String = row.get("revision_date")?;
+            let deleted_date: Option<String> = row.get("deleted_date")?;
+            let archived_date: Option<String> = row.get("archived_date")?;
+            let key: Option<String> = row.get("key")?;
+            let object: String = row.get("object")?;
+            let extra_json: String = row.get("extra")?;
 
             Ok((id, org_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra_json))
         }).map_err(|e| e.to_string())?;
@@ -822,24 +822,24 @@ impl VaultRepository {
         ).map_err(|e| e.to_string())?;
 
         let res = stmt.query_row((), |row| {
-            let id: String = row.get(0)?;
-            let email: String = row.get(1)?;
-            let email_verified = row.get::<_, i32>(2)? != 0;
-            let name: Option<String> = row.get(3)?;
-            let premium = row.get::<_, i32>(4)? != 0;
-            let premium_from_organization = row.get::<_, i32>(5)? != 0;
-            let private_key: Option<String> = row.get(6)?;
-            let public_key: Option<String> = row.get(7)?;
-            let security_stamp: Option<String> = row.get(8)?;
-            let two_factor_enabled = row.get::<_, i32>(9)? != 0;
-            let uses_key_connector = row.get::<_, i32>(10)? != 0;
-            let culture: String = row.get(11)?;
-            let creation_date: String = row.get(12)?;
-            let avatar_color: Option<String> = row.get(13)?;
-            let force_password_reset = row.get::<_, i32>(14)? != 0;
-            let key: String = row.get(15)?;
-            let _status: Option<i32> = row.get(16)?;
-            let extra_json: String = row.get(17)?;
+            let id: String = row.get("id")?;
+            let email: String = row.get("email")?;
+            let email_verified = row.get::<_, i32>("email_verified")? != 0;
+            let name: Option<String> = row.get("name")?;
+            let premium = row.get::<_, i32>("premium")? != 0;
+            let premium_from_organization = row.get::<_, i32>("premium_from_organization")? != 0;
+            let private_key: Option<String> = row.get("private_key")?;
+            let public_key: Option<String> = row.get("public_key")?;
+            let security_stamp: Option<String> = row.get("security_stamp")?;
+            let two_factor_enabled = row.get::<_, i32>("two_factor_enabled")? != 0;
+            let uses_key_connector = row.get::<_, i32>("uses_key_connector")? != 0;
+            let culture: String = row.get("culture")?;
+            let creation_date: String = row.get("creation_date")?;
+            let avatar_color: Option<String> = row.get("avatar_color")?;
+            let force_password_reset = row.get::<_, i32>("force_password_reset")? != 0;
+            let key: String = row.get("key")?;
+            let _status: Option<i32> = row.get("_status")?;
+            let extra_json: String = row.get("extra")?;
 
             Ok((id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra_json))
         });
@@ -854,10 +854,10 @@ impl VaultRepository {
         let mut org_stmt = self.conn.prepare("SELECT id, name, key, object FROM organizations").map_err(|e| e.to_string())?;
         let org_iter = org_stmt.query_map((), |row| {
             Ok(OrganizationSync {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                key: row.get(2)?,
-                object: row.get(3)?,
+                id: row.get("id")?,
+                name: row.get("name")?,
+                key: row.get("key")?,
+                object: row.get("object")?,
                 extra: std::collections::HashMap::new(),
             })
         }).map_err(|e| e.to_string())?;
@@ -896,10 +896,10 @@ impl VaultRepository {
         let mut fold_stmt = self.conn.prepare("SELECT id, name, object, revision_date FROM folders").map_err(|e| e.to_string())?;
         let fold_iter = fold_stmt.query_map((), |row| {
             Ok(FolderSync {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                object: row.get(2)?,
-                revision_date: row.get(3)?,
+                id: row.get("id")?,
+                name: row.get("name")?,
+                object: row.get("object")?,
+                revision_date: row.get("revision_date")?,
             })
         }).map_err(|e| e.to_string())?;
         let mut folders = Vec::new();
@@ -914,12 +914,12 @@ impl VaultRepository {
         // 4. Load metadata & KDF parameters
         let mut meta_stmt = self.conn.prepare("SELECT domains, policies, sends, object, masterPasswordUnlock, extra FROM sync_metadata LIMIT 1").map_err(|e| e.to_string())?;
         let meta_res = meta_stmt.query_row((), |row| {
-            let domains_json: String = row.get(0)?;
-            let policies_json: String = row.get(1)?;
-            let sends_json: String = row.get(2)?;
-            let object: String = row.get(3)?;
-            let mpu_json: String = row.get(4)?;
-            let extra_json: String = row.get(5)?;
+            let domains_json: String = row.get("domains")?;
+            let policies_json: String = row.get("policies")?;
+            let sends_json: String = row.get("sends")?;
+            let object: String = row.get("object")?;
+            let mpu_json: String = row.get("masterPasswordUnlock")?;
+            let extra_json: String = row.get("extra")?;
 
             let domains: Option<serde_json::Value> = serde_json::from_str(&domains_json).ok();
             let policies: Option<Vec<serde_json::Value>> = serde_json::from_str(&policies_json).ok();
