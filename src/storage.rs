@@ -1,24 +1,20 @@
-use aes_gcm::{
-    Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit},
-};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 #[cfg(not(test))]
 use directories::ProjectDirs;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-pub use crate::api::{CipherSync, SyncResponse, ProfileSync};
+pub use crate::api::{CipherSync, SyncResponse, ProfileSync, FolderSync, OrganizationSync};
+use crate::config::Session;
 use crate::crypto;
 
 #[cfg(not(test))]
 const APP_NAME: &str = "sshwarden";
-const DB_FILE_NAME: &str = "vault.db.enc";
+const DB_FILE_NAME: &str = "vault.db";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshKeyItem {
@@ -83,205 +79,880 @@ pub fn unencrypted_db_path() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join(RAW_DB_FILE_NAME))
 }
 
-const KEYS_FILE_NAME: &str = "vault.db.keys";
-
-/// Gets the path to the vault.db.keys file (cached keys)
-pub fn keys_path() -> Option<PathBuf> {
-    cache_dir().map(|dir| dir.join(KEYS_FILE_NAME))
-}
-
-/// Derive the local cache encryption key from master password and local salt
-pub fn derive_db_key(password: &str, salt_b64: &str) -> Result<[u8; 32], String> {
-    let salt = BASE64_STANDARD
-        .decode(salt_b64)
-        .map_err(|e| format!("Invalid base64 salt: {}", e))?;
-
-    let params = argon2::Params::new(
-        65536,    // 64 MB
-        3,        // 3 iterations
-        4,        // 4 parallelism/lanes
-        Some(32), // 32-byte key
-    )
-    .map_err(|e| format!("Argon2 params creation failed: {}", e))?;
-
-    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut db_key = [0u8; 32];
-
-    argon2
-        .hash_password_into(password.as_bytes(), &salt, &mut db_key)
-        .map_err(|e| format!("Argon2 database key derivation failed: {}", e))?;
-
-    Ok(db_key)
-}
 
 /// Load and decrypt the local cache database from disk
-pub fn load_db(db_key: &[u8; 32]) -> Result<SyncResponse, String> {
-    let path = db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            email_verified INTEGER NOT NULL,
+            name TEXT,
+            premium INTEGER NOT NULL,
+            premium_from_organization INTEGER NOT NULL,
+            private_key TEXT,
+            public_key TEXT,
+            security_stamp TEXT,
+            two_factor_enabled INTEGER NOT NULL,
+            uses_key_connector INTEGER NOT NULL,
+            culture TEXT,
+            creation_date TEXT,
+            avatar_color TEXT,
+            force_password_reset INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            _status INTEGER,
+            extra TEXT
+        );
 
-    if !path.exists() {
-        return Err("Cache database file does not exist. Please run 'sshwarden sync' to fetch your vault first.".to_string());
-    }
+        CREATE TABLE IF NOT EXISTS organizations (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            key TEXT NOT NULL,
+            object TEXT NOT NULL
+        );
 
-    let mut file =
-        File::open(&path).map_err(|e| format!("Failed to open cache database: {}", e))?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)
-        .map_err(|e| format!("Failed to read cache database: {}", e))?;
+        CREATE TABLE IF NOT EXISTS folders (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            object TEXT NOT NULL,
+            revision_date TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
 
-    if data.len() < 12 {
-        return Err("Cache database file is corrupted (too short)".to_string());
-    }
+        CREATE TABLE IF NOT EXISTS ciphers (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            organization_id TEXT,
+            type INTEGER NOT NULL,
+            name TEXT,
+            notes TEXT,
+            favorite INTEGER NOT NULL,
+            reprompt INTEGER NOT NULL,
+            organization_use_totp INTEGER NOT NULL,
+            edit INTEGER NOT NULL,
+            view_password INTEGER NOT NULL,
+            creation_date TEXT NOT NULL,
+            revision_date TEXT NOT NULL,
+            deleted_date TEXT,
+            archived_date TEXT,
+            key TEXT,
+            object TEXT NOT NULL,
+            extra TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(organization_id) REFERENCES organizations(id) ON DELETE SET NULL
+        );
 
-    // Split nonce and ciphertext
-    let (nonce_bytes, ciphertext) = data.split_at(12);
-    let nonce = Nonce::try_from(nonce_bytes).map_err(|e| format!("Invalid nonce: {}", e))?;
+        CREATE TABLE IF NOT EXISTS cipher_logins (
+            cipher_id TEXT PRIMARY KEY,
+            username TEXT,
+            password TEXT,
+            uri TEXT,
+            FOREIGN KEY(cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
+        );
 
-    let cipher = Aes256Gcm::new_from_slice(db_key)
-        .map_err(|e| format!("Failed to initialize AES-GCM: {}", e))?;
+        CREATE TABLE IF NOT EXISTS cipher_ssh_keys (
+            cipher_id TEXT PRIMARY KEY,
+            private_key TEXT,
+            public_key TEXT,
+            FOREIGN KEY(cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
+        );
 
-    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
-        "Failed to decrypt local database cache. Did your master password change?".to_string()
-    })?;
+        CREATE TABLE IF NOT EXISTS cipher_fields (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cipher_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            value TEXT,
+            type INTEGER NOT NULL,
+            FOREIGN KEY(cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
+        );
 
-    let sync_resp: SyncResponse = serde_json::from_slice(&plaintext)
-        .map_err(|e| format!("Failed to parse decrypted database JSON: {}", e))?;
+        CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY,
+            cipher_id TEXT NOT NULL,
+            file_name TEXT,
+            size INTEGER,
+            FOREIGN KEY(cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE
+        );
 
-    Ok(sync_resp)
-}
+        CREATE TABLE IF NOT EXISTS folders_ciphers (
+            cipher_id TEXT,
+            folder_id TEXT,
+            PRIMARY KEY(cipher_id, folder_id),
+            FOREIGN KEY(cipher_id) REFERENCES ciphers(id) ON DELETE CASCADE,
+            FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
+        );
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SavedKeys {
-    pub enc_key: String,
-    pub mac_key: String,
-    pub db_key: String,
-}
+        CREATE TABLE IF NOT EXISTS sync_metadata (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            domains TEXT,
+            policies TEXT,
+            sends TEXT,
+            object TEXT NOT NULL,
+            masterPasswordUnlock TEXT,
+            extra TEXT
+        );
 
-/// Save derived keys to keys cache on disk if timeout is "never"
-pub fn save_keys(enc: &[u8; 32], mac: &[u8; 32], db: &[u8; 32]) -> Result<(), String> {
-    if let Some(path) = keys_path() {
-        let saved = SavedKeys {
-            enc_key: hex::encode(enc),
-            mac_key: hex::encode(mac),
-            db_key: hex::encode(db),
-        };
-        let content = serde_json::to_string_pretty(&saved)
-            .map_err(|e| format!("Failed to serialize keys: {}", e))?;
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write keys file: {}", e))?;
-        
-        let file = File::open(&path)
-            .map_err(|e| format!("Failed to open keys file to set permissions: {}", e))?;
-        let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
-        perms.set_mode(0o600);
-        file.set_permissions(perms)
-            .map_err(|e| format!("Failed to set permissions on keys file: {}", e))?;
-    }
+        CREATE TABLE IF NOT EXISTS session_metadata (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            email TEXT,
+            device_id TEXT NOT NULL,
+            access_token TEXT,
+            refresh_token TEXT,
+            last_sync_time TEXT,
+            server_url TEXT,
+            enc_key TEXT,
+            mac_key TEXT
+        );
+        "#
+    ).map_err(|e| format!("Failed to initialize database tables: {}", e))?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO session_metadata (id, device_id) VALUES (1, ?1)",
+        (uuid::Uuid::new_v4().to_string(),),
+    ).map_err(|e| format!("Failed to initialize session_metadata default row: {}", e))?;
+
     Ok(())
 }
 
-/// Load saved keys from disk
-pub fn load_saved_keys() -> Option<([u8; 32], [u8; 32], [u8; 32])> {
-    let path = keys_path()?;
-    if !path.exists() {
-        return None;
-    }
-    let content = fs::read_to_string(&path).ok()?;
-    let saved: SavedKeys = serde_json::from_str(&content).ok()?;
-    
-    let enc_vec = hex::decode(&saved.enc_key).ok()?;
-    let mac_vec = hex::decode(&saved.mac_key).ok()?;
-    let db_vec = hex::decode(&saved.db_key).ok()?;
-    
-    if enc_vec.len() == 32 && mac_vec.len() == 32 && db_vec.len() == 32 {
-        let mut enc = [0u8; 32];
-        let mut mac = [0u8; 32];
-        let mut db = [0u8; 32];
-        enc.copy_from_slice(&enc_vec);
-        mac.copy_from_slice(&mac_vec);
-        db.copy_from_slice(&db_vec);
-        Some((enc, mac, db))
-    } else {
-        None
-    }
+pub struct VaultRepository {
+    conn: rusqlite::Connection,
 }
 
-/// Encrypt and save the local cache database to disk with 0600 permissions
-pub fn save_db(
-    sync_response: &SyncResponse,
-    db_key: &[u8; 32],
-    enc_key: Option<&[u8; 32]>,
-    mac_key: Option<&[u8; 32]>,
-) -> Result<(), String> {
-    let path = db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &str) -> Result<(), String> {
+    
+    let extra_json = serde_json::to_string(&cipher.extra).unwrap_or_default();
+    conn.execute(
+        "INSERT OR REPLACE INTO ciphers (id, user_id, organization_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        rusqlite::params![
+            &cipher.id,
+            user_id,
+            &cipher.organization_id,
+            cipher.r#type,
+            &cipher.name,
+            &cipher.notes,
+            cipher.favorite as i32,
+            cipher.reprompt,
+            cipher.organization_use_totp as i32,
+            cipher.edit as i32,
+            cipher.view_password as i32,
+            &cipher.creation_date,
+            &cipher.revision_date,
+            &cipher.deleted_date,
+            &cipher.archived_date,
+            &cipher.key,
+            &cipher.object,
+            &extra_json,
+        ],
+    ).map_err(|e| format!("Failed to save core cipher: {}", e))?;
 
-    // Ensure parent cache directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create cache directory: {}", e))?;
+    // 2. Clear old child rows
+    conn.execute("DELETE FROM cipher_logins WHERE cipher_id = ?1", (&cipher.id,))
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM cipher_ssh_keys WHERE cipher_id = ?1", (&cipher.id,))
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM cipher_fields WHERE cipher_id = ?1", (&cipher.id,))
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM attachments WHERE cipher_id = ?1", (&cipher.id,))
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM folders_ciphers WHERE cipher_id = ?1", (&cipher.id,))
+        .map_err(|e| e.to_string())?;
+
+    // 3. Save nested login
+    if let Some(ref login) = cipher.login {
+        conn.execute(
+            "INSERT INTO cipher_logins (cipher_id, username, password, uri) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&cipher.id, &login.username, &login.password, &login.uri],
+        ).map_err(|e| format!("Failed to save cipher login: {}", e))?;
     }
 
-    let plaintext = serde_json::to_vec(sync_response)
-        .map_err(|e| format!("Failed to serialize database to JSON: {}", e))?;
+    // 4. Save nested SSH key
+    if let Some(ref ssh_key) = cipher.ssh_key {
+        conn.execute(
+            "INSERT INTO cipher_ssh_keys (cipher_id, private_key, public_key) VALUES (?1, ?2, ?3)",
+            rusqlite::params![&cipher.id, &ssh_key.private_key, &ssh_key.public_key],
+        ).map_err(|e| format!("Failed to save cipher SSH key: {}", e))?;
+    }
 
-    // Generate random 12-byte nonce
-    let mut nonce_bytes = [0u8; 12];
-    let sr = SystemRandom::new();
-    sr.fill(&mut nonce_bytes)
-        .map_err(|e| format!("Failed to generate random database nonce: {}", e))?;
-    let nonce = Nonce::from(nonce_bytes);
-
-    let cipher = Aes256Gcm::new_from_slice(db_key)
-        .map_err(|e| format!("Failed to initialize AES-GCM: {}", e))?;
-
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_slice())
-        .map_err(|e| format!("AES-GCM encryption failed: {}", e))?;
-
-    // Concatenate nonce + ciphertext
-    let mut output = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
-    output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
-
-    fs::write(&path, &output).map_err(|e| format!("Failed to write cache database: {}", e))?;
-
-    // Set owner read/write only permissions (0600)
-    let file = File::open(&path)
-        .map_err(|e| format!("Failed to open database file to set permissions: {}", e))?;
-    let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
-    perms.set_mode(0o600);
-    file.set_permissions(perms)
-        .map_err(|e| format!("Failed to set permissions on cache database: {}", e))?;
-
-    // Save unencrypted backup if timeout is "never", otherwise remove it
-    if let Ok(config) = crate::config::Config::load() {
-        if config.timeout.trim().to_lowercase() == "never" {
-            if let Some(raw_path) = unencrypted_db_path() {
-                if let (Some(enc), Some(mac)) = (enc_key, mac_key) {
-                    let decrypted_items = parse_and_decrypt_all_ciphers(sync_response, enc, mac);
-                    let pretty_json = serde_json::to_vec_pretty(&decrypted_items)
-                        .map_err(|e| format!("Failed to serialize unencrypted database: {}", e))?;
-                    fs::write(&raw_path, &pretty_json)
-                        .map_err(|e| format!("Failed to write unencrypted cache: {}", e))?;
-                    
-                    let file = File::open(&raw_path)
-                        .map_err(|e| format!("Failed to open unencrypted cache file to set permissions: {}", e))?;
-                    let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
-                    perms.set_mode(0o600);
-                    file.set_permissions(perms)
-                        .map_err(|e| format!("Failed to set permissions on unencrypted cache: {}", e))?;
-                }
-            }
-
-            // Save encryption keys if provided
-            if let (Some(enc), Some(mac)) = (enc_key, mac_key) {
-                let _ = save_keys(enc, mac, db_key);
-            }
-        } else {
-            let _ = wipe_unencrypted_cache();
+    // 5. Save custom fields
+    if let Some(ref fields) = cipher.fields {
+        for field in fields {
+            conn.execute(
+                "INSERT INTO cipher_fields (cipher_id, name, value, type) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![&cipher.id, &field.name, &field.value, field.r#type],
+            ).map_err(|e| format!("Failed to save cipher field: {}", e))?;
         }
     }
 
+    // 6. Save attachments
+    if let Some(ref attachments) = cipher.attachments {
+        for att in attachments {
+            conn.execute(
+                "INSERT INTO attachments (id, cipher_id, file_name, size) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![&att.id, &cipher.id, &att.file_name, &att.size],
+            ).map_err(|e| format!("Failed to save cipher attachment: {}", e))?;
+        }
+    }
+
+    // 7. Save folder mapping
+    if let Some(ref folder_id) = cipher.folder_id {
+        conn.execute(
+            "INSERT OR REPLACE INTO folders_ciphers (cipher_id, folder_id) VALUES (?1, ?2)",
+            rusqlite::params![&cipher.id, folder_id],
+        ).map_err(|e| format!("Failed to save folder cipher relationship: {}", e))?;
+    }
+
     Ok(())
+}
+
+impl VaultRepository {
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let conn = rusqlite::Connection::open(path)
+            .map_err(|e| format!("Failed to open cache database: {}", e))?;
+        
+        conn.execute("PRAGMA foreign_keys = ON;", ())
+            .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
+            
+        init_tables(&conn)?;
+        Ok(Self { conn })
+    }
+
+    pub fn clear(&mut self) -> Result<(), String> {
+        self.conn.execute("DELETE FROM users", ()).map_err(|e| e.to_string())?;
+        self.conn.execute("DELETE FROM organizations", ()).map_err(|e| e.to_string())?;
+        self.conn.execute("DELETE FROM folders", ()).map_err(|e| e.to_string())?;
+        self.conn.execute("DELETE FROM ciphers", ()).map_err(|e| e.to_string())?;
+        self.conn.execute("DELETE FROM sync_metadata", ()).map_err(|e| e.to_string())?;
+        self.conn.execute("UPDATE session_metadata SET email = NULL, access_token = NULL, refresh_token = NULL, last_sync_time = NULL, enc_key = NULL, mac_key = NULL WHERE id = 1", ()).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn save_session(&self, session: &Session) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO session_metadata (id, email, device_id, access_token, refresh_token, last_sync_time, server_url) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &session.email,
+                &session.device_id,
+                &session.access_token,
+                &session.refresh_token,
+                &session.last_sync_time,
+                &session.server_url,
+            ],
+        ).map_err(|e| format!("Failed to save session: {}", e))?;
+        Ok(())
+    }
+
+    pub fn load_session(&self) -> Result<Option<Session>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT email, device_id, access_token, refresh_token, last_sync_time, server_url FROM session_metadata WHERE id = 1"
+        ).map_err(|e| e.to_string())?;
+
+        let res = stmt.query_row((), |row| {
+            Ok(Session {
+                email: row.get(0)?,
+                device_id: row.get(1)?,
+                access_token: row.get(2)?,
+                refresh_token: row.get(3)?,
+                last_sync_time: row.get(4)?,
+                server_url: row.get(5)?,
+            })
+        });
+
+        match res {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to load session: {}", e)),
+        }
+    }
+
+    pub fn save_saved_keys(&self, enc: &[u8; 32], mac: &[u8; 32]) -> Result<(), String> {
+        let enc_hex = hex::encode(enc);
+        let mac_hex = hex::encode(mac);
+        self.conn.execute(
+            "UPDATE session_metadata SET enc_key = ?1, mac_key = ?2 WHERE id = 1",
+            rusqlite::params![&enc_hex, &mac_hex],
+        ).map_err(|e| format!("Failed to save keys: {}", e))?;
+        Ok(())
+    }
+
+    pub fn load_saved_keys(&self) -> Result<Option<([u8; 32], [u8; 32])>, String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT enc_key, mac_key FROM session_metadata WHERE id = 1"
+        ).map_err(|e| e.to_string())?;
+
+        let res = stmt.query_row((), |row| {
+            let enc: Option<String> = row.get(0)?;
+            let mac: Option<String> = row.get(1)?;
+            Ok((enc, mac))
+        });
+
+        let (enc, mac) = match res {
+            Ok(val) => val,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(format!("Failed to query saved keys: {}", e)),
+        };
+
+        if let (Some(enc_hex), Some(mac_hex)) = (enc, mac) {
+            let enc_bytes = hex::decode(&enc_hex).map_err(|e| e.to_string())?;
+            let mac_bytes = hex::decode(&mac_hex).map_err(|e| e.to_string())?;
+            if enc_bytes.len() == 32 && mac_bytes.len() == 32 {
+                let mut enc_arr = [0u8; 32];
+                let mut mac_arr = [0u8; 32];
+                enc_arr.copy_from_slice(&enc_bytes);
+                mac_arr.copy_from_slice(&mac_bytes);
+                Ok(Some((enc_arr, mac_arr)))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn clear_saved_keys(&self) -> Result<(), String> {
+        self.conn.execute(
+            "UPDATE session_metadata SET enc_key = NULL, mac_key = NULL WHERE id = 1",
+            (),
+        ).map_err(|e| format!("Failed to clear keys: {}", e))?;
+        Ok(())
+    }
+
+    pub fn save_cipher(&mut self, cipher: &CipherSync, user_id: &str) -> Result<(), String> {
+        save_cipher_conn(&self.conn, cipher, user_id)
+    }
+
+    pub fn delete_cipher(&mut self, id: &str) -> Result<(), String> {
+        self.conn.execute("DELETE FROM ciphers WHERE id = ?1", (id,))
+            .map_err(|e| format!("Failed to delete cipher: {}", e))?;
+        Ok(())
+    }
+
+    pub fn save_folder(&mut self, folder: &FolderSync, user_id: &str) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO folders (id, user_id, name, object, revision_date) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![&folder.id, user_id, &folder.name, &folder.object, &folder.revision_date],
+        ).map_err(|e| format!("Failed to save folder: {}", e))?;
+        Ok(())
+    }
+
+    pub fn delete_folder(&mut self, id: &str) -> Result<(), String> {
+        self.conn.execute("DELETE FROM folders WHERE id = ?1", (id,))
+            .map_err(|e| format!("Failed to delete folder: {}", e))?;
+        Ok(())
+    }
+
+    pub fn save_organization(&mut self, org: &OrganizationSync) -> Result<(), String> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO organizations (id, name, key, object) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&org.id, &org.name, &org.key, &org.object],
+        ).map_err(|e| format!("Failed to save organization: {}", e))?;
+        Ok(())
+    }
+
+    pub fn get_cipher(&self, id: &str) -> Result<Option<CipherSync>, String> {
+        use crate::api::{LoginSync, SshKeySync, FieldSync, AttachmentSync};
+        
+        let mut stmt = self.conn.prepare(
+            "SELECT id, organization_id, folder_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra FROM ciphers WHERE id = ?1"
+        ).map_err(|e| e.to_string())?;
+
+        let res = stmt.query_row(rusqlite::params![id], |row| {
+            let id: String = row.get(0)?;
+            let org_id: Option<String> = row.get(1)?;
+            let folder_id: Option<String> = row.get(2)?;
+            let r#type: i32 = row.get(3)?;
+            let name: Option<String> = row.get(4)?;
+            let notes: Option<String> = row.get(5)?;
+            let favorite = row.get::<_, i32>(6)? != 0;
+            let reprompt: i32 = row.get(7)?;
+            let organization_use_totp = row.get::<_, i32>(8)? != 0;
+            let edit = row.get::<_, i32>(9)? != 0;
+            let view_password = row.get::<_, i32>(10)? != 0;
+            let creation_date: String = row.get(11)?;
+            let revision_date: String = row.get(12)?;
+            let deleted_date: Option<String> = row.get(13)?;
+            let archived_date: Option<String> = row.get(14)?;
+            let key: Option<String> = row.get(15)?;
+            let object: String = row.get(16)?;
+            let extra_json: String = row.get(17)?;
+            let extra: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
+
+            Ok((id, org_id, folder_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra))
+        });
+
+        let (id, org_id, folder_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra) = match res {
+            Ok(val) => val,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+
+        // Query login
+        let mut login_stmt = self.conn.prepare("SELECT username, password, uri FROM cipher_logins WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
+        let login = match login_stmt.query_row(rusqlite::params![id], |row| {
+            Ok(LoginSync {
+                username: row.get(0)?,
+                password: row.get(1)?,
+                uri: row.get(2)?,
+            })
+        }) {
+            Ok(l) => Some(l),
+            Err(_) => None,
+        };
+
+        // Query SSH Key
+        let mut ssh_stmt = self.conn.prepare("SELECT private_key, public_key FROM cipher_ssh_keys WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
+        let ssh_key = match ssh_stmt.query_row(rusqlite::params![id], |row| {
+            Ok(SshKeySync {
+                private_key: row.get(0)?,
+                public_key: row.get(1)?,
+            })
+        }) {
+            Ok(s) => Some(s),
+            Err(_) => None,
+        };
+
+        // Query fields
+        let mut field_stmt = self.conn.prepare("SELECT name, value, type FROM cipher_fields WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
+        let field_iter = field_stmt.query_map(rusqlite::params![id], |row| {
+            Ok(FieldSync {
+                name: row.get(0)?,
+                value: row.get(1)?,
+                r#type: row.get(2)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        let mut fields = Vec::new();
+        for f in field_iter {
+            fields.push(f.map_err(|e| e.to_string())?);
+        }
+        let fields_opt = if fields.is_empty() { None } else { Some(fields) };
+
+        // Query attachments
+        let mut att_stmt = self.conn.prepare("SELECT id, file_name, size FROM attachments WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
+        let att_iter = att_stmt.query_map(rusqlite::params![id], |row| {
+            Ok(AttachmentSync {
+                id: row.get(0)?,
+                file_name: row.get(1)?,
+                size: row.get(2)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        let mut attachments = Vec::new();
+        for a in att_iter {
+            attachments.push(a.map_err(|e| e.to_string())?);
+        }
+        let attachments_opt = if attachments.is_empty() { None } else { Some(attachments) };
+
+        Ok(Some(CipherSync {
+            id,
+            organization_id: org_id,
+            folder_id,
+            r#type,
+            name,
+            notes,
+            favorite,
+            reprompt,
+            organization_use_totp,
+            edit,
+            view_password,
+            creation_date,
+            revision_date,
+            deleted_date,
+            archived_date,
+            key,
+            login,
+            card: None,
+            identity: None,
+            secure_note: None,
+            ssh_key,
+            fields: fields_opt,
+            attachments: attachments_opt,
+            collection_ids: None,
+            password_history: None,
+            permissions: None,
+            object,
+            extra,
+        }))
+    }
+
+    pub fn list_ciphers(&self) -> Result<Vec<CipherSync>, String> {
+        use crate::api::{LoginSync, SshKeySync, FieldSync, AttachmentSync};
+
+        // Query base ciphers
+        let mut stmt = self.conn.prepare(
+            "SELECT id, organization_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra FROM ciphers"
+        ).map_err(|e| e.to_string())?;
+
+        // Batch load all logins
+        let mut login_stmt = self.conn.prepare("SELECT cipher_id, username, password, uri FROM cipher_logins").map_err(|e| e.to_string())?;
+        let mut logins_map = std::collections::HashMap::new();
+        let login_iter = login_stmt.query_map((), |row| {
+            let cid: String = row.get(0)?;
+            Ok((cid, LoginSync {
+                username: row.get(1)?,
+                password: row.get(2)?,
+                uri: row.get(3)?,
+            }))
+        }).map_err(|e| e.to_string())?;
+        for item in login_iter {
+            let (cid, login) = item.map_err(|e| e.to_string())?;
+            logins_map.insert(cid, login);
+        }
+
+        // Batch load all SSH Keys
+        let mut ssh_stmt = self.conn.prepare("SELECT cipher_id, private_key, public_key FROM cipher_ssh_keys").map_err(|e| e.to_string())?;
+        let mut ssh_map = std::collections::HashMap::new();
+        let ssh_iter = ssh_stmt.query_map((), |row| {
+            let cid: String = row.get(0)?;
+            Ok((cid, SshKeySync {
+                private_key: row.get(1)?,
+                public_key: row.get(2)?,
+            }))
+        }).map_err(|e| e.to_string())?;
+        for item in ssh_iter {
+            let (cid, ssh) = item.map_err(|e| e.to_string())?;
+            ssh_map.insert(cid, ssh);
+        }
+
+        // Batch load all fields
+        let mut field_stmt = self.conn.prepare("SELECT cipher_id, name, value, type FROM cipher_fields").map_err(|e| e.to_string())?;
+        let mut fields_map: std::collections::HashMap<String, Vec<FieldSync>> = std::collections::HashMap::new();
+        let field_iter = field_stmt.query_map((), |row| {
+            let cid: String = row.get(0)?;
+            Ok((cid, FieldSync {
+                name: row.get(1)?,
+                value: row.get(2)?,
+                r#type: row.get(3)?,
+            }))
+        }).map_err(|e| e.to_string())?;
+        for item in field_iter {
+            let (cid, field) = item.map_err(|e| e.to_string())?;
+            fields_map.entry(cid).or_default().push(field);
+        }
+
+        // Batch load all attachments
+        let mut att_stmt = self.conn.prepare("SELECT id, cipher_id, file_name, size FROM attachments").map_err(|e| e.to_string())?;
+        let mut att_map: std::collections::HashMap<String, Vec<AttachmentSync>> = std::collections::HashMap::new();
+        let att_iter = att_stmt.query_map((), |row| {
+            let id: String = row.get(0)?;
+            let cid: String = row.get(1)?;
+            Ok((cid, AttachmentSync {
+                id,
+                file_name: row.get(2)?,
+                size: row.get(3)?,
+            }))
+        }).map_err(|e| e.to_string())?;
+        for item in att_iter {
+            let (cid, att) = item.map_err(|e| e.to_string())?;
+            att_map.entry(cid).or_default().push(att);
+        }
+
+        // Batch load folder mappings
+        let mut folder_stmt = self.conn.prepare("SELECT cipher_id, folder_id FROM folders_ciphers").map_err(|e| e.to_string())?;
+        let mut folders_map = std::collections::HashMap::new();
+        let folder_iter = folder_stmt.query_map((), |row| {
+            let cid: String = row.get(0)?;
+            let fid: String = row.get(1)?;
+            Ok((cid, fid))
+        }).map_err(|e| e.to_string())?;
+        for item in folder_iter {
+            let (cid, fid) = item.map_err(|e| e.to_string())?;
+            folders_map.insert(cid, fid);
+        }
+
+        // Query base ciphers and build the final list
+        let cipher_iter = stmt.query_map((), |row| {
+            let id: String = row.get(0)?;
+            let org_id: Option<String> = row.get(1)?;
+            let r#type: i32 = row.get(2)?;
+            let name: Option<String> = row.get(3)?;
+            let notes: Option<String> = row.get(4)?;
+            let favorite = row.get::<_, i32>(5)? != 0;
+            let reprompt: i32 = row.get(6)?;
+            let organization_use_totp = row.get::<_, i32>(7)? != 0;
+            let edit = row.get::<_, i32>(8)? != 0;
+            let view_password = row.get::<_, i32>(9)? != 0;
+            let creation_date: String = row.get(10)?;
+            let revision_date: String = row.get(11)?;
+            let deleted_date: Option<String> = row.get(12)?;
+            let archived_date: Option<String> = row.get(13)?;
+            let key: Option<String> = row.get(14)?;
+            let object: String = row.get(15)?;
+            let extra_json: String = row.get(16)?;
+
+            Ok((id, org_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra_json))
+        }).map_err(|e| e.to_string())?;
+
+        let mut ciphers = Vec::new();
+        for cipher_row in cipher_iter {
+            let (id, org_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra_json) = cipher_row.map_err(|e| e.to_string())?;
+            let extra = serde_json::from_str(&extra_json).unwrap_or_default();
+            
+            let login = logins_map.get(&id).cloned();
+            let ssh_key = ssh_map.get(&id).cloned();
+            let fields = fields_map.get(&id).cloned();
+            let attachments = att_map.get(&id).cloned();
+            let folder_id = folders_map.get(&id).cloned();
+
+            ciphers.push(CipherSync {
+                id,
+                organization_id: org_id,
+                folder_id,
+                r#type,
+                name,
+                notes,
+                favorite,
+                reprompt,
+                organization_use_totp,
+                edit,
+                view_password,
+                creation_date,
+                revision_date,
+                deleted_date,
+                archived_date,
+                key,
+                login,
+                card: None,
+                identity: None,
+                secure_note: None,
+                ssh_key,
+                fields,
+                attachments,
+                collection_ids: None,
+                password_history: None,
+                permissions: None,
+                object,
+                extra,
+            });
+        }
+
+        Ok(ciphers)
+    }
+
+    pub fn save_sync_response(&mut self, sync: &SyncResponse) -> Result<(), String> {
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+
+        // Clear existing data
+        tx.execute("DELETE FROM users", ()).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM organizations", ()).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM folders", ()).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM ciphers", ()).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sync_metadata", ()).map_err(|e| e.to_string())?;
+
+        // 1. Save profile
+        let profile = &sync.profile;
+        let extra_profile_json = serde_json::to_string(&profile.extra).unwrap_or_default();
+        tx.execute(
+            "INSERT INTO users (id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            rusqlite::params![
+                &profile.id,
+                &profile.email,
+                profile.email_verified as i32,
+                &profile.name,
+                profile.premium as i32,
+                profile.premium_from_organization as i32,
+                &profile.private_key,
+                &profile.public_key,
+                &profile.security_stamp,
+                profile.two_factor_enabled as i32,
+                profile.uses_key_connector as i32,
+                &profile.culture,
+                &profile.creation_date,
+                &profile.avatar_color,
+                profile.force_password_reset as i32,
+                &profile.key,
+                profile._status,
+                &extra_profile_json,
+            ],
+        ).map_err(|e| format!("Failed to save user profile: {}", e))?;
+
+        // 2. Save organizations
+        if let Some(ref orgs) = profile.organizations {
+            for org in orgs {
+                tx.execute(
+                    "INSERT INTO organizations (id, name, key, object) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![&org.id, &org.name, &org.key, &org.object],
+                ).map_err(|e| format!("Failed to save organization: {}", e))?;
+            }
+        }
+
+        // 3. Save folders
+        if let Some(ref folders) = sync.folders {
+            for folder in folders {
+                tx.execute(
+                    "INSERT INTO folders (id, user_id, name, object, revision_date) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![&folder.id, &profile.id, &folder.name, &folder.object, &folder.revision_date],
+                ).map_err(|e| format!("Failed to save folder: {}", e))?;
+            }
+        }
+
+        // 4. Save metadata & KDF parameters
+        let domains_json = serde_json::to_string(&sync.domains).unwrap_or_default();
+        let policies_json = serde_json::to_string(&sync.policies).unwrap_or_default();
+        let sends_json = serde_json::to_string(&sync.sends).unwrap_or_default();
+        let extra_sync_json = serde_json::to_string(&sync.extra).unwrap_or_default();
+        let mpu_json = if let Some(ref ud) = sync.user_decryption {
+            serde_json::to_string(&ud.master_password_unlock).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_metadata (id, domains, policies, sends, object, masterPasswordUnlock, extra) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![&domains_json, &policies_json, &sends_json, &sync.object, &mpu_json, &extra_sync_json],
+        ).map_err(|e| format!("Failed to save sync metadata: {}", e))?;
+
+        // 5. Save ciphers
+        for cipher in &sync.ciphers {
+            save_cipher_conn(&tx, cipher, &profile.id)?;
+        }
+
+        tx.commit().map_err(|e| format!("Failed to commit transaction: {}", e))?;
+        Ok(())
+    }
+
+    pub fn load_sync_response(&self) -> Result<SyncResponse, String> {
+        use crate::api::{OrganizationSync, FolderSync, MasterPasswordUnlockSync, UserDecryptionSync};
+
+        // 1. Load Profile
+        let mut stmt = self.conn.prepare(
+            "SELECT id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra FROM users LIMIT 1"
+        ).map_err(|e| e.to_string())?;
+
+        let res = stmt.query_row((), |row| {
+            let id: String = row.get(0)?;
+            let email: String = row.get(1)?;
+            let email_verified = row.get::<_, i32>(2)? != 0;
+            let name: Option<String> = row.get(3)?;
+            let premium = row.get::<_, i32>(4)? != 0;
+            let premium_from_organization = row.get::<_, i32>(5)? != 0;
+            let private_key: Option<String> = row.get(6)?;
+            let public_key: Option<String> = row.get(7)?;
+            let security_stamp: Option<String> = row.get(8)?;
+            let two_factor_enabled = row.get::<_, i32>(9)? != 0;
+            let uses_key_connector = row.get::<_, i32>(10)? != 0;
+            let culture: String = row.get(11)?;
+            let creation_date: String = row.get(12)?;
+            let avatar_color: Option<String> = row.get(13)?;
+            let force_password_reset = row.get::<_, i32>(14)? != 0;
+            let key: String = row.get(15)?;
+            let _status: Option<i32> = row.get(16)?;
+            let extra_json: String = row.get(17)?;
+
+            Ok((id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra_json))
+        });
+
+        let (id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra_json) = match res {
+            Ok(val) => val,
+            Err(e) => return Err(format!("Failed to load user profile: {}", e)),
+        };
+        let extra_profile: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
+
+        // Load organizations
+        let mut org_stmt = self.conn.prepare("SELECT id, name, key, object FROM organizations").map_err(|e| e.to_string())?;
+        let org_iter = org_stmt.query_map((), |row| {
+            Ok(OrganizationSync {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                key: row.get(2)?,
+                object: row.get(3)?,
+                extra: std::collections::HashMap::new(),
+            })
+        }).map_err(|e| e.to_string())?;
+        let mut organizations = Vec::new();
+        for org in org_iter {
+            organizations.push(org.map_err(|e| e.to_string())?);
+        }
+        let organizations_opt = if organizations.is_empty() { None } else { Some(organizations) };
+
+        let profile = ProfileSync {
+            id,
+            email,
+            email_verified,
+            name,
+            premium,
+            premium_from_organization,
+            private_key,
+            public_key,
+            security_stamp,
+            two_factor_enabled,
+            uses_key_connector,
+            culture,
+            creation_date,
+            avatar_color,
+            force_password_reset,
+            key,
+            organizations: organizations_opt,
+            provider_organizations: None,
+            providers: None,
+            _status,
+            object: "profile".to_string(),
+            extra: extra_profile,
+        };
+
+        // 2. Load folders
+        let mut fold_stmt = self.conn.prepare("SELECT id, name, object, revision_date FROM folders").map_err(|e| e.to_string())?;
+        let fold_iter = fold_stmt.query_map((), |row| {
+            Ok(FolderSync {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                object: row.get(2)?,
+                revision_date: row.get(3)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        let mut folders = Vec::new();
+        for f in fold_iter {
+            folders.push(f.map_err(|e| e.to_string())?);
+        }
+        let folders_opt = if folders.is_empty() { None } else { Some(folders) };
+
+        // 3. Load ciphers
+        let ciphers = self.list_ciphers()?;
+
+        // 4. Load metadata & KDF parameters
+        let mut meta_stmt = self.conn.prepare("SELECT domains, policies, sends, object, masterPasswordUnlock, extra FROM sync_metadata LIMIT 1").map_err(|e| e.to_string())?;
+        let meta_res = meta_stmt.query_row((), |row| {
+            let domains_json: String = row.get(0)?;
+            let policies_json: String = row.get(1)?;
+            let sends_json: String = row.get(2)?;
+            let object: String = row.get(3)?;
+            let mpu_json: String = row.get(4)?;
+            let extra_json: String = row.get(5)?;
+
+            let domains: Option<serde_json::Value> = serde_json::from_str(&domains_json).ok();
+            let policies: Option<Vec<serde_json::Value>> = serde_json::from_str(&policies_json).ok();
+            let sends: Option<Vec<serde_json::Value>> = serde_json::from_str(&sends_json).ok();
+            let master_password_unlock: Option<MasterPasswordUnlockSync> = serde_json::from_str(&mpu_json).ok();
+            let extra: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
+
+            Ok((domains, policies, sends, object, master_password_unlock, extra))
+        });
+
+        let (domains, policies, sends, object, master_password_unlock, extra_sync) = match meta_res {
+            Ok(val) => val,
+            Err(_) => (None, None, None, "sync".to_string(), None, std::collections::HashMap::new()),
+        };
+
+        let user_decryption = if master_password_unlock.is_some() {
+            Some(UserDecryptionSync { master_password_unlock })
+        } else {
+            None
+        };
+
+        Ok(SyncResponse {
+            profile,
+            ciphers,
+            folders: folders_opt,
+            domains,
+            policies,
+            sends,
+            object,
+            user_decryption,
+            extra: extra_sync,
+        })
+    }
 }
 
 /// Delete the local cache database from disk (used on logout)
@@ -297,16 +968,10 @@ pub fn wipe_db() -> Result<(), String> {
                 .map_err(|e| format!("Failed to delete unencrypted cache database file: {}", e))?;
         }
     }
-    if let Some(k_path) = keys_path() {
-        if k_path.exists() {
-            fs::remove_file(&k_path)
-                .map_err(|e| format!("Failed to delete keys cache file: {}", e))?;
-        }
-    }
     Ok(())
 }
 
-/// Delete only the unencrypted raw cache database and cached key files (used when timeout changes from "never")
+/// Delete only the unencrypted raw cache database (used when timeout changes from "never")
 pub fn wipe_unencrypted_cache() -> Result<(), String> {
     if let Some(raw_path) = unencrypted_db_path() {
         if raw_path.exists() {
@@ -314,14 +979,40 @@ pub fn wipe_unencrypted_cache() -> Result<(), String> {
                 .map_err(|e| format!("Failed to delete unencrypted cache database file: {}", e))?;
         }
     }
-    if let Some(k_path) = keys_path() {
-        if k_path.exists() {
-            fs::remove_file(&k_path)
-                .map_err(|e| format!("Failed to delete keys cache file: {}", e))?;
+    Ok(())
+}
+
+pub fn handle_post_sync(
+    sync_response: &SyncResponse,
+    repo: &VaultRepository,
+    enc_key: &[u8; 32],
+    mac_key: &[u8; 32],
+) -> Result<(), String> {
+    if let Ok(config) = crate::config::Config::load() {
+        if config.timeout.trim().to_lowercase() == "never" {
+            if let Some(raw_path) = unencrypted_db_path() {
+                let decrypted_items = parse_and_decrypt_all_ciphers(sync_response, enc_key, mac_key);
+                let pretty_json = serde_json::to_vec_pretty(&decrypted_items)
+                    .map_err(|e| format!("Failed to serialize unencrypted database: {}", e))?;
+                fs::write(&raw_path, &pretty_json)
+                    .map_err(|e| format!("Failed to write unencrypted cache: {}", e))?;
+                
+                let file = File::open(&raw_path)
+                    .map_err(|e| format!("Failed to open unencrypted cache file to set permissions: {}", e))?;
+                let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
+                perms.set_mode(0o600);
+                file.set_permissions(perms)
+                    .map_err(|e| format!("Failed to set permissions on unencrypted cache: {}", e))?;
+            }
+            repo.save_saved_keys(enc_key, mac_key)?;
+        } else {
+            let _ = wipe_unencrypted_cache();
+            repo.clear_saved_keys()?;
         }
     }
     Ok(())
 }
+
 
 /// Load unencrypted SSH keys from raw cache database if timeout is "never"
 pub fn load_unencrypted_db() -> Option<Vec<ssh_key::private::PrivateKey>> {
@@ -723,19 +1414,19 @@ mod tests {
         assert_eq!(mpu.kdf.parallelism, Some(2));
         assert_eq!(mpu.salt, "alex@okkk.cc");
 
-        // Verify that flattened extra fields are captured
-        assert!(sync_resp.extra.contains_key("folders"));
-        assert!(sync_resp.extra.contains_key("object"));
-        assert!(sync_resp.profile.extra.contains_key("name"));
-        assert!(sync_resp.ciphers[0].extra.contains_key("favorite"));
+        // Verify that fields are parsed
+        assert!(sync_resp.folders.is_some());
+        assert_eq!(sync_resp.object, "sync");
+        assert_eq!(sync_resp.profile.name.as_deref(), Some("Alex Yuan"));
+        assert_eq!(sync_resp.ciphers[0].favorite, false);
 
         // Round-trip serialization
         let serialized = serde_json::to_string(&sync_resp).expect("Failed to serialize");
         let sync_resp_2: SyncResponse = serde_json::from_str(&serialized).expect("Failed to deserialize second time");
 
-        // Verify round-tripped extra fields
-        assert!(sync_resp_2.extra.contains_key("folders"));
-        assert!(sync_resp_2.extra.contains_key("object"));
+        // Verify round-tripped fields
+        assert!(sync_resp_2.folders.is_some());
+        assert_eq!(sync_resp_2.object, "sync");
         assert_eq!(sync_resp_2.profile.email, "alex@okkk.cc");
     }
 
@@ -746,38 +1437,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache_d);
 
         let mut extra_profile = std::collections::HashMap::new();
-        extra_profile.insert("name".to_string(), serde_json::json!("Test User"));
+        extra_profile.insert("customField".to_string(), serde_json::json!("Custom Value"));
 
         let mut extra_sync = std::collections::HashMap::new();
-        extra_sync.insert("object".to_string(), serde_json::json!("sync"));
+        extra_sync.insert("customSyncField".to_string(), serde_json::json!("Custom Sync Value"));
 
         let sync_resp = SyncResponse {
             profile: ProfileSync {
                 id: "user-123".to_string(),
                 email: "test@example.com".to_string(),
-                key: "wrapped-key".to_string(),
+                email_verified: false,
+                name: Some("Test User".to_string()),
+                premium: false,
+                premium_from_organization: false,
                 private_key: None,
+                public_key: None,
+                security_stamp: None,
+                two_factor_enabled: false,
+                uses_key_connector: false,
+                culture: "en-US".to_string(),
+                creation_date: String::new(),
+                avatar_color: None,
+                force_password_reset: false,
+                key: "wrapped-key".to_string(),
                 organizations: None,
+                provider_organizations: None,
+                providers: None,
+                _status: None,
+                object: "profile".to_string(),
                 extra: extra_profile,
             },
             ciphers: Vec::new(),
+            folders: None,
+            domains: None,
+            policies: None,
+            sends: None,
+            object: "sync".to_string(),
             user_decryption: None,
             extra: extra_sync,
         };
 
-        let db_key = [7u8; 32];
-
-        // Save it
-        save_db(&sync_resp, &db_key, None, None).expect("save_db failed");
+        // Save it using VaultRepository
+        let path = cache_d.join(DB_FILE_NAME);
+        let mut repo = VaultRepository::open(&path).expect("VaultRepository::open failed");
+        repo.save_sync_response(&sync_resp).expect("save_sync_response failed");
 
         // Load it back
-        let loaded = load_db(&db_key).expect("load_db failed");
+        let loaded = repo.load_sync_response().expect("load_sync_response failed");
 
         assert_eq!(loaded.profile.id, "user-123");
         assert_eq!(loaded.profile.email, "test@example.com");
         assert_eq!(loaded.profile.key, "wrapped-key");
-        assert_eq!(loaded.profile.extra.get("name").unwrap(), "Test User");
-        assert_eq!(loaded.extra.get("object").unwrap(), "sync");
+        assert_eq!(loaded.profile.name.as_deref(), Some("Test User"));
+        assert_eq!(loaded.profile.extra.get("customField").unwrap(), "Custom Value");
+        assert_eq!(loaded.extra.get("customSyncField").unwrap(), "Custom Sync Value");
 
         // Clean up
         let _ = std::fs::remove_dir_all(&cache_d);

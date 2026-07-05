@@ -97,7 +97,9 @@ pub struct RefreshTokenResponse {
 #[serde(rename_all = "camelCase")]
 pub struct OrganizationSync {
     pub id: String,
+    pub name: String,
     pub key: String,
+    pub object: String,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -107,9 +109,26 @@ pub struct OrganizationSync {
 pub struct ProfileSync {
     pub id: String,
     pub email: String,
-    pub key: String, // MasterKeyWrappedUserKey
+    pub email_verified: bool,
+    pub name: Option<String>,
+    pub premium: bool,
+    pub premium_from_organization: bool,
     pub private_key: Option<String>,
+    pub public_key: Option<String>,
+    pub security_stamp: Option<String>,
+    pub two_factor_enabled: bool,
+    pub uses_key_connector: bool,
+    pub culture: String,
+    pub creation_date: String,
+    pub avatar_color: Option<String>,
+    pub force_password_reset: bool,
+    pub key: String, // MasterKeyWrappedUserKey
     pub organizations: Option<Vec<OrganizationSync>>,
+    pub provider_organizations: Option<Vec<serde_json::Value>>,
+    pub providers: Option<Vec<serde_json::Value>>,
+    #[serde(rename = "_status")]
+    pub _status: Option<i32>,
+    pub object: String,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -149,18 +168,43 @@ pub struct SshKeySync {
 #[serde(rename_all = "camelCase")]
 pub struct CipherSync {
     pub id: String,
+    pub organization_id: Option<String>,
+    pub folder_id: Option<String>,
     pub r#type: i32, // 1: Login, 2: SecureNote, etc.
     pub name: Option<String>,
     pub notes: Option<String>,
-    pub fields: Option<Vec<FieldSync>>,
-    pub login: Option<LoginSync>,
-    pub attachments: Option<Vec<AttachmentSync>>,
-    pub ssh_key: Option<SshKeySync>,
+    pub favorite: bool,
+    pub reprompt: i32,
+    pub organization_use_totp: bool,
+    pub edit: bool,
+    pub view_password: bool,
+    pub creation_date: String,
+    pub revision_date: String,
     pub deleted_date: Option<String>,
+    pub archived_date: Option<String>,
     pub key: Option<String>,
-    pub organization_id: Option<String>,
+    pub login: Option<LoginSync>,
+    pub card: Option<serde_json::Value>,
+    pub identity: Option<serde_json::Value>,
+    pub secure_note: Option<serde_json::Value>,
+    pub ssh_key: Option<SshKeySync>,
+    pub fields: Option<Vec<FieldSync>>,
+    pub attachments: Option<Vec<AttachmentSync>>,
+    pub collection_ids: Option<Vec<String>>,
+    pub password_history: Option<Vec<serde_json::Value>>,
+    pub permissions: Option<serde_json::Value>,
+    pub object: String,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderSync {
+    pub id: String,
+    pub name: String,
+    pub object: String,
+    pub revision_date: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -191,6 +235,11 @@ pub struct UserDecryptionSync {
 pub struct SyncResponse {
     pub profile: ProfileSync,
     pub ciphers: Vec<CipherSync>,
+    pub folders: Option<Vec<FolderSync>>,
+    pub domains: Option<serde_json::Value>,
+    pub policies: Option<Vec<serde_json::Value>>,
+    pub sends: Option<Vec<serde_json::Value>>,
+    pub object: String,
     pub user_decryption: Option<UserDecryptionSync>,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,

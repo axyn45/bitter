@@ -24,7 +24,6 @@ use crate::storage;
 pub struct KeysContext {
     pub enc_key: [u8; 32],
     pub mac_key: [u8; 32],
-    pub db_key: [u8; 32],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,7 +33,6 @@ pub enum ControlRequest {
         keys: Vec<SshKeyData>,
         enc_key: String,
         mac_key: String,
-        db_key: String,
     },
     Lock,
     Status,
@@ -310,6 +308,9 @@ async fn run_daemon_loops(
     let timeout_action = config.timeout_action;
 
     // If timeout is "never", try to load unencrypted keys and decryption keys automatically
+    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = storage::VaultRepository::open(&db_path)?;
+
     if config.timeout.trim().to_lowercase() == "never" {
         if let Some(raw_keys) = storage::load_unencrypted_db() {
             let count = raw_keys.len();
@@ -317,11 +318,9 @@ async fn run_daemon_loops(
 
             let mut enc_bytes = [0u8; 32];
             let mut mac_bytes = [0u8; 32];
-            let mut db_bytes = [0u8; 32];
-            if let Some((enc, mac, db)) = storage::load_saved_keys() {
+            if let Ok(Some((enc, mac))) = repo.load_saved_keys() {
                 enc_bytes = enc;
                 mac_bytes = mac;
-                db_bytes = db;
                 info!("Agent started: loaded decryption keys from secure cache.");
             } else {
                 info!("Agent started: decryption keys missing, running in read-only cache mode until unlocked.");
@@ -330,7 +329,6 @@ async fn run_daemon_loops(
             *keys_context.write().await = Some(KeysContext {
                 enc_key: enc_bytes,
                 mac_key: mac_bytes,
-                db_key: db_bytes,
             });
             info!("Agent started: automatically unlocked and loaded {} keys from unencrypted cache.", count);
         }
@@ -404,8 +402,6 @@ async fn run_daemon_loops(
                             kr.write().await.clear();
                             *kc.write().await = None;
                             let _ = storage::wipe_db();
-                            let session = crate::config::Session::default();
-                            let _ = session.save();
                             info!("Logged out due to inactivity.");
                         }
                     }
@@ -566,7 +562,6 @@ async fn handle_control_connection(
             keys,
             enc_key,
             mac_key,
-            db_key,
         } => {
             let mut parsed_keys = Vec::new();
             let mut parse_err = None;
@@ -600,23 +595,19 @@ async fn handle_control_connection(
                 // Decode hex keys
                 let enc_dec = hex::decode(&enc_key);
                 let mac_dec = hex::decode(&mac_key);
-                let db_dec = hex::decode(&db_key);
 
-                if let (Ok(enc_val), Ok(mac_val), Ok(db_val)) = (enc_dec, mac_dec, db_dec) {
+                if let (Ok(enc_val), Ok(mac_val)) = (enc_dec, mac_dec) {
                     let mut enc_bytes = [0u8; 32];
                     let mut mac_bytes = [0u8; 32];
-                    let mut db_bytes = [0u8; 32];
 
-                    if enc_val.len() == 32 && mac_val.len() == 32 && db_val.len() == 32 {
+                    if enc_val.len() == 32 && mac_val.len() == 32 {
                         enc_bytes.copy_from_slice(&enc_val);
                         mac_bytes.copy_from_slice(&mac_val);
-                        db_bytes.copy_from_slice(&db_val);
 
                         // Store keys context in memory for WebSocket sync
                         *keys_context.write().await = Some(KeysContext {
                             enc_key: enc_bytes,
                             mac_key: mac_bytes,
-                            db_key: db_bytes,
                         });
 
                         let count = parsed_keys.len();
@@ -701,14 +692,10 @@ async fn handle_control_connection(
 
                     // If timeout is not "never", remove unencrypted DB and keys if they exist
                     if config.timeout.trim().to_lowercase() != "never" {
-                        if let Some(raw_path) = storage::unencrypted_db_path() {
-                            if raw_path.exists() {
-                                let _ = fs::remove_file(raw_path);
-                            }
-                        }
-                        if let Some(keys_path) = storage::keys_path() {
-                            if keys_path.exists() {
-                                let _ = fs::remove_file(keys_path);
+                        let _ = storage::wipe_unencrypted_cache();
+                        if let Some(path) = storage::db_path() {
+                            if let Ok(repo) = storage::VaultRepository::open(&path) {
+                                let _ = repo.clear_saved_keys();
                             }
                         }
                     }
@@ -830,48 +817,28 @@ async fn handle_surgical_cipher_update(
         }
     }
 
-    // Load existing SyncResponse from cache database
-    let mut sync_resp = match storage::load_db(&ctx.db_key) {
-        Ok(resp) => resp,
-        Err(e) => {
-            info!("Failed to load cache database: {}. Initializing empty database.", e);
-            storage::SyncResponse {
-                profile: storage::ProfileSync {
-                    id: String::new(),
-                    email: String::new(),
-                    key: String::new(),
-                    private_key: None,
-                    organizations: None,
-                    extra: std::collections::HashMap::new(),
-                },
-                ciphers: Vec::new(),
-                user_decryption: None,
-                extra: std::collections::HashMap::new(),
-            }
-        }
-    };
+    // Open cache database repository
+    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let mut repo = storage::VaultRepository::open(&db_path)?;
 
-    let existed = sync_resp.ciphers.iter().any(|c| c.id == cipher_id);
+    // Get current sync response to find user_id and then update
+    let sync_resp = repo.load_sync_response().map_err(|e| format!("Failed to load cache database: {}", e))?;
+    let user_id = sync_resp.profile.id.clone();
+
     if is_deleted {
-        if !existed {
-            return Ok(());
-        }
-        // Remove from list
-        sync_resp.ciphers.retain(|c| c.id != cipher_id);
+        repo.delete_cipher(&cipher_id)?;
     } else if let Some(cipher) = fetched_cipher {
-        // Upsert item
-        if let Some(pos) = sync_resp.ciphers.iter().position(|x| x.id == cipher_id) {
-            sync_resp.ciphers[pos] = cipher;
-        } else {
-            sync_resp.ciphers.push(cipher);
-        }
+        repo.save_cipher(&cipher, &user_id)?;
     }
 
-    // Save updated SyncResponse back to database cache
-    storage::save_db(&sync_resp, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key))?;
+    // Reload the updated sync response from DB
+    let updated_sync_resp = repo.load_sync_response()?;
+
+    // Update unencrypted raw cache if timeout is "never"
+    storage::handle_post_sync(&updated_sync_resp, &repo, &ctx.enc_key, &ctx.mac_key)?;
 
     // Decrypt all ciphers
-    let decrypted_items = storage::parse_and_decrypt_all_ciphers(&sync_resp, &ctx.enc_key, &ctx.mac_key);
+    let decrypted_items = storage::parse_and_decrypt_all_ciphers(&updated_sync_resp, &ctx.enc_key, &ctx.mac_key);
 
     // Reload keyring memory
     let ssh_items = storage::extract_ssh_keys_from_ciphers(&decrypted_items);
@@ -901,10 +868,15 @@ async fn run_websocket_sync_loop(
 ) -> Result<(), String> {
     let config =
         crate::config::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
-    let mut session =
-        crate::config::Session::load().map_err(|e| format!("Failed to load session: {}", e))?;
+    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = storage::VaultRepository::open(&db_path)?;
+    let mut session: crate::config::Session = repo.load_session()?.unwrap_or_default();
 
-    let token = session.get_valid_token(&config.server_url).await?;
+    let token = match session.get_valid_token(&config.server_url).await {
+        Ok(t) => t,
+        Err(e) => return Err(e),
+    };
+    repo.save_session(&session)?;
 
     let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
     let client = ApiClient::new(&config.server_url);
@@ -976,11 +948,7 @@ async fn run_websocket_sync_loop(
                                             let kr_clone = keyring.clone();
                                             let cipher_id_str = cipher_id.to_string();
                                             tokio::spawn(async move {
-                                                let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
-                                                    sess.get_valid_token(&cfg.server_url).await.unwrap_or_default()
-                                                } else {
-                                                    String::new()
-                                                };
+                                                let current_token = get_valid_token_from_db("").await;
                                                 if let Err(e) = handle_surgical_cipher_update(
                                                     &client_clone,
                                                     &current_token,
@@ -1001,11 +969,7 @@ async fn run_websocket_sync_loop(
                                             ut
                                         );
 
-                                        let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
-                                            sess.get_valid_token(&cfg.server_url).await.unwrap_or_else(|_| token.clone())
-                                        } else {
-                                            token.clone()
-                                        };
+                                        let current_token = get_valid_token_from_db(&token).await;
                                         match client.sync(&current_token).await {
                                             Ok(sync_data) => {
                                                 let ctx_opt = keys_context.read().await;
@@ -1039,17 +1003,28 @@ async fn run_websocket_sync_loop(
                                                     let mut kr = keyring.write().await;
                                                     *kr = parsed_keys;
 
-                                                    if let Err(err) = storage::save_db(
-                                                        &sync_data,
-                                                        &ctx.db_key,
-                                                        Some(&ctx.enc_key),
-                                                        Some(&ctx.mac_key),
-                                                    ) {
+                                                    let mut repo_res = Ok(());
+                                                    let mut opened_repo = None;
+                                                    if let Some(db_path) = storage::db_path() {
+                                                        if let Ok(mut repo) = storage::VaultRepository::open(&db_path) {
+                                                            repo_res = repo.save_sync_response(&sync_data);
+                                                            opened_repo = Some(repo);
+                                                        } else {
+                                                            repo_res = Err("Failed to open cache database".to_string());
+                                                        }
+                                                    } else {
+                                                        repo_res = Err("Could not determine cache database path".to_string());
+                                                    }
+
+                                                    if let Err(err) = repo_res {
                                                         error!(
                                                             "WebSocket background sync failed to save db: {}",
                                                             err
                                                         );
                                                     } else {
+                                                        if let Some(ref repo) = opened_repo {
+                                                            let _ = storage::handle_post_sync(&sync_data, repo, &ctx.enc_key, &ctx.mac_key);
+                                                        }
                                                         info!(
                                                             "WebSocket: Background sync completed. Synced and reloaded {} keys.",
                                                             count
@@ -1118,11 +1093,7 @@ async fn run_websocket_sync_loop(
                                                             let kr_clone = keyring.clone();
                                                             let cipher_id_str = cipher_id.to_string();
                                                             tokio::spawn(async move {
-                                                                let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
-                                                                    sess.get_valid_token(&cfg.server_url).await.unwrap_or_default()
-                                                                } else {
-                                                                    String::new()
-                                                                };
+                                                                let current_token = get_valid_token_from_db("").await;
                                                                 if let Err(e) = handle_surgical_cipher_update(
                                                                     &client_clone,
                                                                     &current_token,
@@ -1139,11 +1110,7 @@ async fn run_websocket_sync_loop(
                                                     } else if ut_val == 0 || ut_val == 4 || ut_val == 5 {
                                                         // Full Sync
                                                         info!("WebSocket (binary): Received vault update event (Type {}). Syncing...", ut_val);
-                                                        let current_token = if let (Ok(cfg), Ok(mut sess)) = (crate::config::Config::load(), crate::config::Session::load()) {
-                                                            sess.get_valid_token(&cfg.server_url).await.unwrap_or_else(|_| token.clone())
-                                                        } else {
-                                                            token.clone()
-                                                        };
+                                                        let current_token = get_valid_token_from_db(&token).await;
                                                         match client.sync(&current_token).await {
                                                             Ok(sync_data) => {
                                                                 let ctx_opt = keys_context.read().await;
@@ -1167,9 +1134,24 @@ async fn run_websocket_sync_loop(
                                                                     }
                                                                     let count = parsed_keys.len();
                                                                     *keyring.write().await = parsed_keys;
-                                                                    if let Err(err) = storage::save_db(&sync_data, &ctx.db_key, Some(&ctx.enc_key), Some(&ctx.mac_key)) {
+                                                                    let mut repo_res = Ok(());
+                                                                    let mut opened_repo = None;
+                                                                    if let Some(db_path) = storage::db_path() {
+                                                                        if let Ok(mut repo) = storage::VaultRepository::open(&db_path) {
+                                                                            repo_res = repo.save_sync_response(&sync_data);
+                                                                            opened_repo = Some(repo);
+                                                                        } else {
+                                                                            repo_res = Err("Failed to open cache database".to_string());
+                                                                        }
+                                                                    } else {
+                                                                        repo_res = Err("Could not determine cache database path".to_string());
+                                                                    };
+                                                                    if let Err(err) = repo_res {
                                                                         error!("WebSocket background sync failed to save db: {}", err);
                                                                     } else {
+                                                                        if let Some(ref repo) = opened_repo {
+                                                                            let _ = storage::handle_post_sync(&sync_data, repo, &ctx.enc_key, &ctx.mac_key);
+                                                                        }
                                                                         info!("WebSocket (binary): Background sync completed. Synced and reloaded {} keys.", count);
                                                                     }
                                                                 }
@@ -1270,8 +1252,9 @@ async fn prompt_tty_for_unlock(
     }
 
     // Load session to check if logged in
-    let session = crate::config::Session::load()
-        .map_err(|e| format!("Failed to load session: {}", e))?;
+    let db_path = crate::storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = crate::storage::VaultRepository::open(&db_path)?;
+    let session = repo.load_session()?.unwrap_or_default();
 
     if session.email.is_none() {
         return Err("Not logged in".to_string());
@@ -1336,19 +1319,11 @@ async fn prompt_tty_for_unlock(
 
 
 
-    let salt = session.cache_salt.as_ref()
-        .ok_or_else(|| "No cache salt found in session".to_string())?;
-
-    // Derive DB key
-    tty.write_all(b"[sshwarden] Deriving encryption key (Argon2)... ").map_err(|e| e.to_string())?;
-    let _ = tty.flush();
-    let db_key = crate::storage::derive_db_key(&password, salt)
-        .map_err(|e| format!("KDF failed: {}", e))?;
-    tty.write_all(b"Done.\r\n").map_err(|e| e.to_string())?;
-
     // Load local database
-    let sync_resp = crate::storage::load_db(&db_key)
-        .map_err(|e| format!("Password incorrect or local database decryption failed: {}", e))?;
+    let db_path = crate::storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = crate::storage::VaultRepository::open(&db_path)?;
+    let sync_resp = repo.load_sync_response()
+        .map_err(|e| format!("Password incorrect or local database load failed: {}", e))?;
 
     // Decrypt ciphers offline using master password
     let (items, enc_key, mac_key) = crate::storage::decrypt_sync_response_offline(&sync_resp, &password)
@@ -1369,7 +1344,6 @@ async fn prompt_tty_for_unlock(
     *keys_context.write().await = Some(KeysContext {
         enc_key,
         mac_key,
-        db_key,
     });
 
     tty.write_all(format!("[sshwarden] Vault unlocked successfully. Loaded {} keys.\r\n\n", count).as_bytes())
@@ -1415,4 +1389,25 @@ fn count_active_user_sessions(username: &str) -> usize {
         }
     }
     count
+}
+
+async fn get_valid_token_from_db(fallback: &str) -> String {
+    if let Ok(cfg) = crate::config::Config::load() {
+        if let Some(db_path) = storage::db_path() {
+            if let Ok(repo) = storage::VaultRepository::open(&db_path) {
+                if let Ok(Some(mut sess)) = repo.load_session() {
+                    match sess.get_valid_token(&cfg.server_url).await {
+                        Ok(t) => {
+                            let _ = repo.save_session(&sess);
+                            return t;
+                        }
+                        Err(e) => {
+                            error!("Failed to get valid token: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fallback.to_string()
 }

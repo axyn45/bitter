@@ -17,7 +17,6 @@ pub async fn perform_sync_and_reload(
     api_client: &ApiClient,
     token: &str,
     key_source: KeySource,
-    db_key: &[u8; 32],
     session: &mut Session,
 ) -> Result<Vec<storage::CipherItem>, String> {
     // 1. Fetch sync data
@@ -38,22 +37,23 @@ pub async fn perform_sync_and_reload(
     // 3. Decrypt all ciphers
     let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
 
-    // 4. Update session fields and save first
+    // 4. Update session fields and save
     session.last_sync_time = Some(get_current_time_string());
-    session
-        .save()
+    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let mut repo = storage::VaultRepository::open(&db_path)?;
+    repo.save_session(session)
         .map_err(|e| format!("Failed to save session: {}", e))?;
 
-    // 5. Save to database cache
-    storage::save_db(&sync_data, db_key, Some(&enc_key), Some(&mac_key))
+    // 5. Save sync response to database cache
+    repo.save_sync_response(&sync_data)
         .map_err(|e| format!("Failed to save cache database: {}", e))?;
+    storage::handle_post_sync(&sync_data, &repo, &enc_key, &mac_key)?;
 
     // 6. Automatically unlock running agent daemon if it is running
     if daemon::is_agent_running() {
         let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
         let enc_hex = hex::encode(&enc_key);
         let mac_hex = hex::encode(&mac_key);
-        let db_hex = hex::encode(*db_key);
         let daemon_keys: Vec<daemon::SshKeyData> = ssh_keys
             .into_iter()
             .map(|k| daemon::SshKeyData {
@@ -66,7 +66,6 @@ pub async fn perform_sync_and_reload(
             keys: daemon_keys,
             enc_key: enc_hex,
             mac_key: mac_hex,
-            db_key: db_hex,
         })
         .await
         {
@@ -96,7 +95,10 @@ pub async fn perform_sync_and_reload(
 }
 
 pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), String> {
-    let mut session = Session::load().map_err(|e| format!("Failed to load session: {}", e))?;
+    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = storage::VaultRepository::open(&db_path)?;
+    let mut session = repo.load_session()?.unwrap_or_default();
+
     match command {
         Commands::Login(args) => handle_login(args, config, &mut session).await?,
         Commands::Logout => handle_logout(config).await?,
@@ -142,6 +144,8 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
             }
         }
     }
+
+    repo.save_session(&session)?;
     Ok(())
 }
 
@@ -160,7 +164,7 @@ async fn handle_login(
     let client_id = args.client_id.or_else(|| config.client_id.clone());
     let client_secret = args.client_secret.or_else(|| config.client_secret.clone());
 
-    let (token_resp, master_key, password, email) = if let (Some(cid), Some(csec)) =
+    let (token_resp, master_key, email) = if let (Some(cid), Some(csec)) =
         (client_id, client_secret)
     {
         println!("Logging in using Personal API Key client credentials...");
@@ -227,7 +231,7 @@ async fn handle_login(
         let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
         println!("Vault keys decrypted and verified successfully.");
 
-        (resp, master_key, password, email)
+        (resp, master_key, email)
     } else {
         // Password Login
         let email = match args.email.or_else(|| session.email.clone()) {
@@ -284,7 +288,7 @@ async fn handle_login(
         let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
         println!("Vault keys decrypted and verified successfully.");
 
-        (resp, master_key, password, email)
+        (resp, master_key, email)
     };
 
     // Store token and configurations
@@ -297,25 +301,15 @@ async fn handle_login(
     session.refresh_token = token_resp.refresh_token.clone();
     session.email = Some(email);
     session.server_url = Some(server_url);
-    session
-        .save()
-        .map_err(|e| format!("Failed to save session: {}", e))?;
-
     println!("Logged in successfully. Session token stored locally.");
 
     // Automatically perform synchronization
     println!("Automatically syncing ciphers from server...");
-    let salt = session
-        .cache_salt
-        .as_ref()
-        .ok_or_else(|| "Local database salt missing from session.".to_string())?;
-    let db_key = storage::derive_db_key(&password, salt)?;
 
     match perform_sync_and_reload(
         &api_client,
         &token_resp.access_token,
         KeySource::MasterKey(master_key),
-        &db_key,
         session,
     )
     .await
@@ -348,11 +342,7 @@ async fn handle_logout(config: &mut Config) -> Result<(), String> {
         .save()
         .map_err(|e| format!("Failed to save configuration: {}", e))?;
 
-    let session = Session::default();
-    session
-        .save()
-        .map_err(|e| format!("Failed to save session: {}", e))?;
-    println!("Logged out successfully. Configuration, session, and local cache cleared.");
+    println!("Logged out successfully. Configuration and local cache cleared.");
     Ok(())
 }
 
@@ -362,22 +352,22 @@ async fn handle_sync(config: &mut Config, session: &mut Session) -> Result<(), S
     let api_client = ApiClient::new(&config.server_url);
     println!("Syncing ciphers from server {}...", config.server_url);
 
+    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = storage::VaultRepository::open(&db_path)?;
+
     let mut cached_keys = None;
     if config.timeout.trim().to_lowercase() == "never" {
-        if let Some((enc, mac, db)) = storage::load_saved_keys() {
+        if let Some((enc, mac)) = repo.load_saved_keys()? {
             println!("Using cached decryption keys for passwordless sync...");
-            cached_keys = Some((enc, mac, db));
+            cached_keys = Some((enc, mac));
         }
     }
 
-    let (key_source, db_key) = match cached_keys {
-        Some((enc, mac, db)) => (
-            KeySource::DecryptedKeys {
-                enc_key: enc,
-                mac_key: mac,
-            },
-            db,
-        ),
+    let key_source = match cached_keys {
+        Some((enc, mac)) => KeySource::DecryptedKeys {
+            enc_key: enc,
+            mac_key: mac,
+        },
         None => {
             let password = rpassword::prompt_password("Master Password (to decrypt vault keys): ")
                 .map_err(|e| format!("Password prompt failed: {}", e))?;
@@ -410,17 +400,11 @@ async fn handle_sync(config: &mut Config, session: &mut Session) -> Result<(), S
                 t => return Err(format!("Unsupported KDF type: {}", t)),
             };
 
-            let salt = session
-                .cache_salt
-                .as_ref()
-                .ok_or_else(|| "Local database salt missing from session.".to_string())?;
-            let db = storage::derive_db_key(&password, salt)?;
-
-            (KeySource::MasterKey(master_key), db)
+            KeySource::MasterKey(master_key)
         }
     };
 
-    match perform_sync_and_reload(&api_client, &token, key_source, &db_key, session).await {
+    match perform_sync_and_reload(&api_client, &token, key_source, session).await {
         Ok(ciphers) => {
             println!("Synced {} items.", ciphers.len());
         }
@@ -450,21 +434,15 @@ async fn handle_settings(
                 )
                 .map_err(|e| format!("Password prompt failed: {}", e))?;
 
-                let salt = session
-                    .cache_salt
-                    .as_ref()
-                    .ok_or_else(|| "Local database salt missing from session.".to_string())?;
-                let db_key = storage::derive_db_key(&password, salt)?;
-
-                // Try verifying with local cache first
                 let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
                 let mut verified = false;
                 let mut verified_locally = false;
                 let mut loaded_sync_resp = None;
                 let mut decrypted_keys = None;
+                let repo = storage::VaultRepository::open(&path)?;
 
                 if path.exists() {
-                    if let Ok(sync_resp) = storage::load_db(&db_key) {
+                    if let Ok(sync_resp) = repo.load_sync_response() {
                         if let Ok((_ciphers, enc, mac)) = storage::decrypt_sync_response_offline(&sync_resp, &password) {
                             verified = true;
                             verified_locally = true;
@@ -511,7 +489,6 @@ async fn handle_settings(
                                 &api_client,
                                 &token,
                                 KeySource::MasterKey(master_key),
-                                &db_key,
                                 session,
                              )
                             .await
@@ -545,7 +522,7 @@ async fn handle_settings(
 
                     if let (Some(sync_resp), Some((enc, mac))) = (loaded_sync_resp, decrypted_keys) {
                         println!("Generating unencrypted cache database...");
-                        if let Err(e) = storage::save_db(&sync_resp, &db_key, Some(&enc), Some(&mac)) {
+                        if let Err(e) = storage::handle_post_sync(&sync_resp, &repo, &enc, &mac) {
                             eprintln!("Warning: Failed to generate unencrypted cache: {}", e);
                         }
                     }
@@ -653,12 +630,6 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
     let password = rpassword::prompt_password("Master Password: ")
         .map_err(|e| format!("Password prompt failed: {}", e))?;
 
-    let salt = session
-        .cache_salt
-        .as_ref()
-        .ok_or_else(|| "Local database salt missing from session.".to_string())?;
-    let db_key = storage::derive_db_key(&password, salt)?;
-
     let api_client = ApiClient::new(&config.server_url);
 
     // Attempt online sync first
@@ -692,7 +663,6 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
                         &api_client,
                         &token,
                         KeySource::MasterKey(master_key),
-                        &db_key,
                         session,
                     )
                     .await
@@ -718,7 +688,9 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
 
     if !synced_successfully {
         println!("Falling back to decrypting local cache database...");
-        let sync_resp = storage::load_db(&db_key)?;
+        let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+        let repo = storage::VaultRepository::open(&db_path)?;
+        let sync_resp = repo.load_sync_response()?;
         let (ciphers, enc_key, mac_key) = storage::decrypt_sync_response_offline(&sync_resp, &password)?;
         let cache_keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
         if cache_keys.is_empty() {
@@ -729,7 +701,6 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         }
         println!("Warning: Running in offline mode. Live background sync will be unavailable.");
 
-        let db_hex = hex::encode(db_key);
         let enc_hex = hex::encode(enc_key);
         let mac_hex = hex::encode(mac_key);
         let daemon_keys: Vec<daemon::SshKeyData> = cache_keys
@@ -745,7 +716,6 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
             keys: daemon_keys,
             enc_key: enc_hex,
             mac_key: mac_hex,
-            db_key: db_hex,
         })
         .await?;
 
