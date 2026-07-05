@@ -133,6 +133,19 @@ CREATE TABLE IF NOT EXISTS sync_metadata (
     object TEXT NOT NULL,
     masterPasswordUnlock TEXT -- JSON representation of KDF parameters
 );
+
+-- 11. Session Metadata (consolidates session.json and eliminates vault.db.keys)
+CREATE TABLE IF NOT EXISTS session_metadata (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    email TEXT,
+    device_id TEXT NOT NULL,
+    access_token TEXT,
+    refresh_token TEXT,
+    last_sync_time TEXT,
+    server_url TEXT,
+    enc_key TEXT, -- hex encoded symmetric decryption key, present only when timeout is 'never'
+    mac_key TEXT  -- hex encoded MAC verification key, present only when timeout is 'never'
+);
 ```
 
 ---
@@ -188,9 +201,18 @@ pub struct VaultRepository {
 * `load_sync_response(&self) -> Result<SyncResponse, String>`:
   - Aggregates all tables in memory to reconstruct the full unified `SyncResponse` struct.
 
+#### 5. Session & Keys Management
+* `save_session(&self, session: &Session) -> Result<(), String>`: Saves the active user session details to `session_metadata`.
+* `load_session(&self) -> Result<Option<Session>, String>`: Loads the active user session details from `session_metadata`.
+* `save_saved_keys(&self, enc: &[u8; 32], mac: &[u8; 32]) -> Result<(), String>`: Stores the plaintext vault keys inside `session_metadata` when timeout is `'never'`.
+* `load_saved_keys(&self) -> Result<Option<([u8; 32], [u8; 32])>, String>`: Loads the plaintext vault keys from `session_metadata` when timeout is `'never'`.
+* `clear_saved_keys(&self) -> Result<(), String>`: Clears the plaintext keys by setting `enc_key` and `mac_key` to `NULL` in `session_metadata`.
+
+---
+
 ## 5. Direct Dependents Update Plan
 
-We will completely remove the old bulk `save_db` and `load_db` functions from `src/storage.rs`. All call-sites in `commands.rs` and `daemon.rs` will be refactored to use the new `VaultRepository` struct directly.
+We will completely remove the old bulk `save_db` and `load_db` functions from `src/storage.rs`. Additionally, **`session.json` and `vault.db.keys` files are completely eliminated**. All session and key persistence operations are migrated to SQLite.
 
 ### Call-Sites to Update
 
@@ -198,14 +220,18 @@ We will completely remove the old bulk `save_db` and `load_db` functions from `s
 * **Vault Login/Sync (`sync` & `login` command flow):**
   - Instantiates `VaultRepository::open(&db_path)`
   - Calls `repo.save_sync_response(&sync_data)` to write the updated database cache.
+  - Saves the updated session tokens to `repo.save_session(&session)`.
   - The backup of unencrypted credentials (`vault.db.raw` for timeout=never settings) is written directly using `storage::parse_and_decrypt_all_ciphers`.
 * **Vault Decryption/Unlock (`unlock` / offline lookup):**
   - Instantiates `VaultRepository::open(&db_path)`
+  - Loads session metadata from `repo.load_session()`.
   - Calls `repo.load_sync_response()` to load the data for offline key derivation and cipher decryption.
 
 #### B. In `src/daemon.rs`:
 * **Agent Daemon Setup & Refresh:**
   - Instantiates `VaultRepository::open(&db_path)`
+  - Loads session from `repo.load_session()`.
+  - Checks if timeout is `"never"` and loads cached keys via `repo.load_saved_keys()`.
   - Calls `repo.load_sync_response()` to rebuild the keys and ciphers in-memory.
 * **WebSocket Cipher Sync Events:**
   - Instead of downloading and writing the entire database, the background WebSocket sync will directly invoke single-item CRUD operations:
