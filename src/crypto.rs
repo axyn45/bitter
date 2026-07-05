@@ -241,6 +241,30 @@ pub fn decrypt_symmetric_key(
     Ok((enc_key, mac_key))
 }
 
+/// Decrypts RSA-OAEP with SHA-1
+pub fn decrypt_rsa_oaep_sha1(priv_key_der: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    let priv_key = RsaPrivateKey::from_pkcs8_der(priv_key_der)
+        .map_err(|e| format!("Failed to parse RSA private key from PKCS#8 DER: {}", e))?;
+    
+    let padding = rsa::Oaep::new::<sha1::Sha1>();
+    priv_key.decrypt(padding, ciphertext)
+        .map_err(|e| format!("RSA-OAEP-SHA1 decryption failed: {}", e))
+}
+
+/// Decrypts RSA-OAEP with SHA-256
+pub fn decrypt_rsa_oaep_sha256(priv_key_der: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+    let priv_key = RsaPrivateKey::from_pkcs8_der(priv_key_der)
+        .map_err(|e| format!("Failed to parse RSA private key from PKCS#8 DER: {}", e))?;
+    
+    let padding = rsa::Oaep::new::<sha2::Sha256>();
+    priv_key.decrypt(padding, ciphertext)
+        .map_err(|e| format!("RSA-OAEP-SHA256 decryption failed: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -411,16 +411,71 @@ pub fn extract_ssh_keys_from_ciphers(ciphers: &[CipherItem]) -> Vec<SshKeyItem> 
     ssh_keys
 }
 
+fn decrypt_org_key(org_key_str: &str, priv_key_der: &[u8]) -> Result<([u8; 32], [u8; 32]), String> {
+    let parts: Vec<&str> = org_key_str.split('.').collect();
+    if parts.len() < 2 {
+        return Err("Invalid organization key format".to_string());
+    }
+    let enc_type: u32 = parts[0].parse().map_err(|_| "Invalid enc_type".to_string())?;
+    let data_parts: Vec<&str> = parts[1].split('|').collect();
+    let ciphertext = BASE64_STANDARD.decode(data_parts[0])
+        .map_err(|e| format!("Failed to base64 decode organization key ciphertext: {}", e))?;
+
+    let decrypted = match enc_type {
+        3 | 5 => crypto::decrypt_rsa_oaep_sha256(priv_key_der, &ciphertext)?,
+        4 | 6 => crypto::decrypt_rsa_oaep_sha1(priv_key_der, &ciphertext)?,
+        t => return Err(format!("Unsupported organization key encryption type: {}", t)),
+    };
+
+    if decrypted.len() != 64 {
+        return Err(format!("Decrypted organization key has invalid length: {} (expected 64)", decrypted.len()));
+    }
+
+    let mut enc = [0u8; 32];
+    let mut mac = [0u8; 32];
+    enc.copy_from_slice(&decrypted[0..32]);
+    mac.copy_from_slice(&decrypted[32..64]);
+    Ok((enc, mac))
+}
+
 /// Parses the full sync response and decrypts all ciphers without filtering out non-SSH keys.
 pub fn parse_and_decrypt_all_ciphers(
     sync_response: &SyncResponse,
     enc_key: &[u8; 32],
     mac_key: &[u8; 32],
 ) -> Vec<CipherItem> {
+    // 1. Decrypt RSA private key if present
+    let rsa_priv_key_der = if let Some(ref enc_private_key) = sync_response.profile.private_key {
+        match crypto::decrypt_cipher_string(enc_private_key, enc_key, mac_key) {
+            Ok(der) => Some(der),
+            Err(e) => {
+                eprintln!("Warning: Failed to decrypt user RSA private key: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 2. Decrypt all organization keys
+    let mut org_keys = std::collections::HashMap::new();
+    if let (Some(organizations), Some(priv_key_der)) = (&sync_response.profile.organizations, &rsa_priv_key_der) {
+        for org in organizations {
+            match decrypt_org_key(&org.key, priv_key_der) {
+                Ok((org_enc, org_mac)) => {
+                    org_keys.insert(org.id.clone(), (org_enc, org_mac));
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to decrypt organization key for {}: {}", org.id, e);
+                }
+            }
+        }
+    }
+
     let mut ciphers = Vec::new();
 
     for cipher in &sync_response.ciphers {
-        if let Err(e) = decrypt_single_cipher(cipher, enc_key, mac_key, &mut ciphers) {
+        if let Err(e) = decrypt_single_cipher(cipher, enc_key, mac_key, &org_keys, &mut ciphers) {
             eprintln!(
                 "Warning: Skipping cipher ID {} due to error: {}",
                 cipher.id, e
@@ -435,6 +490,7 @@ fn decrypt_single_cipher(
     cipher: &CipherSync,
     user_enc_key: &[u8; 32],
     user_mac_key: &[u8; 32],
+    org_keys: &std::collections::HashMap<String, ([u8; 32], [u8; 32])>,
     ciphers: &mut Vec<CipherItem>,
 ) -> Result<(), String> {
     if cipher.deleted_date.is_some() {
@@ -442,7 +498,17 @@ fn decrypt_single_cipher(
     }
 
     let (ck_enc, ck_mac) = if let Some(ref cipher_key_str) = cipher.key {
-        let decrypted = crypto::decrypt_cipher_string(cipher_key_str, user_enc_key, user_mac_key)?;
+        let (active_enc, active_mac) = if let Some(ref org_id) = cipher.organization_id {
+            if let Some(keys) = org_keys.get(org_id) {
+                *keys
+            } else {
+                (*user_enc_key, *user_mac_key)
+            }
+        } else {
+            (*user_enc_key, *user_mac_key)
+        };
+
+        let decrypted = crypto::decrypt_cipher_string(cipher_key_str, &active_enc, &active_mac)?;
         if decrypted.len() != 64 {
             return Err(format!(
                 "Decrypted cipher key has invalid length: {} (expected 64)",
@@ -455,7 +521,15 @@ fn decrypt_single_cipher(
         ck_mac.copy_from_slice(&decrypted[32..64]);
         (ck_enc, ck_mac)
     } else {
-        (*user_enc_key, *user_mac_key)
+        if let Some(ref org_id) = cipher.organization_id {
+            if let Some(keys) = org_keys.get(org_id) {
+                *keys
+            } else {
+                (*user_enc_key, *user_mac_key)
+            }
+        } else {
+            (*user_enc_key, *user_mac_key)
+        }
     };
 
     let enc_key = &ck_enc;
@@ -675,6 +749,8 @@ mod tests {
                 id: "user-123".to_string(),
                 email: "test@example.com".to_string(),
                 key: "wrapped-key".to_string(),
+                private_key: None,
+                organizations: None,
                 extra: extra_profile,
             },
             ciphers: Vec::new(),

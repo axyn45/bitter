@@ -95,10 +95,21 @@ pub struct RefreshTokenResponse {
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct OrganizationSync {
+    pub id: String,
+    pub key: String,
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileSync {
     pub id: String,
     pub email: String,
     pub key: String, // MasterKeyWrappedUserKey
+    pub private_key: Option<String>,
+    pub organizations: Option<Vec<OrganizationSync>>,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -147,6 +158,7 @@ pub struct CipherSync {
     pub ssh_key: Option<SshKeySync>,
     pub deleted_date: Option<String>,
     pub key: Option<String>,
+    pub organization_id: Option<String>,
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }

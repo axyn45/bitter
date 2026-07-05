@@ -840,6 +840,8 @@ async fn handle_surgical_cipher_update(
                     id: String::new(),
                     email: String::new(),
                     key: String::new(),
+                    private_key: None,
+                    organizations: None,
                     extra: std::collections::HashMap::new(),
                 },
                 ciphers: Vec::new(),
