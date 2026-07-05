@@ -99,6 +99,8 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
     let repo = storage::VaultRepository::open(&db_path)?;
     let mut session = repo.load_session()?.unwrap_or_default();
 
+    let is_logout = matches!(command, Commands::Logout);
+
     match command {
         Commands::Login(args) => handle_login(args, config, &mut session).await?,
         Commands::Logout => handle_logout(config).await?,
@@ -145,7 +147,9 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
         }
     }
 
-    repo.save_session(&session)?;
+    if !is_logout {
+        repo.save_session(&session)?;
+    }
     Ok(())
 }
 
