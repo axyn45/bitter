@@ -153,6 +153,69 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
     Ok(())
 }
 
+async fn listen_for_sso_callback(port: u16) -> Option<String> {
+    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(_) => return None,
+    };
+
+    if let Ok((mut stream, _)) = listener.accept().await {
+        let mut buffer = [0u8; 2048];
+        if let Ok(n) = stream.read(&mut buffer).await {
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            if let Some(path_line) = request.lines().next() {
+                if path_line.contains("GET /sso-callback") {
+                    // Try to find GET /sso-callback?code=...
+                    let parts: Vec<&str> = path_line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let path = parts[1];
+                        if let Some(query_start) = path.find('?') {
+                            let query = &path[query_start + 1..];
+                            let mut code = None;
+                            for pair in query.split('&') {
+                                let kv: Vec<&str> = pair.split('=').collect();
+                                if kv.len() == 2 && kv[0] == "code" {
+                                    if let Ok(decoded) = urlencoding::decode(kv[1]) {
+                                        code = Some(decoded.into_owned());
+                                    }
+                                }
+                            }
+                            if let Some(auth_code) = code {
+                                let response_body = "<html><head><title>SSO Login Successful</title><style>body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #121212; color: #e0e0e0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; } h1 { color: #4caf50; } p { color: #888; }</style></head><body><h1>SSO Login Successful!</h1><p>You can close this window now and return to your terminal.</p></body></html>";
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
+                                    response_body.len(),
+                                    response_body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.flush().await;
+                                return Some(auth_code);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn prompt_manual_sso_code_async() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| {
+        print!("Paste the redirected URL (or the 'code' parameter value): ");
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).map_err(|e| format!("Failed to read stdin: {}", e))?;
+        parse_auth_code(input.trim())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn parse_auth_code(input: &str) -> Result<String, String> {
     if input.contains("code=") {
         // It's a full URL or query string, parse it
@@ -263,16 +326,35 @@ async fn handle_login(
         println!("\nPlease open the following URL in a browser on your local device to authenticate:\n");
         println!("{}\n", auth_url);
 
-        // 3. Prompt the user for the redirect URL or auth code
+        // 3. Prompt the user or listen for automatic callback on port 8081
         println!("Once logged in, your browser will redirect to a page starting with '{}'.", redirect_uri);
-        print!("Paste the redirected URL (or the 'code' parameter value): ");
-        io::stdout().flush().unwrap();
-        let mut callback_input = String::new();
-        io::stdin()
-            .read_line(&mut callback_input)
-            .map_err(|e| format!("Failed to read redirect input: {}", e))?;
         
-        let code = parse_auth_code(callback_input.trim())?;
+        let (callback_tx, mut callback_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Some(code) = listen_for_sso_callback(8081).await {
+                let _ = callback_tx.send(code);
+            }
+        });
+
+        println!("Waiting for automatic browser callback on port 8081...");
+        println!("(If the browser doesn't automatically redirect, copy the URL/code and paste it below.)");
+
+        let code = tokio::select! {
+            code_from_server = &mut callback_rx => {
+                match code_from_server {
+                    Ok(c) => {
+                        println!("\nSuccessfully captured authorization code from browser callback!");
+                        c
+                    }
+                    Err(_) => {
+                        prompt_manual_sso_code_async().await?
+                    }
+                }
+            }
+            manual_input = prompt_manual_sso_code_async() => {
+                manual_input?
+            }
+        };
 
         // 4. Exchange authorization code for token
         println!("Exchanging authorization code for access token...");
