@@ -181,19 +181,6 @@ async fn handle_login(
         config.client_id = Some(cid.clone());
         config.client_secret = Some(csec.clone());
 
-        let email = match args.email.clone().or_else(|| session.email.clone()) {
-            Some(e) => e,
-            None => {
-                print!("Email Address: ");
-                io::stdout().flush().unwrap();
-                let mut input = String::new();
-                io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|e| format!("Failed to read email: {}", e))?;
-                input.trim().to_string()
-            }
-        };
-
         // Prompt for master password to verify we can derive the Master Key and decrypt the symmetric key
         let password = match args.password.clone() {
             Some(pass) => pass,
@@ -209,6 +196,10 @@ async fn handle_login(
             .master_password_unlock
             .as_ref()
             .ok_or_else(|| "MasterPasswordUnlock data missing from response.".to_string())?;
+
+        let email = args.email.clone()
+            .or_else(|| session.email.clone())
+            .unwrap_or_else(|| unlock_data.salt.clone());
 
         let kdf_type = unlock_data.kdf.kdf_type;
         let iterations = unlock_data.kdf.iterations;
