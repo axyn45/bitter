@@ -434,6 +434,7 @@ impl ApiClient {
 
     pub async fn exchange_sso_code(
         &self,
+        client_id: &str,
         code: &str,
         code_verifier: &str,
         redirect_uri: &str,
@@ -442,7 +443,7 @@ impl ApiClient {
 
         let mut params = HashMap::new();
         params.insert("grant_type", "authorization_code".to_string());
-        params.insert("client_id", "web".to_string());
+        params.insert("client_id", client_id.to_string());
         params.insert("redirect_uri", redirect_uri.to_string());
         params.insert("code", code.to_string());
         params.insert("code_verifier", code_verifier.to_string());
@@ -466,6 +467,29 @@ impl ApiClient {
             .map_err(|e| format!("Failed to parse SSO token response: {}", e))?;
 
         Ok(token_resp)
+    }
+
+    pub async fn fetch_sso_prevalidate_token(&self) -> Result<Option<String>, String> {
+        let url = format!("{}/sso/prevalidate", self.identity_url);
+        
+        let response = match self.client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => return Err(format!("SSO prevalidate request failed: {}", e)),
+        };
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        #[derive(Deserialize)]
+        struct PrevalidateResponse {
+            token: String,
+        }
+
+        match response.json::<PrevalidateResponse>().await {
+            Ok(json_resp) => Ok(Some(json_resp.token)),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Fetches the user's encrypted vault payload
