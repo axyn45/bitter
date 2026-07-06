@@ -69,6 +69,14 @@ pub struct LoginArgs {
     /// Custom Bitwarden server URL (e.g. self-hosted Vaultwarden)
     #[arg(short, long)]
     pub server: Option<String>,
+
+    /// Log in using SSO (Single Sign-On)
+    #[arg(long)]
+    pub sso: bool,
+
+    /// Organization identifier (required for SSO login)
+    #[arg(long)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Args)]

@@ -153,6 +153,26 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
     Ok(())
 }
 
+fn parse_auth_code(input: &str) -> Result<String, String> {
+    if input.contains("code=") {
+        // It's a full URL or query string, parse it
+        let url_parts: Vec<&str> = input.split('?').collect();
+        let query = url_parts.last().ok_or_else(|| "Invalid URL format".to_string())?;
+        for pair in query.split('&') {
+            let key_val: Vec<&str> = pair.split('=').collect();
+            if key_val.len() == 2 && key_val[0] == "code" {
+                return Ok(urlencoding::decode(key_val[1])
+                    .map_err(|e| e.to_string())?
+                    .into_owned());
+            }
+        }
+        Err("Authorization code not found in URL".to_string())
+    } else {
+        // It's already the raw code
+        Ok(input.to_string())
+    }
+}
+
 async fn handle_login(
     args: crate::cli::LoginArgs,
     config: &mut Config,
@@ -168,9 +188,106 @@ async fn handle_login(
     let client_id = args.client_id.or_else(|| config.client_id.clone());
     let client_secret = args.client_secret.or_else(|| config.client_secret.clone());
 
-    let (token_resp, master_key, email) = if let (Some(cid), Some(csec)) =
-        (client_id, client_secret)
-    {
+    let (token_resp, master_key, email) = if args.sso {
+        println!("Logging in using Single Sign-On (SSO)...");
+        
+        let org_id = match args.org_id.clone() {
+            Some(o) => o,
+            None => {
+                print!("Organization Identifier: ");
+                io::stdout().flush().unwrap();
+                let mut input = String::new();
+                io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| format!("Failed to read organization ID: {}", e))?;
+                input.trim().to_string()
+            }
+        };
+
+        if org_id.is_empty() {
+            return Err("Organization Identifier is required for SSO login.".to_string());
+        }
+
+        // 1. Generate PKCE Verifier and Challenge
+        let (code_verifier, code_challenge) = crypto::generate_pkce_pair();
+        let redirect_uri = "http://localhost:8081/sso-callback";
+
+        // 2. Build the authorization URL
+        let auth_url = format!(
+            "{}/identity/connect/authorize?response_type=code&scope=api%20offline_access\
+             &client_id=web&redirect_uri={}&code_challenge={}&code_challenge_method=S256\
+             &acr_values=idp:sso&organizationId={}",
+            server_url.trim_end_matches('/'),
+            urlencoding::encode(redirect_uri),
+            code_challenge,
+            org_id
+        );
+
+        println!("\nPlease open the following URL in a browser on your local device to authenticate:\n");
+        println!("{}\n", auth_url);
+
+        // 3. Prompt the user for the redirect URL or auth code
+        println!("Once logged in, your browser will redirect to a page starting with '{}'.", redirect_uri);
+        print!("Paste the redirected URL (or the 'code' parameter value): ");
+        io::stdout().flush().unwrap();
+        let mut callback_input = String::new();
+        io::stdin()
+            .read_line(&mut callback_input)
+            .map_err(|e| format!("Failed to read redirect input: {}", e))?;
+        
+        let code = parse_auth_code(callback_input.trim())?;
+
+        // 4. Exchange authorization code for token
+        println!("Exchanging authorization code for access token...");
+        let resp = api_client.exchange_sso_code(&code, &code_verifier, redirect_uri).await?;
+
+        // 5. Prompt for Master Password to verify master key and decrypt vault keys
+        let password = match args.password.clone() {
+            Some(pass) => pass,
+            None => rpassword::prompt_password("Master Password (to decrypt vault keys): ")
+                .map_err(|e| format!("Password prompt failed: {}", e))?,
+        };
+
+        // Extract KDF parameters from the login response
+        let decrypt_opts = resp.user_decryption_options.as_ref()
+            .ok_or_else(|| "UserDecryptionOptions missing from SSO response. Ensure your account is fully set up.".to_string())?;
+
+        let unlock_data = decrypt_opts
+            .master_password_unlock
+            .as_ref()
+            .ok_or_else(|| "MasterPasswordUnlock data missing from response.".to_string())?;
+
+        let email = args.email.clone()
+            .or_else(|| session.email.clone())
+            .unwrap_or_else(|| unlock_data.salt.clone());
+
+        let kdf_type = unlock_data.kdf.kdf_type;
+        let iterations = unlock_data.kdf.iterations;
+        let memory = unlock_data.kdf.memory;
+        let parallelism = unlock_data.kdf.parallelism;
+        let salt_email = &unlock_data.salt;
+
+        println!("Deriving master key to verify password...");
+        let master_key = match kdf_type {
+            0 => crypto::derive_master_key_pbkdf2(&password, salt_email, iterations)?,
+            1 => {
+                let mem = memory.ok_or_else(|| {
+                    "Argon2 memory parameter missing from KDF settings".to_string()
+                })?;
+                let para = parallelism.ok_or_else(|| {
+                    "Argon2 parallelism parameter missing from KDF settings".to_string()
+                })?;
+                crypto::derive_master_key_argon2(&password, salt_email, iterations, mem, para)?
+            }
+            t => return Err(format!("Unsupported KDF type: {}", t)),
+        };
+
+        println!("Decrypting vault symmetric keys...");
+        let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
+        println!("Vault keys decrypted and verified successfully.");
+
+        (resp, master_key, email)
+    } else if let (Some(cid), Some(csec)) = (client_id, client_secret) {
         println!("Logging in using Personal API Key client credentials...");
 
         let resp = api_client

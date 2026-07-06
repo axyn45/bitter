@@ -34,3 +34,4 @@ rsa = { version = "0.9.10", features = ["sha2"] }
 sha1 = "0.10.6"
 sha2 = "0.10.9"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+urlencoding = "2.1.3"

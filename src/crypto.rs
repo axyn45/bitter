@@ -265,6 +265,24 @@ pub fn decrypt_rsa_oaep_sha256(priv_key_der: &[u8], ciphertext: &[u8]) -> Result
         .map_err(|e| format!("RSA-OAEP-SHA256 decryption failed: {}", e))
 }
 
+/// Generates a PKCE code verifier (base64url unpadded) and its SHA-256 code challenge (base64url unpadded)
+pub fn generate_pkce_pair() -> (String, String) {
+    use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+    use ring::rand::{SecureRandom, SystemRandom};
+    use ring::digest;
+
+    let rand_gen = SystemRandom::new();
+    let mut verifier_bytes = [0u8; 32];
+    let _ = rand_gen.fill(&mut verifier_bytes);
+    
+    let code_verifier = BASE64_URL_SAFE_NO_PAD.encode(verifier_bytes);
+    
+    let sha256_hash = digest::digest(&digest::SHA256, code_verifier.as_bytes());
+    let code_challenge = BASE64_URL_SAFE_NO_PAD.encode(sha256_hash.as_ref());
+    
+    (code_verifier, code_challenge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

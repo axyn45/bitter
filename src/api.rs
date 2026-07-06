@@ -432,6 +432,42 @@ impl ApiClient {
         Ok(token_resp)
     }
 
+    pub async fn exchange_sso_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<TokenResponse, String> {
+        let url = format!("{}/connect/token", self.identity_url);
+
+        let mut params = HashMap::new();
+        params.insert("grant_type", "authorization_code".to_string());
+        params.insert("client_id", "web".to_string());
+        params.insert("redirect_uri", redirect_uri.to_string());
+        params.insert("code", code.to_string());
+        params.insert("code_verifier", code_verifier.to_string());
+
+        let response = self
+            .client
+            .post(&url)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("SSO token exchange request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(format!("SSO token exchange failed: {}", err_text));
+        }
+
+        let token_resp: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse SSO token response: {}", e))?;
+
+        Ok(token_resp)
+    }
+
     /// Fetches the user's encrypted vault payload
     pub async fn sync(&self, access_token: &str) -> Result<SyncResponse, String> {
         let url = format!("{}/sync?excludeDomains=true", self.api_url);
