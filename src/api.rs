@@ -451,6 +451,7 @@ impl ApiClient {
         params.insert("deviceIdentifier", device_id.to_string());
         params.insert("deviceName", "bitter_client".to_string());
         params.insert("deviceType", "9".to_string());
+        params.insert("scope", "api offline_access".to_string());
 
         let response = self
             .client
