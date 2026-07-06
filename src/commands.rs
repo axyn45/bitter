@@ -208,29 +208,40 @@ async fn handle_login(
             return Err("Organization Identifier is required for SSO login.".to_string());
         }
 
-        // 1. Generate PKCE Verifier and Challenge
+        // 1. Generate PKCE Verifier and Challenge and State
         let (code_verifier, code_challenge) = crypto::generate_pkce_pair();
-        let client_id = "cli";
-        let redirect_uri = "http://localhost:8081/sso-callback";
+        let state = uuid::Uuid::new_v4().to_string();
 
         // Try to fetch Vaultwarden SSO prevalidate token if available
         println!("Retrieving SSO pre-validation token...");
         let sso_token = api_client.fetch_sso_prevalidate_token().await.unwrap_or(None);
 
+        let (client_id, redirect_uri) = match sso_token {
+            Some(_) => (
+                "web",
+                format!("{}/sso-connector.html", server_url.trim_end_matches('/')),
+            ),
+            None => (
+                "cli",
+                "http://localhost:8081/sso-callback".to_string(),
+            ),
+        };
+
         // 2. Build the authorization URL
         let auth_url = match sso_token {
-            Some(token) => {
+            Some(ref token) => {
                 // Vaultwarden OIDC SSO flow
                 format!(
                     "{}/identity/connect/authorize?response_type=code&scope=api%20offline_access\
                      &client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256\
-                     &response_mode=query&_identifier={}&ssoToken={}",
+                     &response_mode=query&state={}&_identifier={}&ssoToken={}",
                     server_url.trim_end_matches('/'),
                     client_id,
-                    urlencoding::encode(redirect_uri),
+                    urlencoding::encode(&redirect_uri),
                     code_challenge,
+                    urlencoding::encode(&state),
                     org_id,
-                    urlencoding::encode(&token)
+                    urlencoding::encode(token)
                 )
             }
             None => {
@@ -238,11 +249,12 @@ async fn handle_login(
                 format!(
                     "{}/identity/connect/authorize?response_type=code&scope=api%20offline_access\
                      &client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256\
-                     &acr_values=idp:sso&organizationId={}",
+                     &state={}&acr_values=idp:sso&organizationId={}",
                     server_url.trim_end_matches('/'),
                     client_id,
-                    urlencoding::encode(redirect_uri),
+                    urlencoding::encode(&redirect_uri),
                     code_challenge,
+                    urlencoding::encode(&state),
                     org_id
                 )
             }
@@ -264,7 +276,7 @@ async fn handle_login(
 
         // 4. Exchange authorization code for token
         println!("Exchanging authorization code for access token...");
-        let resp = api_client.exchange_sso_code(client_id, &code, &code_verifier, redirect_uri).await?;
+        let resp = api_client.exchange_sso_code(client_id, &code, &code_verifier, &redirect_uri).await?;
 
         // 5. Prompt for Master Password to verify master key and decrypt vault keys
         let password = match args.password.clone() {
