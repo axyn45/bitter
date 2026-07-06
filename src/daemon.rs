@@ -86,7 +86,7 @@ pub fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) -> Res
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&control_socket_path);
 
-    info!("Starting sshwarden agent...");
+    info!("Starting sshwarden daemon...");
     info!("SSH_AUTH_SOCK={}", socket_path.display());
 
     if !background {
@@ -153,7 +153,7 @@ pub fn stop_agent() -> Result<(), String> {
         .parse()
         .map_err(|e| format!("Invalid pid format: {}", e))?;
 
-    info!("Stopping agent with PID {}...", pid);
+    info!("Stopping daemon with PID {}...", pid);
 
     // SAFETY: `libc::kill` is a standard Unix system call. We pass `pid` (parsed from the local
     // pid file) and a standard signal constant `libc::SIGTERM`. This call is memory safe as it only
