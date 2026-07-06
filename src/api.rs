@@ -438,6 +438,7 @@ impl ApiClient {
         code: &str,
         code_verifier: &str,
         redirect_uri: &str,
+        device_id: &str,
     ) -> Result<TokenResponse, String> {
         let url = format!("{}/connect/token", self.identity_url);
 
@@ -447,6 +448,9 @@ impl ApiClient {
         params.insert("redirect_uri", redirect_uri.to_string());
         params.insert("code", code.to_string());
         params.insert("code_verifier", code_verifier.to_string());
+        params.insert("deviceIdentifier", device_id.to_string());
+        params.insert("deviceName", "bitter_client".to_string());
+        params.insert("deviceType", "9".to_string());
 
         let response = self
             .client

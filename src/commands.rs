@@ -276,7 +276,7 @@ async fn handle_login(
 
         // 4. Exchange authorization code for token
         println!("Exchanging authorization code for access token...");
-        let resp = api_client.exchange_sso_code(client_id, &code, &code_verifier, &redirect_uri).await?;
+        let resp = api_client.exchange_sso_code(client_id, &code, &code_verifier, &redirect_uri, &session.device_id).await?;
 
         // 5. Prompt for Master Password to verify master key and decrypt vault keys
         let password = match args.password.clone() {
