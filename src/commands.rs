@@ -281,8 +281,7 @@ async fn handle_login(
         // 5. Prompt for Master Password to verify master key and decrypt vault keys
         let password = match args.password.clone() {
             Some(pass) => pass,
-            None => rpassword::prompt_password("Master Password (to decrypt vault keys): ")
-                .map_err(|e| format!("Password prompt failed: {}", e))?,
+            None => crypto::prompt_master_password(Some("Master Password (to decrypt vault keys): "))?,
         };
 
         // Extract KDF parameters from the login response
@@ -338,8 +337,7 @@ async fn handle_login(
         // Prompt for master password to verify we can derive the Master Key and decrypt the symmetric key
         let password = match args.password.clone() {
             Some(pass) => pass,
-            None => rpassword::prompt_password("Master Password (to decrypt vault keys): ")
-                .map_err(|e| format!("Password prompt failed: {}", e))?,
+            None => crypto::prompt_master_password(Some("Master Password (to decrypt vault keys): "))?,
         };
 
         // Extract KDF parameters from the login response (under UserDecryptionOptions)
@@ -398,8 +396,7 @@ async fn handle_login(
 
         let password = match args.password {
             Some(pass) => pass,
-            None => rpassword::prompt_password("Master Password: ")
-                .map_err(|e| format!("Password prompt failed: {}", e))?,
+            None => crypto::prompt_master_password(None)?,
         };
 
         println!("Fetching KDF settings for {}...", email);
@@ -518,8 +515,7 @@ async fn handle_sync(config: &mut Config, session: &mut Session) -> Result<(), S
             mac_key: mac,
         },
         None => {
-            let password = rpassword::prompt_password("Master Password (to decrypt vault keys): ")
-                .map_err(|e| format!("Password prompt failed: {}", e))?;
+            let password = crypto::prompt_master_password(Some("Master Password (to decrypt vault keys): "))?;
 
             let email = session.email.as_ref().ok_or_else(|| {
                 "Email address missing from session. Please log in again.".to_string()
@@ -578,10 +574,7 @@ async fn handle_settings(
                     .clone()
                     .ok_or_else(|| "Access token missing from session".to_string())?;
 
-                let password = rpassword::prompt_password(
-                    "Enter Master Password to verify and enable 'never' timeout: ",
-                )
-                .map_err(|e| format!("Password prompt failed: {}", e))?;
+                let password = crypto::prompt_master_password(Some("Enter Master Password to verify and enable 'never' timeout: "))?;
 
                 let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
                 let mut verified = false;
@@ -780,8 +773,7 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         .clone()
         .ok_or_else(|| "Not logged in. Please run 'bitter login' first.".to_string())?;
 
-    let password = rpassword::prompt_password("Master Password: ")
-        .map_err(|e| format!("Password prompt failed: {}", e))?;
+    let password = crypto::prompt_master_password(None)?;
 
     let api_client = ApiClient::new(&config.server_url);
 

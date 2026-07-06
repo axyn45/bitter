@@ -283,6 +283,13 @@ pub fn generate_pkce_pair() -> (String, String) {
     (code_verifier, code_challenge)
 }
 
+/// Securely prompts the user for their master password in the terminal
+pub fn prompt_master_password(custom_prompt: Option<&str>) -> Result<String, String> {
+    let prompt = custom_prompt.unwrap_or("Master Password: ");
+    rpassword::prompt_password(prompt)
+        .map_err(|e| format!("Password prompt failed: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
