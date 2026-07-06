@@ -845,6 +845,9 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         let repo = storage::VaultRepository::open(&db_path)?;
         let sync_resp = repo.load_sync_response()?;
         let (ciphers, enc_key, mac_key) = storage::decrypt_sync_response_offline(&sync_resp, &password)?;
+        if config.timeout.trim().to_lowercase() == "never" {
+            repo.save_saved_keys(&enc_key, &mac_key)?;
+        }
         let cache_keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
         if cache_keys.is_empty() {
             return Err(

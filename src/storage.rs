@@ -327,7 +327,7 @@ impl VaultRepository {
 
     pub fn save_session(&self, session: &Session) -> Result<(), String> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO session_metadata (id, email, device_id, access_token, refresh_token, last_sync_time, server_url) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+            "UPDATE session_metadata SET email = ?1, device_id = ?2, access_token = ?3, refresh_token = ?4, last_sync_time = ?5, server_url = ?6 WHERE id = 1",
             rusqlite::params![
                 &session.email,
                 &session.device_id,
