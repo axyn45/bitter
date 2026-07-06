@@ -1,3 +1,4 @@
 vaultwarden
 target/
 .env
+tmp
