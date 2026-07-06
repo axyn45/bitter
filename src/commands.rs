@@ -117,7 +117,7 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
         }
         Commands::StartSsh => {
             if !daemon::is_agent_running() {
-                return Err("Agent daemon is not running. Please start the daemon first using 'sshwarden start'.".to_string());
+                return Err("Agent daemon is not running. Please start the daemon first using 'bitter start'.".to_string());
             }
             println!("Requesting running daemon to start SSH agent loop...");
             let resp = daemon::send_control_request(daemon::ControlRequest::StartSshAgent).await?;
@@ -174,7 +174,7 @@ async fn handle_login(
         println!("Logging in using Personal API Key client credentials...");
 
         let resp = api_client
-            .login_api_key(&cid, &csec, &session.device_id, "sshwarden_client")
+            .login_api_key(&cid, &csec, &session.device_id, "bitter_client")
             .await?;
 
         // Save credentials in config
@@ -276,7 +276,7 @@ async fn handle_login(
         println!("Authenticating with server...");
 
         let resp = api_client
-            .login_password(&email, &login_hash, &session.device_id, "sshwarden_client")
+            .login_password(&email, &login_hash, &session.device_id, "bitter_client")
             .await?;
 
         println!("Decrypting vault symmetric keys...");
@@ -620,7 +620,7 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
     let token = session
         .access_token
         .clone()
-        .ok_or_else(|| "Not logged in. Please run 'sshwarden login' first.".to_string())?;
+        .ok_or_else(|| "Not logged in. Please run 'bitter login' first.".to_string())?;
 
     let password = rpassword::prompt_password("Master Password: ")
         .map_err(|e| format!("Password prompt failed: {}", e))?;
@@ -731,7 +731,7 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
 }
 
 async fn handle_status(config: &Config, session: &Session) -> Result<(), String> {
-    println!("sshwarden Status:");
+    println!("bitter Status:");
     let active_url = session.server_url.as_deref().unwrap_or(&config.server_url);
     println!("  Server URL:     {}", active_url);
 

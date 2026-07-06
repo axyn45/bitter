@@ -86,7 +86,7 @@ pub fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) -> Res
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(&control_socket_path);
 
-    info!("Starting sshwarden daemon...");
+    info!("Starting bitter daemon...");
     info!("SSH_AUTH_SOCK={}", socket_path.display());
 
     if !background {
@@ -219,7 +219,7 @@ pub async fn send_control_request(req: ControlRequest) -> Result<ControlResponse
 
     if !is_agent_running() {
         return Err(
-            "Agent is not running. Start it first with 'sshwarden start'".to_string(),
+            "Agent is not running. Start it first with 'bitter start'".to_string(),
         );
     }
 
@@ -1294,7 +1294,7 @@ async fn prompt_tty_for_unlock(
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) };
     }
 
-    tty.write_all(b"\r\n[sshwarden] SSH Agent request received, but vault is locked.\r\nMaster Password: ")
+    tty.write_all(b"\r\n[bitter] SSH Agent request received, but vault is locked.\r\nMaster Password: ")
         .map_err(|e| e.to_string())?;
     let _ = tty.flush();
 
@@ -1346,7 +1346,7 @@ async fn prompt_tty_for_unlock(
         mac_key,
     });
 
-    tty.write_all(format!("[sshwarden] Vault unlocked successfully. Loaded {} keys.\r\n\n", count).as_bytes())
+    tty.write_all(format!("[bitter] Vault unlocked successfully. Loaded {} keys.\r\n\n", count).as_bytes())
         .map_err(|e| e.to_string())?;
     let _ = tty.flush();
 

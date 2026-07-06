@@ -1,6 +1,6 @@
-# sshwarden: Headless Bitwarden SSH Agent & Terminal Vault Client
+# bitter: Headless Bitwarden SSH Agent & Terminal Vault Client
 
-`sshwarden` is a headless, server-friendly Bitwarden client implemented in Rust that acts as a local SSH agent and terminal vault client. It allows users to securely use SSH keys stored in their Bitwarden vaults on headless Linux servers without requiring the official graphical Bitwarden Desktop client, while providing a full terminal interface for vault interaction.
+`bitter` is a headless, server-friendly Bitwarden client implemented in Rust that acts as a local SSH agent and terminal vault client. It allows users to securely use SSH keys stored in their Bitwarden vaults on headless Linux servers without requiring the official graphical Bitwarden Desktop client, while providing a full terminal interface for vault interaction.
 
 ---
 
@@ -34,7 +34,7 @@
 
 ```mermaid
 graph TD
-    CLI[CLI / sshwarden binary] -->|Command invocation| Config[Config & Settings]
+    CLI[CLI / bitter binary] -->|Command invocation| Config[Config & Settings]
     CLI -->|Interactive Unlock/Sync| Core[Core Lib / Crypto]
     Daemon[Agent Daemon] -->|Serves keys| Socket[Unix Domain Socket]
     Daemon -->|Loads encrypted keys| SecureMem[Secure Memory / Kernel Keyring]
@@ -62,7 +62,7 @@ A single cargo crate with clear module separation:
 ## 3. Detailed Component Designs
 
 ### A. Authentication & Cryptography
-To interact with Bitwarden, `sshwarden` implements the client-side cryptographic standard of Bitwarden:
+To interact with Bitwarden, `bitter` implements the client-side cryptographic standard of Bitwarden:
 1. **Key Derivation (KDF)**:
    - On login, fetch the user's KDF settings (PBKDF2 or Argon2id) from the API using their email.
    - Derives the **Master Key** using the password, salt (email), and KDF parameters.
@@ -75,10 +75,10 @@ To interact with Bitwarden, `sshwarden` implements the client-side cryptographic
 
 ### B. Storage Design (Session vs Config)
 All files are stored according to the XDG Base Directory Specification:
-- **Configuration (`~/.config/sshwarden/config.toml`)**: Contains server URL, KDF parameters, username, timeout configurations, and custom socket paths. Contains no secrets.
-- **Session Credentials (`~/.config/sshwarden/session.json`)**: Contains `email`, `device_id`, `access_token`, and `refresh_token`. Initialized with strict `0600` owner permissions.
-- **Encrypted Cache (`~/.cache/sshwarden/vault.db`)**: Contains synced SSH key ciphers and general credentials encrypted using the local DB key.
-- **Socket Path**: `~/.cache/sshwarden/ssh-agent.sock` (and control socket at `.control`).
+- **Configuration (`~/.config/bitter/config.toml`)**: Contains server URL, KDF parameters, username, timeout configurations, and custom socket paths. Contains no secrets.
+- **Session Credentials (`~/.config/bitter/session.json`)**: Contains `email`, `device_id`, `access_token`, and `refresh_token`. Initialized with strict `0600` owner permissions.
+- **Encrypted Cache (`~/.cache/bitter/vault.db`)**: Contains synced SSH key ciphers and general credentials encrypted using the local DB key.
+- **Socket Path**: `~/.cache/bitter/ssh-agent.sock` (and control socket at `.control`).
 
 ### C. SSH Agent Daemon & TTY Hijacking
 The SSH agent runs as a background daemon process.
@@ -90,12 +90,12 @@ The SSH agent runs as a background daemon process.
 The timeout daemon keeps track of the time elapsed since the last SSH signature request or user interaction:
 - **Lock Action**:
   - Wipes the decrypted SSH keys from memory.
-  - Requires `sshwarden unlock` (master password input) to re-load and decrypt the local cache into memory.
+  - Requires `bitter unlock` (master password input) to re-load and decrypt the local cache into memory.
 - **Logout Action**:
   - Wipes decrypted SSH keys from memory.
-  - Deletes `~/.cache/sshwarden/vault.db` (encrypted cache).
+  - Deletes `~/.cache/bitter/vault.db` (encrypted cache).
   - Deletes the session token file `session.json`.
-  - Requires full `sshwarden login` and `sshwarden sync` to be used again.
+  - Requires full `bitter login` and `bitter sync` to be used again.
 
 ### E. Advanced Login Methods
 1. **SSO Authentication**:
@@ -117,7 +117,7 @@ The timeout daemon keeps track of the time elapsed since the last SSH signature 
 
 ## 4. SSH Key Representation in Bitwarden
 
-Bitwarden supports SSH keys natively and via custom fields. `sshwarden` supports:
+Bitwarden supports SSH keys natively and via custom fields. `bitter` supports:
 1. **Native SSH Key Items**: Bitwarden's standard SSH key type (type `100`).
 2. **Secure Notes with Attachments**: Secure notes with standard names containing private keys.
 3. **Login / Note Items with Custom Fields**: Items where the private key is stored in a custom field named `ssh_private_key` or similar.
@@ -135,12 +135,12 @@ Bitwarden supports SSH keys natively and via custom fields. `sshwarden` supports
 - Implement Bitwarden client cryptography (KDF, PBKDF2, Argon2id, Master Key derivation).
 - Implement Bitwarden Login API (Password, API key auth, self-hosted endpoints).
 - Implement Vault Sync API (`/sync`).
-- Write CLI command `sshwarden login` and `sshwarden sync`.
+- Write CLI command `bitter login` and `bitter sync`.
 
 ### Phase 3: Secure Local Storage & Cache (Complete)
 - Implement secure encryption/decryption of the local vault cache.
 - Implement the filtering logic to store only SSH keys.
-- Write CLI command `sshwarden keys list/add/delete/edit` to manipulate vault ciphers.
+- Write CLI command `bitter keys list/add/delete/edit` to manipulate vault ciphers.
 
 ### Phase 4: SSH Agent Protocol & Unix Socket (Complete)
 - Implement SSH Agent Protocol parser.

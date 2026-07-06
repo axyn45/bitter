@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "sshwarden",
-    about = "Headless Bitwarden SSH Agent Client",
+    name = "bitter",
+    about = "Bitwarden Terminal Client & SSH Agent",
     version
 )]
 pub struct Cli {
@@ -44,7 +44,7 @@ pub enum Commands {
     /// Unlock the agent by supplying the master password
     Unlock,
 
-    /// View global status of sshwarden
+    /// View global status of bitter
     Status,
 }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Building sshwarden release..."
+echo "Building bitter release..."
 
 # Ensure target is installed
 if ! rustup target list --installed | grep -q "x86_64-unknown-linux-musl"; then
@@ -15,7 +15,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 # Create dist directory
 mkdir -p dist
-cp target/x86_64-unknown-linux-musl/release/sshwarden dist/
+cp target/x86_64-unknown-linux-musl/release/bitter dist/
 
-echo "Build complete! Statically linked binary is at: dist/sshwarden"
-file dist/sshwarden
+echo "Build complete! Statically linked binary is at: dist/bitter"
+file dist/bitter

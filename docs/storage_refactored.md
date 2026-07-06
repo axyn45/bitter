@@ -1,6 +1,6 @@
 # Storage Refactoring Plan: SQLite Migration, Normalization & Active Repository CRUD
 
-This document outlines the detailed architecture and implementation plan to migrate `sshwarden`'s local cache storage from JSON to a fully normalized SQLite database, utilizing the **Repository Pattern** for active, granular CRUD operations.
+This document outlines the detailed architecture and implementation plan to migrate `bitter`'s local cache storage from JSON to a fully normalized SQLite database, utilizing the **Repository Pattern** for active, granular CRUD operations.
 
 ---
 

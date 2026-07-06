@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use tracing;
 
-const APP_NAME: &str = "sshwarden";
+const APP_NAME: &str = "bitter";
 const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,7 +109,7 @@ impl Config {
             .map_err(|e| format!("Invalid timeout duration value '{}': {}", val_str, e))?;
         Ok(Some(std::time::Duration::from_secs(val * multiplier)))
     }
-    /// Gets the standard configuration directory for sshwarden
+    /// Gets the standard configuration directory for bitter
     pub fn config_dir() -> Option<PathBuf> {
         ProjectDirs::from("com", "", APP_NAME).map(|proj| proj.config_dir().to_path_buf())
     }

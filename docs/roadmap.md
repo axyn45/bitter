@@ -1,6 +1,6 @@
-# sshwarden: Development Roadmap & Checklist
+# bitter: Development Roadmap & Checklist
 
-This document tracks the step-by-step progress of the `sshwarden` project, including the new feature expansion roadmap.
+This document tracks the step-by-step progress of the `bitter` project, including the new feature expansion roadmap.
 
 ---
 
@@ -33,9 +33,9 @@ This document tracks the step-by-step progress of the `sshwarden` project, inclu
   - [x] Parse and extract SSH keys from Secure Notes containing PEM/OpenSSH private key text
   - [x] Parse and extract SSH keys from Logins containing custom `ssh_private_key` fields
 - [x] Implement local vault keys management CLI commands
-  - [x] `sshwarden keys list`: List all synced SSH keys
-  - [x] `sshwarden sync`: Manually trigger synchronization and refresh local cache
-  - [x] `sshwarden keys add / edit / delete`: Modifying keys (Placeholder, deferred for post-agent implementation)
+  - [x] `bitter keys list`: List all synced SSH keys
+  - [x] `bitter sync`: Manually trigger synchronization and refresh local cache
+  - [x] `bitter keys add / edit / delete`: Modifying keys (Placeholder, deferred for post-agent implementation)
 
 ## Phase 4: SSH Agent Protocol & Unix Socket
 - [x] Implement SSH Agent Protocol parser (`agent` module)
@@ -47,7 +47,7 @@ This document tracks the step-by-step progress of the `sshwarden` project, inclu
 - [x] Implement signing operations for standard SSH keys
   - [x] RSA, Ed25519, and ECDSA signature algorithms
 - [x] Implement daemonization (`daemonize` crate)
-  - [x] Launch `sshwarden agent start` to spin off the background agent process
+  - [x] Launch `bitter agent start` to spin off the background agent process
   - [x] Auto-generate and clean up Unix socket file
 
 ## Phase 5: Session Timeout & Security Hardening
@@ -63,9 +63,9 @@ This document tracks the step-by-step progress of the `sshwarden` project, inclu
   - [x] Synchronize concurrent client connection prompts using Tokio `Mutex`
 - [x] Implement active user session checks (auto-quit daemon on zero active sessions)
 - [x] Implement Timeout Actions
-  - [x] **Lock**: Wipe decrypted keys from memory, requires `sshwarden unlock` (master password) to restore
+  - [x] **Lock**: Wipe decrypted keys from memory, requires `bitter unlock` (master password) to restore
   - [x] **Logout**: Wipe decrypted keys, delete local encrypted cache database, clear authentication tokens
-- [x] Implement `sshwarden unlock` subcommand
+- [x] Implement `bitter unlock` subcommand
   - [x] Securely prompt for master password, derive master key, and restore daemon to active state
 
 ## Phase 6: WebSocket Live Sync

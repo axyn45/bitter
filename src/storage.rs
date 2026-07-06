@@ -13,7 +13,7 @@ use crate::config::Session;
 use crate::crypto;
 
 #[cfg(not(test))]
-const APP_NAME: &str = "sshwarden";
+const APP_NAME: &str = "bitter";
 const DB_FILE_NAME: &str = "vault.db";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ pub struct CipherItem {
 pub fn cache_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        Some(std::env::temp_dir().join("sshwarden_test"))
+        Some(std::env::temp_dir().join("bitter_test"))
     }
     #[cfg(not(test))]
     {
