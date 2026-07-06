@@ -312,25 +312,42 @@ async fn run_daemon_loops(
     let repo = storage::VaultRepository::open(&db_path)?;
 
     if config.timeout.trim().to_lowercase() == "never" {
-        if let Some(raw_keys) = storage::load_unencrypted_db() {
-            let count = raw_keys.len();
-            *keyring.write().await = raw_keys;
+        let mut enc_bytes = [0u8; 32];
+        let mut mac_bytes = [0u8; 32];
+        let mut keys_loaded = false;
 
-            let mut enc_bytes = [0u8; 32];
-            let mut mac_bytes = [0u8; 32];
-            if let Ok(Some((enc, mac))) = repo.load_saved_keys() {
-                enc_bytes = enc;
-                mac_bytes = mac;
-                info!("Agent started: loaded decryption keys from secure cache.");
+        if let Ok(Some((enc, mac))) = repo.load_saved_keys() {
+            enc_bytes = enc;
+            mac_bytes = mac;
+            keys_loaded = true;
+            info!("Agent started: loaded decryption keys from secure cache.");
+        }
+
+        if keys_loaded {
+            if let Ok(sync_resp) = repo.load_sync_response() {
+                let decrypted = storage::parse_and_decrypt_all_ciphers(&sync_resp, &enc_bytes, &mac_bytes);
+                let raw_keys = storage::extract_ssh_keys_from_ciphers(&decrypted);
+                
+                let mut parsed_keys = Vec::new();
+                for item in raw_keys {
+                    if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(&item.private_key) {
+                        pkey.set_comment(&item.name);
+                        parsed_keys.push(pkey);
+                    }
+                }
+                
+                let count = parsed_keys.len();
+                *keyring.write().await = parsed_keys;
+                *keys_context.write().await = Some(KeysContext {
+                    enc_key: enc_bytes,
+                    mac_key: mac_bytes,
+                });
+                info!("Agent started: automatically unlocked and loaded {} keys from cache.", count);
             } else {
-                info!("Agent started: decryption keys missing, running in read-only cache mode until unlocked.");
+                info!("Agent started: failed to load ciphers from cache.");
             }
-
-            *keys_context.write().await = Some(KeysContext {
-                enc_key: enc_bytes,
-                mac_key: mac_bytes,
-            });
-            info!("Agent started: automatically unlocked and loaded {} keys from unencrypted cache.", count);
+        } else {
+            info!("Agent started: decryption keys missing, running in locked state.");
         }
     }
 
@@ -690,9 +707,8 @@ async fn handle_control_connection(
                     *shared_timeout.write().await = t;
                     *shared_timeout_action.write().await = config.timeout_action;
 
-                    // If timeout is not "never", remove unencrypted DB and keys if they exist
+                    // If timeout is not "never", clear saved keys if they exist
                     if config.timeout.trim().to_lowercase() != "never" {
-                        let _ = storage::wipe_unencrypted_cache();
                         if let Some(path) = storage::db_path() {
                             if let Ok(repo) = storage::VaultRepository::open(&path) {
                                 let _ = repo.clear_saved_keys();

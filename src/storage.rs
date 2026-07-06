@@ -72,12 +72,6 @@ pub fn db_path() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join(DB_FILE_NAME))
 }
 
-const RAW_DB_FILE_NAME: &str = "vault.db.raw";
-
-/// Gets the path to the vault.db.raw file (unencrypted cache)
-pub fn unencrypted_db_path() -> Option<PathBuf> {
-    cache_dir().map(|dir| dir.join(RAW_DB_FILE_NAME))
-}
 
 
 /// Load and decrypt the local cache database from disk
@@ -962,80 +956,23 @@ pub fn wipe_db() -> Result<(), String> {
         fs::remove_file(&path)
             .map_err(|e| format!("Failed to delete cache database file: {}", e))?;
     }
-    if let Some(raw_path) = unencrypted_db_path() {
-        if raw_path.exists() {
-            fs::remove_file(&raw_path)
-                .map_err(|e| format!("Failed to delete unencrypted cache database file: {}", e))?;
-        }
-    }
-    Ok(())
-}
-
-/// Delete only the unencrypted raw cache database (used when timeout changes from "never")
-pub fn wipe_unencrypted_cache() -> Result<(), String> {
-    if let Some(raw_path) = unencrypted_db_path() {
-        if raw_path.exists() {
-            fs::remove_file(&raw_path)
-                .map_err(|e| format!("Failed to delete unencrypted cache database file: {}", e))?;
-        }
-    }
     Ok(())
 }
 
 pub fn handle_post_sync(
-    sync_response: &SyncResponse,
+    _sync_response: &SyncResponse,
     repo: &VaultRepository,
     enc_key: &[u8; 32],
     mac_key: &[u8; 32],
 ) -> Result<(), String> {
     if let Ok(config) = crate::config::Config::load() {
         if config.timeout.trim().to_lowercase() == "never" {
-            if let Some(raw_path) = unencrypted_db_path() {
-                let decrypted_items = parse_and_decrypt_all_ciphers(sync_response, enc_key, mac_key);
-                let pretty_json = serde_json::to_vec_pretty(&decrypted_items)
-                    .map_err(|e| format!("Failed to serialize unencrypted database: {}", e))?;
-                fs::write(&raw_path, &pretty_json)
-                    .map_err(|e| format!("Failed to write unencrypted cache: {}", e))?;
-                
-                let file = File::open(&raw_path)
-                    .map_err(|e| format!("Failed to open unencrypted cache file to set permissions: {}", e))?;
-                let mut perms = file.metadata().map_err(|e| e.to_string())?.permissions();
-                perms.set_mode(0o600);
-                file.set_permissions(perms)
-                    .map_err(|e| format!("Failed to set permissions on unencrypted cache: {}", e))?;
-            }
             repo.save_saved_keys(enc_key, mac_key)?;
         } else {
-            let _ = wipe_unencrypted_cache();
             repo.clear_saved_keys()?;
         }
     }
     Ok(())
-}
-
-
-/// Load unencrypted SSH keys from raw cache database if timeout is "never"
-pub fn load_unencrypted_db() -> Option<Vec<ssh_key::private::PrivateKey>> {
-    let raw_path = unencrypted_db_path()?;
-    if !raw_path.exists() {
-        return None;
-    }
-
-    let mut file = File::open(&raw_path).ok()?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-
-    let items: Vec<CipherItem> = serde_json::from_slice(&data).ok()?;
-    let ssh_items = extract_ssh_keys_from_ciphers(&items);
-
-    let mut parsed_keys = Vec::new();
-    for item in ssh_items {
-        if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(&item.private_key) {
-            pkey.set_comment(&item.name);
-            parsed_keys.push(pkey);
-        }
-    }
-    Some(parsed_keys)
 }
 
 /// Extracts SSH keys from generic decrypted ciphers list

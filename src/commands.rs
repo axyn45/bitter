@@ -662,7 +662,7 @@ async fn handle_settings(
                 }
 
                 if verified_locally {
-                    // Verified locally. Save config and generate unencrypted backup.
+                    // Verified locally. Save config and save decryption keys.
                     config.timeout = t.clone();
                     println!("Timeout updated to: {}", t);
                     config
@@ -670,9 +670,9 @@ async fn handle_settings(
                         .map_err(|e| format!("Failed to save configuration: {}", e))?;
 
                     if let (Some(sync_resp), Some((enc, mac))) = (loaded_sync_resp, decrypted_keys) {
-                        println!("Generating unencrypted cache database...");
+                        println!("Saving decryption keys to database...");
                         if let Err(e) = storage::handle_post_sync(&sync_resp, &repo, &enc, &mac) {
-                            eprintln!("Warning: Failed to generate unencrypted cache: {}", e);
+                            eprintln!("Warning: Failed to save decryption keys: {}", e);
                         }
                     }
                 }
@@ -685,8 +685,12 @@ async fn handle_settings(
         } else {
             config.timeout = t.clone();
             println!("Timeout updated to: {}", t);
-            if let Err(e) = storage::wipe_unencrypted_cache() {
-                eprintln!("Warning: Failed to clean up unencrypted cache files: {}", e);
+            if let Some(path) = storage::db_path() {
+                if let Ok(repo) = storage::VaultRepository::open(&path) {
+                    if let Err(e) = repo.clear_saved_keys() {
+                        eprintln!("Warning: Failed to clear saved keys: {}", e);
+                    }
+                }
             }
             updated = true;
         }
