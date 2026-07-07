@@ -197,21 +197,16 @@ impl Default for Session {
 
 impl Session {
     /// Checks if the stored access token is expired or close to expiring
-    pub fn is_token_expired(&self) -> bool {
-        let token = match &self.access_token {
-            Some(t) => t,
-            None => return true,
-        };
-        let parts: Vec<&str> = token.split('.').collect();
+    pub(crate) fn is_token_expired(&self) -> bool {
+        let parts: Vec<&str> = self.access_token.as_deref().unwrap_or("").split('.').collect();
         if parts.len() < 2 {
             return true;
         }
-        let payload_b64 = parts[1];
-        let mut pad = payload_b64.to_string();
+        let payload = parts[1];
+        let mut pad = payload.to_string();
         while pad.len() % 4 != 0 {
             pad.push('=');
         }
-        let pad = pad.replace('-', "+").replace('_', "/");
         if let Ok(decoded) = BASE64_STANDARD.decode(pad) {
             if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&decoded) {
                 if let Some(exp) = val.get("exp").and_then(|e| e.as_i64()) {
@@ -229,7 +224,7 @@ impl Session {
 
     /// Returns a valid access token, refreshing it if expired and refresh token is available.
     /// Note: Callers are responsible for persisting the updated session to SQLite.
-    pub async fn get_valid_token(&mut self, server_url: &str) -> Result<String, String> {
+    pub(crate) async fn get_valid_token(&mut self, server_url: &str) -> Result<String, String> {
         let active_url = self.server_url.as_deref().unwrap_or(server_url);
         let access_token = self
             .access_token

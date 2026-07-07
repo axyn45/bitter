@@ -107,7 +107,7 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
             match other {
                 Commands::Login(args) => handle_login(args, config, &mut session).await?,
                 Commands::Logout => handle_logout(config, &mut session, &mut repo).await?,
-                Commands::Sync => handle_sync(config, &mut session).await?,
+                Commands::Sync => handle_sync(config, &mut session, &repo).await?,
                 Commands::Settings(args) => handle_settings(args, config, &mut session).await?,
                 Commands::Keys(args) => handle_keys(args.command, &session).await?,
                 Commands::Unlock => handle_unlock(config, &mut session).await?,
@@ -508,8 +508,13 @@ async fn handle_reset(args: ResetArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn handle_sync(config: &mut Config, session: &mut Session) -> Result<(), String> {
-    let token = session.get_valid_token(&config.server_url).await?;
+async fn handle_sync(config: &mut Config, session: &mut Session, repo: &storage::VaultRepository) -> Result<(), String> {
+    let token = repo.get_valid_token().await?;
+
+    // Reload the updated session from database
+    if let Some(updated) = repo.load_session()? {
+        *session = updated;
+    }
 
     let api_client = ApiClient::new(&config.server_url);
     println!("Syncing ciphers from server {}...", config.server_url);

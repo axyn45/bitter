@@ -317,6 +317,56 @@ fn save_cipher_conn(
 }
 
 impl VaultRepository {
+    pub async fn get_valid_token(&self) -> Result<String, String> {
+        let mut session = self
+            .load_session()?
+            .ok_or_else(|| "No active session found".to_string())?;
+
+        let is_expired = session.is_token_expired();
+        let server_url = session.server_url.clone().unwrap_or_else(|| {
+            let config = crate::config::Config::load().unwrap_or_default();
+            config.server_url
+        });
+
+        let token = session.get_valid_token(&server_url).await?;
+
+        if is_expired {
+            self.save_session(&session)?;
+        }
+
+        Ok(token)
+    }
+
+    pub async fn get_valid_token_shared(
+        db: &std::sync::Arc<tokio::sync::Mutex<Self>>,
+    ) -> Result<String, String> {
+        let (is_expired, mut session, server_url) = {
+            let repo = db.lock().await;
+            let sess = repo
+                .load_session()?
+                .ok_or_else(|| "No active session found".to_string())?;
+            let is_expired = sess.is_token_expired();
+            let config = crate::config::Config::load().unwrap_or_default();
+            let server_url = sess.server_url.clone().unwrap_or(config.server_url);
+            (is_expired, sess, server_url)
+        };
+
+        if !is_expired {
+            if let Some(token) = session.access_token {
+                return Ok(token);
+            }
+        }
+
+        let token = session.get_valid_token(&server_url).await?;
+
+        {
+            let repo = db.lock().await;
+            repo.save_session(&session)?;
+        }
+
+        Ok(token)
+    }
+
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);

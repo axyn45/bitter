@@ -899,23 +899,7 @@ async fn handle_surgical_cipher_update(
 async fn run_websocket_sync_loop(keys_context: SharedKeysContext, shared_db: SharedDb) -> Result<(), String> {
     let config =
         crate::config::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
-    let mut session = {
-        let db = shared_db.lock().await;
-        db.load_session()?.unwrap_or_else(|| {
-            let mut s = crate::config::Session::default();
-            if let Some(ref d_id) = config.device_id {
-                s.device_id = d_id.clone();
-            }
-            s
-        })
-    };
-
-    let token = session.get_valid_token(&config.server_url).await?;
-
-    {
-        let db = shared_db.lock().await;
-        db.save_session(&session)?;
-    }
+    let token = storage::VaultRepository::get_valid_token_shared(&shared_db).await?;
 
     let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
     let client = ApiClient::new(&config.server_url);
@@ -998,8 +982,9 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext, shared_db: Sha
                                             let cipher_id_str = cipher_id.to_string();
                                             let db_clone = shared_db.clone();
                                             tokio::spawn(async move {
-                                                let current_token =
-                                                    get_valid_token_from_db(&db_clone, "").await;
+                                                let current_token = storage::VaultRepository::get_valid_token_shared(&db_clone)
+                                                    .await
+                                                    .unwrap_or_default();
                                                 if let Err(e) = handle_surgical_cipher_update(
                                                     &client_clone,
                                                     &current_token,
@@ -1023,7 +1008,9 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext, shared_db: Sha
                                             ut
                                         );
 
-                                        let current_token = get_valid_token_from_db(&shared_db, &token).await;
+                                        let current_token = storage::VaultRepository::get_valid_token_shared(&shared_db)
+                                            .await
+                                            .unwrap_or_else(|_| token.clone());
                                         match client.sync(&current_token).await {
                                             Ok(sync_data) => {
                                                 let repo_res = {
@@ -1115,9 +1102,9 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext, shared_db: Sha
                                                                 cipher_id.to_string();
                                                             let db_clone = shared_db.clone();
                                                             tokio::spawn(async move {
-                                                                let current_token =
-                                                                    get_valid_token_from_db(&db_clone, "")
-                                                                        .await;
+                                                                let current_token = storage::VaultRepository::get_valid_token_shared(&db_clone)
+                                                                    .await
+                                                                    .unwrap_or_default();
                                                                 if let Err(e) =
                                                                     handle_surgical_cipher_update(
                                                                         &client_clone,
@@ -1144,8 +1131,9 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext, shared_db: Sha
                                                             "WebSocket (binary): Received vault update event (Type {}). Syncing...",
                                                             ut_val
                                                         );
-                                                        let current_token =
-                                                            get_valid_token_from_db(&shared_db, &token).await;
+                                                        let current_token = storage::VaultRepository::get_valid_token_shared(&shared_db)
+                                                            .await
+                                                            .unwrap_or_else(|_| token.clone());
                                                         match client.sync(&current_token).await {
                                                             Ok(sync_data) => {
                                                                 let repo_res = {
@@ -1505,20 +1493,4 @@ fn count_active_user_sessions(username: &str) -> usize {
     count
 }
 
-async fn get_valid_token_from_db(shared_db: &SharedDb, fallback: &str) -> String {
-    if let Ok(cfg) = crate::config::Config::load() {
-        let db = shared_db.lock().await;
-        if let Ok(Some(mut sess)) = db.load_session() {
-            match sess.get_valid_token(&cfg.server_url).await {
-                Ok(t) => {
-                    let _ = db.save_session(&sess);
-                    return t;
-                }
-                Err(e) => {
-                    error!("Failed to get valid token: {}", e);
-                }
-            }
-        }
-    }
-    fallback.to_string()
-}
+
