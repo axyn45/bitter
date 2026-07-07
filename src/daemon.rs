@@ -298,16 +298,10 @@ async fn run_daemon_loops(
     let db_path =
         storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
     let repo = storage::VaultRepository::open(&db_path)?;
-    let session = repo.load_session()?.unwrap_or_else(|| {
-        let mut s = crate::config::Session::default();
-        if let Some(ref d_id) = config.device_id {
-            s.device_id = d_id.clone();
-        }
-        s
-    });
+    let session_opt = repo.load_session()?;
 
-    let timeout = session.parse_timeout_duration().unwrap_or(None);
-    let timeout_action = session.timeout_action;
+    let timeout = session_opt.as_ref().and_then(|s| s.parse_timeout_duration().unwrap_or(None));
+    let timeout_action = session_opt.as_ref().map(|s| s.timeout_action).unwrap_or(crate::config::TimeoutAction::Lock);
 
     let saved_keys_opt = repo.load_saved_keys().ok().flatten();
 
@@ -315,10 +309,11 @@ async fn run_daemon_loops(
     let shared_db: SharedDb = Arc::new(tokio::sync::Mutex::new(repo));
 
     // If timeout is "unlocked", try to load decryption keys automatically
-    if session.timeout.trim().to_lowercase() == "unlocked" {
+    let is_unlocked_timeout = session_opt.as_ref().map(|s| s.timeout.trim().to_lowercase() == "unlocked").unwrap_or(false);
+    if is_unlocked_timeout {
         if let Some((enc, mac)) = saved_keys_opt {
             *keys_context.write().await = Some(KeysContext {
-                user_id: session.user_id.clone().unwrap_or_default(),
+                user_id: session_opt.as_ref().map(|s| s.user_id.clone()).unwrap_or_default(),
                 enc_key: enc,
                 mac_key: mac,
             });
@@ -735,7 +730,7 @@ async fn handle_control_connection(
                 let is_unlocked = {
                     let mut keys = keys_context.write().await;
                     let user_id_mismatch = if let Some(ref k) = *keys {
-                        Some(&k.user_id) != session.user_id.as_ref()
+                        k.user_id != session.user_id
                     } else {
                         false
                     };
@@ -1277,14 +1272,15 @@ async fn prompt_tty_for_unlock(
     }
 
     // Load session to check if logged in
-    let session = {
+    let session_opt = {
         let db = shared_db.lock().await;
-        db.load_session()?.unwrap_or_default()
+        db.load_session()?
     };
 
-    if session.email.is_none() {
-        return Err("Not logged in".to_string());
-    }
+    let _session = match session_opt {
+        Some(s) => s,
+        None => return Err("Not logged in".to_string()),
+    };
 
     let db_exists = crate::storage::db_path()
         .map(|p| p.exists())

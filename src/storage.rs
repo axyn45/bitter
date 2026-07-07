@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub use crate::api::{CipherSync, FolderSync, OrganizationSync, ProfileSync, SyncResponse};
-use crate::config::Session;
+use crate::config::{DEFAULT_TIMEOUT, Session};
 use crate::crypto;
 
 #[cfg(not(test))]
@@ -72,7 +72,7 @@ pub fn db_path() -> Option<PathBuf> {
 /// Load and decrypt the local cache database from disk
 fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute_batch(
-        r#"
+        format!(r#"
         CREATE TABLE IF NOT EXISTS session_metadata (
             user_id TEXT PRIMARY KEY,
             email TEXT,
@@ -84,7 +84,7 @@ fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
             enc_key TEXT,
             mac_key TEXT,
             last_activated INTEGER NOT NULL,
-            timeout TEXT NOT NULL DEFAULT '15m',
+            timeout TEXT NOT NULL DEFAULT '{}',
             timeout_action TEXT NOT NULL DEFAULT 'Lock'
         );
 
@@ -197,7 +197,7 @@ fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
             masterPasswordUnlock TEXT,
             extra TEXT
         );
-        "#,
+        "#, DEFAULT_TIMEOUT).as_str(),
     )
     .map_err(|e| format!("Failed to initialize database tables: {}", e))?;
 
@@ -323,12 +323,8 @@ impl VaultRepository {
             .ok_or_else(|| "No active session found".to_string())?;
 
         let is_expired = session.is_token_expired();
-        let server_url = session.server_url.clone().unwrap_or_else(|| {
-            let config = crate::config::Config::load().unwrap_or_default();
-            config.server_url
-        });
 
-        let token = session.get_valid_token(&server_url).await?;
+        let token = session.get_valid_token().await?;
 
         if is_expired {
             self.save_session(&session)?;
@@ -340,15 +336,13 @@ impl VaultRepository {
     pub async fn get_valid_token_shared(
         db: &std::sync::Arc<tokio::sync::Mutex<Self>>,
     ) -> Result<String, String> {
-        let (is_expired, mut session, server_url) = {
+        let (is_expired, mut session) = {
             let repo = db.lock().await;
             let sess = repo
                 .load_session()?
                 .ok_or_else(|| "No active session found".to_string())?;
             let is_expired = sess.is_token_expired();
-            let config = crate::config::Config::load().unwrap_or_default();
-            let server_url = sess.server_url.clone().unwrap_or(config.server_url);
-            (is_expired, sess, server_url)
+            (is_expired, sess)
         };
 
         if !is_expired {
@@ -357,7 +351,7 @@ impl VaultRepository {
             }
         }
 
-        let token = session.get_valid_token(&server_url).await?;
+        let token = session.get_valid_token().await?;
 
         {
             let repo = db.lock().await;
@@ -421,7 +415,7 @@ impl VaultRepository {
     }
 
     pub fn save_session(&self, session: &Session) -> Result<(), String> {
-        let target_uid = session.user_id.as_deref().unwrap_or("");
+        let target_uid = &session.user_id;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -466,20 +460,18 @@ impl VaultRepository {
             let timeout_action = crate::config::TimeoutAction::from_str(&timeout_action_str)
                 .unwrap_or(crate::config::TimeoutAction::Lock);
 
-            let user_id_raw: Option<String> = row.get("user_id")?;
-            let user_id = match user_id_raw {
-                Some(uid) if !uid.is_empty() => Some(uid),
-                _ => None,
-            };
+            let user_id = row.get::<_, Option<String>>("user_id")?.unwrap_or_default();
+            let email = row.get::<_, Option<String>>("email")?.unwrap_or_default();
+            let server_url = row.get::<_, Option<String>>("server_url")?.unwrap_or_default();
 
             Ok(Session {
                 user_id,
-                email: row.get("email")?,
+                email,
                 device_id: row.get("device_id")?,
                 access_token: row.get("access_token")?,
                 refresh_token: row.get("refresh_token")?,
                 last_sync_time: row.get("last_sync_time")?,
-                server_url: row.get("server_url")?,
+                server_url,
                 timeout: row.get("timeout")?,
                 timeout_action,
             })

@@ -12,6 +12,7 @@ use tracing;
 
 const APP_NAME: &str = "bitter";
 const CONFIG_FILE_NAME: &str = "config.toml";
+pub const DEFAULT_TIMEOUT: &str = "never";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -60,7 +61,7 @@ fn default_ssh_agent_auto_start() -> bool {
     true
 }
 
-fn generate_device_id() -> String {
+pub(crate) fn generate_device_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -167,32 +168,16 @@ impl Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub user_id: Option<String>,
-    pub email: Option<String>,
+    pub user_id: String,
+    pub email: String,
     #[serde(default = "generate_device_id")]
     pub device_id: String,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub last_sync_time: Option<String>,
-    pub server_url: Option<String>,
+    pub server_url: String,
     pub timeout: String,
     pub timeout_action: TimeoutAction,
-}
-
-impl Default for Session {
-    fn default() -> Self {
-        Session {
-            user_id: None,
-            email: None,
-            device_id: generate_device_id(),
-            access_token: None,
-            refresh_token: None,
-            last_sync_time: None,
-            server_url: None,
-            timeout: "15m".to_string(),
-            timeout_action: TimeoutAction::Lock,
-        }
-    }
 }
 
 impl Session {
@@ -224,8 +209,8 @@ impl Session {
 
     /// Returns a valid access token, refreshing it if expired and refresh token is available.
     /// Note: Callers are responsible for persisting the updated session to SQLite.
-    pub(crate) async fn get_valid_token(&mut self, server_url: &str) -> Result<String, String> {
-        let active_url = self.server_url.as_deref().unwrap_or(server_url);
+    pub(crate) async fn get_valid_token(&mut self) -> Result<String, String> {
+        let active_url = &self.server_url;
         let access_token = self
             .access_token
             .as_ref()
@@ -256,15 +241,6 @@ impl Session {
         }
 
         Ok(access_token.clone())
-    }
-
-    /// Logs out by clearing all in-memory credentials and session details
-    pub fn logout(&mut self) {
-        self.user_id = None;
-        self.email = None;
-        self.access_token = None;
-        self.refresh_token = None;
-        self.last_sync_time = None;
     }
 
     /// Parses the timeout string into a Duration, or None if set to 'never'

@@ -1,6 +1,6 @@
 use crate::api::ApiClient;
 use crate::cli::{Commands, KeysCommands, ResetArgs};
-use crate::config::{Config, Session, TimeoutAction};
+use crate::config::{Config, DEFAULT_TIMEOUT, Session, TimeoutAction};
 use crate::{crypto, daemon, storage};
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -17,8 +17,8 @@ pub async fn perform_sync(
         .map_err(|e| format!("Failed to sync vault from server: {}", e))?;
 
     // 2. Update session fields and save
-    session.user_id = Some(sync_data.profile.id.clone());
-    session.email = Some(sync_data.profile.email.clone());
+    session.user_id = sync_data.profile.id.clone();
+    session.email = sync_data.profile.email.clone();
     session.last_sync_time = Some(get_current_time_string());
     let db_path =
         storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
@@ -51,6 +51,48 @@ pub async fn perform_sync(
 
     Ok(())
 }
+
+pub async fn unlock_with_keys(
+    repo: &storage::VaultRepository,
+    session: &Session,
+    enc_key: &[u8; 32],
+    mac_key: &[u8; 32],
+) -> Result<(), String> {
+    // If timeout is "unlocked", save keys to SQLite
+    if session.timeout.trim().to_lowercase() == "unlocked" {
+        repo.save_saved_keys(enc_key, mac_key)
+            .map_err(|e| format!("Failed to save decryption keys: {}", e))?;
+    }
+
+    // Send keys to daemon if running
+    if daemon::is_agent_running() {
+        println!("Sending decryption keys to background agent daemon...");
+        let enc_hex = hex::encode(enc_key);
+        let mac_hex = hex::encode(mac_key);
+        let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
+            user_id: session.user_id.clone(),
+            enc_key: enc_hex,
+            mac_key: mac_hex,
+        })
+        .await?;
+
+        if resp.status == "ok" {
+            println!("Agent unlocked successfully.");
+        } else {
+            return Err(format!(
+                "Failed to unlock agent: {}",
+                resp.error.unwrap_or_default()
+            ));
+        }
+    } else {
+        println!(
+            "Keys derived successfully. (Agent daemon is not running, so keys were not sent.)"
+        );
+    }
+
+    Ok(())
+}
+
 
 pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), String> {
     match command {
@@ -94,33 +136,20 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
             let db_path = storage::db_path()
                 .ok_or_else(|| "Could not determine cache database path".to_string())?;
             let mut repo = storage::VaultRepository::open(&db_path)?;
-            let mut session = repo.load_session()?.unwrap_or_else(|| {
-                let mut s = Session::default();
-                if let Some(ref d_id) = config.device_id {
-                    s.device_id = d_id.clone();
-                }
-                s
-            });
-
-            let is_logout = matches!(other, Commands::Logout);
 
             match other {
-                Commands::Login(args) => handle_login(args, config, &mut session).await?,
-                Commands::Logout => handle_logout(config, &mut session, &mut repo).await?,
-                Commands::Sync => handle_sync(config, &mut session, &repo).await?,
-                Commands::Settings(args) => handle_settings(args, config, &mut session).await?,
-                Commands::Keys(args) => handle_keys(args.command, &session).await?,
-                Commands::Unlock => handle_unlock(config, &mut session).await?,
-                Commands::Status => handle_status(config, &session).await?,
+                Commands::Login(args) => handle_login(args, config, &mut repo).await?,
+                Commands::Logout => handle_logout(config, &mut repo).await?,
+                Commands::Sync => handle_sync(config, &mut repo).await?,
+                Commands::Settings(args) => handle_settings(args, config, &mut repo).await?,
+                Commands::Keys(args) => handle_keys(args.command, &mut repo).await?,
+                Commands::Unlock => handle_unlock(config, &mut repo).await?,
+                Commands::Status => handle_status(config, &mut repo).await?,
                 Commands::Start(_) => {
                     unreachable!("Start command handled synchronously in main()");
                 }
                 Commands::Reset(_) => unreachable!(),
                 _ => {}
-            }
-
-            if !is_logout {
-                repo.save_session(&session)?;
             }
         }
     }
@@ -152,8 +181,6 @@ fn parse_auth_code(input: &str) -> Result<String, String> {
 fn derive_and_verify_keys_from_response(
     resp: &crate::api::TokenResponse,
     password_arg: Option<String>,
-    email_arg: Option<String>,
-    session_email: Option<String>,
     error_context: &str,
 ) -> Result<([u8; 32], String), String> {
     let decrypt_opts = resp.user_decryption_options.as_ref().ok_or_else(|| {
@@ -168,9 +195,7 @@ fn derive_and_verify_keys_from_response(
         .as_ref()
         .ok_or_else(|| "MasterPasswordUnlock data missing from response.".to_string())?;
 
-    let email = email_arg
-        .or(session_email)
-        .unwrap_or_else(|| unlock_data.salt.clone());
+    let email = unlock_data.salt.clone();
 
     let kdf_type = unlock_data.kdf.kdf_type;
     let iterations = unlock_data.kdf.iterations;
@@ -199,13 +224,24 @@ fn derive_and_verify_keys_from_response(
 async fn handle_login(
     args: crate::cli::LoginArgs,
     config: &mut Config,
-    session: &mut Session,
+    repo: &mut storage::VaultRepository,
 ) -> Result<(), String> {
     let server_url = args
         .server
         .clone()
         .unwrap_or_else(|| config.server_url.clone());
     let api_client = ApiClient::new(&server_url);
+
+    let existing_session = repo.load_session()?;
+    let existing_email = existing_session.as_ref().map(|s| s.email.clone());
+    let device_id = existing_session.as_ref().map(|s| s.device_id.clone()).unwrap_or_else(|| {
+        config.device_id.clone().unwrap_or_else(|| {
+            let d = crate::config::generate_device_id();
+            config.device_id = Some(d.clone());
+            let _ = config.save();
+            d
+        })
+    });
 
     // Determine if using API Key or Password Login
     let client_id = args.client_id.or_else(|| config.client_id.clone());
@@ -310,7 +346,7 @@ async fn handle_login(
                 &code,
                 &code_verifier,
                 &redirect_uri,
-                &session.device_id,
+                &device_id,
             )
             .await?;
 
@@ -318,8 +354,6 @@ async fn handle_login(
         let (master_key, email) = derive_and_verify_keys_from_response(
             &resp,
             args.password.clone(),
-            args.email.clone(),
-            session.email.clone(),
             "SSO response",
         )?;
 
@@ -328,7 +362,7 @@ async fn handle_login(
         println!("Logging in using Personal API Key client credentials...");
 
         let resp = api_client
-            .login_api_key(&cid, &csec, &session.device_id, "bitter_client")
+            .login_api_key(&cid, &csec, &device_id, "bitter_client")
             .await?;
 
         // Save credentials in config
@@ -339,15 +373,13 @@ async fn handle_login(
         let (master_key, email) = derive_and_verify_keys_from_response(
             &resp,
             args.password.clone(),
-            args.email.clone(),
-            session.email.clone(),
             "API Key response",
         )?;
 
         (resp, master_key, email)
     } else {
         // Password Login
-        let email = match args.email.or_else(|| session.email.clone()) {
+        let email = match args.email.or_else(|| existing_email) {
             Some(email) => email,
             None => {
                 print!("Email: ");
@@ -383,7 +415,7 @@ async fn handle_login(
         println!("Authenticating with server...");
 
         let resp = api_client
-            .login_password(&email, &login_hash, &session.device_id, "bitter_client")
+            .login_password(&email, &login_hash, &device_id, "bitter_client")
             .await?;
 
         println!("Decrypting vault symmetric keys...");
@@ -399,10 +431,23 @@ async fn handle_login(
         .save()
         .map_err(|e| format!("Failed to save configuration: {}", e))?;
 
-    session.access_token = Some(token_resp.access_token.clone());
-    session.refresh_token = token_resp.refresh_token.clone();
-    session.email = Some(email);
-    session.server_url = Some(server_url);
+    let (timeout, timeout_action) = if let Some(ref s) = existing_session {
+        (s.timeout.clone(), s.timeout_action)
+    } else {
+        (DEFAULT_TIMEOUT.to_string(), TimeoutAction::Lock)
+    };
+
+    let mut session = Session {
+        user_id: "".to_string(), // Will be populated in perform_sync
+        email: email.clone(),
+        device_id: device_id.clone(),
+        access_token: Some(token_resp.access_token.clone()),
+        refresh_token: token_resp.refresh_token.clone(),
+        last_sync_time: None,
+        server_url: server_url.clone(),
+        timeout,
+        timeout_action,
+    };
     println!("Logged in successfully. Session token stored locally.");
 
     // Automatically perform synchronization
@@ -411,43 +456,10 @@ async fn handle_login(
     let (enc_key, mac_key) = crypto::decrypt_symmetric_key(&master_key, &token_resp.key)
         .map_err(|e| format!("Failed to decrypt symmetric keys: {}", e))?;
 
-    perform_sync(&api_client, &token_resp.access_token, session).await?;
+    perform_sync(&api_client, &token_resp.access_token, &mut session).await?;
 
-    // Save keys to SQLite if timeout is unlocked
-    if session.timeout.trim().to_lowercase() == "unlocked" {
-        let db_path = storage::db_path()
-            .ok_or_else(|| "Could not determine cache database path".to_string())?;
-        let repo = storage::VaultRepository::open(&db_path)?;
-        if let Err(e) = repo.save_saved_keys(&enc_key, &mac_key) {
-            eprintln!("Warning: Failed to save decryption keys: {}", e);
-        }
-    }
-
-    // Send keys to agent if running
-    if daemon::is_agent_running() {
-        let enc_hex = hex::encode(enc_key);
-        let mac_hex = hex::encode(mac_key);
-        match daemon::send_control_request(daemon::ControlRequest::Unlock {
-            user_id: session.user_id.clone().unwrap_or_default(),
-            enc_key: enc_hex,
-            mac_key: mac_hex,
-        })
-        .await
-        {
-            Ok(resp) => {
-                if resp.status == "ok" {
-                    println!("Agent unlocked successfully.");
-                } else {
-                    eprintln!(
-                        "Warning: Failed to unlock agent: {}",
-                        resp.error.unwrap_or_default()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to communicate with running agent: {}", e);
-            }
-        }
+    if let Err(e) = unlock_with_keys(repo, &session, &enc_key, &mac_key).await {
+        eprintln!("Warning: Failed to unlock vault: {}", e);
     }
 
     Ok(())
@@ -455,7 +467,6 @@ async fn handle_login(
 
 async fn handle_logout(
     config: &mut Config,
-    _session: &mut Session,
     repo: &mut storage::VaultRepository,
 ) -> Result<(), String> {
     println!("Logging out...");
@@ -508,18 +519,16 @@ async fn handle_reset(args: ResetArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn handle_sync(config: &mut Config, session: &mut Session, repo: &storage::VaultRepository) -> Result<(), String> {
+async fn handle_sync(config: &mut Config, repo: &mut storage::VaultRepository) -> Result<(), String> {
     let token = repo.get_valid_token().await?;
 
-    // Reload the updated session from database
-    if let Some(updated) = repo.load_session()? {
-        *session = updated;
-    }
+    // Load the updated session from database
+    let mut session = repo.load_session()?.ok_or_else(|| "Not logged in. Please log in first.".to_string())?;
 
     let api_client = ApiClient::new(&config.server_url);
     println!("Syncing ciphers from server {}...", config.server_url);
 
-    perform_sync(&api_client, &token, session).await?;
+    perform_sync(&api_client, &token, &mut session).await?;
     println!("Sync completed successfully.");
 
     Ok(())
@@ -528,27 +537,51 @@ async fn handle_sync(config: &mut Config, session: &mut Session, repo: &storage:
 async fn handle_settings(
     args: crate::cli::SettingsArgs,
     config: &mut Config,
-    session: &mut Session,
+    repo: &mut storage::VaultRepository,
 ) -> Result<(), String> {
+    let mut session = repo.load_session()?.ok_or_else(|| "Not logged in. Please log in first.".to_string())?;
     let mut updated = false;
 
     if let Some(t) = args.timeout {
         if t.trim().to_lowercase() == "unlocked" {
-            if let Some(ref email) = session.email {
-                let password = crypto::prompt_master_password(Some(
-                    "Enter Master Password to verify and enable 'unlocked' mode: ",
-                ))?;
+            let email = &session.email;
+            let password = crypto::prompt_master_password(Some(
+                "Enter Master Password to verify and enable 'unlocked' mode: ",
+            ))?;
 
-                let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
-                let mut verified = false;
-                let mut enc_key_opt = None;
-                let mut mac_key_opt = None;
-                let repo = storage::VaultRepository::open(&path)?;
+            let mut verified = false;
+            let mut enc_key_opt = None;
+            let mut mac_key_opt = None;
 
-                if path.exists() {
+            if let Ok(sync_resp) = repo.load_sync_response() {
+                if let Ok((_ciphers, enc, mac)) =
+                    storage::decrypt_sync_response_offline(&sync_resp, &password)
+                {
+                    verified = true;
+                    enc_key_opt = Some(enc);
+                    mac_key_opt = Some(mac);
+                }
+            }
+
+            // If not verified locally, verify with server using KDF settings
+            if !verified {
+                println!("Verifying master password with server...");
+                let api_client = ApiClient::new(&config.server_url);
+                let prelogin = api_client.prelogin(email).await?;
+                let master_key_res = crypto::prompt_and_derive_master_key(
+                    Some(password.clone()),
+                    email,
+                    prelogin.kdf,
+                    prelogin.kdf_iterations,
+                    prelogin.kdf_memory,
+                    prelogin.kdf_parallelism,
+                    None,
+                );
+
+                if let Ok(master_key) = master_key_res {
                     if let Ok(sync_resp) = repo.load_sync_response() {
-                        if let Ok((_ciphers, enc, mac)) =
-                            storage::decrypt_sync_response_offline(&sync_resp, &password)
+                        if let Ok((enc, mac)) =
+                            crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)
                         {
                             verified = true;
                             enc_key_opt = Some(enc);
@@ -556,77 +589,40 @@ async fn handle_settings(
                         }
                     }
                 }
+            }
 
-                // If not verified locally, verify with server using KDF settings
-                if !verified {
-                    println!("Verifying master password with server...");
-                    let api_client = ApiClient::new(&config.server_url);
-                    let prelogin = api_client.prelogin(email).await?;
-                    let master_key_res = crypto::prompt_and_derive_master_key(
-                        Some(password.clone()),
-                        email,
-                        prelogin.kdf,
-                        prelogin.kdf_iterations,
-                        prelogin.kdf_memory,
-                        prelogin.kdf_parallelism,
-                        None,
-                    );
+            if !verified {
+                return Err(
+                    "Incorrect Master Password. Timeout setting remains unchanged.".to_string(),
+                );
+            }
 
-                    if let Ok(master_key) = master_key_res {
-                        if let Ok(sync_resp) = repo.load_sync_response() {
-                            if let Ok((enc, mac)) =
-                                crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)
-                            {
-                                verified = true;
-                                enc_key_opt = Some(enc);
-                                mac_key_opt = Some(mac);
-                            }
-                        }
-                    }
+            // Save config and save decryption keys
+            session.timeout = t.clone();
+            println!("Timeout updated to: {}", t);
+            updated = true;
+
+            if let (Some(enc), Some(mac)) = (enc_key_opt, mac_key_opt) {
+                println!("Saving decryption keys to database...");
+                if let Err(e) = repo.save_saved_keys(&enc, &mac) {
+                    eprintln!("Warning: Failed to save decryption keys: {}", e);
                 }
 
-                if !verified {
-                    return Err(
-                        "Incorrect Master Password. Timeout setting remains unchanged.".to_string(),
-                    );
+                // Send keys to daemon if running
+                if daemon::is_agent_running() {
+                    let _ = daemon::send_control_request(daemon::ControlRequest::Unlock {
+                        user_id: session.user_id.clone(),
+                        enc_key: hex::encode(enc),
+                        mac_key: hex::encode(mac),
+                    })
+                    .await;
                 }
-
-                // Save config and save decryption keys
-                session.timeout = t.clone();
-                println!("Timeout updated to: {}", t);
-                updated = true;
-
-                if let (Some(enc), Some(mac)) = (enc_key_opt, mac_key_opt) {
-                    println!("Saving decryption keys to database...");
-                    if let Err(e) = repo.save_saved_keys(&enc, &mac) {
-                        eprintln!("Warning: Failed to save decryption keys: {}", e);
-                    }
-
-                    // Send keys to daemon if running
-                    if daemon::is_agent_running() {
-                        let _ = daemon::send_control_request(daemon::ControlRequest::Unlock {
-                            user_id: session.user_id.clone().unwrap_or_default(),
-                            enc_key: hex::encode(enc),
-                            mac_key: hex::encode(mac),
-                        })
-                        .await;
-                    }
-                }
-            } else {
-                // Not logged in, allow setting timeout to "unlocked" (keys will be saved on next login)
-                session.timeout = t.clone();
-                println!("Timeout updated to: {}", t);
-                updated = true;
             }
         } else {
             session.timeout = t.clone();
             println!("Timeout updated to: {}", t);
-            if let Some(path) = storage::db_path() {
-                if let Ok(repo) = storage::VaultRepository::open(&path) {
-                    if let Err(e) = repo.clear_saved_keys() {
-                        eprintln!("Warning: Failed to clear saved keys: {}", e);
-                    }
-                }
+            if let Err(e) = repo.clear_saved_keys() {
+                eprintln!("Warning: Failed to clear saved keys: {}", e);
             }
             updated = true;
         }
@@ -664,6 +660,7 @@ async fn handle_settings(
         config
             .save()
             .map_err(|e| format!("Failed to save configuration: {}", e))?;
+        repo.save_session(&session)?;
         println!("Settings saved.");
 
         if daemon::is_agent_running() {
@@ -675,10 +672,7 @@ async fn handle_settings(
     } else {
         println!("Current settings:");
         println!("  Server URL:     {}", config.server_url);
-        println!(
-            "  Email:          {}",
-            session.email.as_deref().unwrap_or("<not logged in>")
-        );
+        println!("  Email:          {}", session.email);
         println!("  Session Timeout: {}", session.timeout);
         println!("  Timeout Action:  {:?}", session.timeout_action);
         println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
@@ -688,7 +682,8 @@ async fn handle_settings(
 }
 
 // Deprecated: This function is a placeholder for future key management features. Refactoration may be needed.
-async fn handle_keys(command: KeysCommands, _session: &Session) -> Result<(), String> {
+async fn handle_keys(command: KeysCommands, repo: &mut storage::VaultRepository) -> Result<(), String> {
+    let _session = repo.load_session()?.ok_or_else(|| "Not logged in. Please log in first.".to_string())?;
     match command {
         KeysCommands::List => {
             println!("Listing keys... (Will be implemented in Phase 3)");
@@ -706,17 +701,11 @@ async fn handle_keys(command: KeysCommands, _session: &Session) -> Result<(), St
     Ok(())
 }
 
-async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(), String> {
-    let email = session
-        .email
-        .clone()
-        .ok_or_else(|| "Email address missing from session. Please log in first.".to_string())?;
+async fn handle_unlock(config: &mut Config, repo: &mut storage::VaultRepository) -> Result<(), String> {
+    let session = repo.load_session()?.ok_or_else(|| "Not logged in. Please log in first.".to_string())?;
+    let email = session.email.clone();
 
     let password = crypto::prompt_master_password(None)?;
-
-    let db_path =
-        storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let repo = storage::VaultRepository::open(&db_path)?;
 
     // Attempt online sync of KDF settings first
     let api_client = ApiClient::new(&config.server_url);
@@ -761,48 +750,19 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         }
     };
 
-    // If timeout is "unlocked", save keys to SQLite
-    if session.timeout.trim().to_lowercase() == "unlocked" {
-        repo.save_saved_keys(&enc_key, &mac_key)?;
-    }
-
-    // Send keys to daemon if running
-    if daemon::is_agent_running() {
-        println!("Sending decryption keys to background agent daemon...");
-        let enc_hex = hex::encode(enc_key);
-        let mac_hex = hex::encode(mac_key);
-        let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
-            user_id: session.user_id.clone().unwrap_or_default(),
-            enc_key: enc_hex,
-            mac_key: mac_hex,
-        })
-        .await?;
-
-        if resp.status == "ok" {
-            println!("Agent unlocked successfully.");
-        } else {
-            return Err(format!(
-                "Failed to unlock agent: {}",
-                resp.error.unwrap_or_default()
-            ));
-        }
-    } else {
-        println!(
-            "Keys derived successfully. (Agent daemon is not running, so keys were not sent.)"
-        );
-    }
+    unlock_with_keys(repo, &session, &enc_key, &mac_key).await?;
 
     Ok(())
 }
 
-async fn handle_status(config: &Config, session: &Session) -> Result<(), String> {
+async fn handle_status(config: &Config, repo: &mut storage::VaultRepository) -> Result<(), String> {
     println!("bitter Status:");
-    let active_url = session.server_url.as_deref().unwrap_or(&config.server_url);
-    println!("  Server URL:     {}", active_url);
+    let session_opt = repo.load_session()?;
 
-    if let Some(ref email) = session.email {
+    if let Some(ref session) = session_opt {
+        println!("  Server URL:     {}", session.server_url);
         println!("  Login Status:   Logged In");
-        println!("  Logged in User: {}", email);
+        println!("  Logged in User: {}", session.email);
 
         let method = if config.client_id.is_some() {
             "API Key"
@@ -811,6 +771,7 @@ async fn handle_status(config: &Config, session: &Session) -> Result<(), String>
         };
         println!("  Login Method:   {}", method);
     } else {
+        println!("  Server URL:     {}", config.server_url);
         println!("  Login Status:   Not Logged In");
     }
 
@@ -825,8 +786,9 @@ async fn handle_status(config: &Config, session: &Session) -> Result<(), String>
     );
 
     if agent_running {
+        let user_id = session_opt.as_ref().map(|s| s.user_id.clone());
         match daemon::send_control_request(daemon::ControlRequest::Status {
-            user_id: session.user_id.clone(),
+            user_id,
         }).await {
             Ok(resp) => {
                 let unlocked = resp.unlocked.unwrap_or(false);
@@ -851,13 +813,20 @@ async fn handle_status(config: &Config, session: &Session) -> Result<(), String>
         }
     }
 
-    println!("  Timeout Setting: {}", session.timeout);
-    println!("  Timeout Action:  {:?}", session.timeout_action);
-    println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
+    if let Some(ref session) = session_opt {
+        println!("  Timeout Setting: {}", session.timeout);
+        println!("  Timeout Action:  {:?}", session.timeout_action);
+        println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
 
-    if let Some(ref sync_time) = session.last_sync_time {
-        println!("  Last Synced:    {}", sync_time);
+        if let Some(ref sync_time) = session.last_sync_time {
+            println!("  Last Synced:    {}", sync_time);
+        } else {
+            println!("  Last Synced:    Never");
+        }
     } else {
+        println!("  Timeout Setting: {}", DEFAULT_TIMEOUT);
+        println!("  Timeout Action:  Lock");
+        println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
         println!("  Last Synced:    Never");
     }
 
