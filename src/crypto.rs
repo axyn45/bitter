@@ -290,6 +290,36 @@ pub fn prompt_master_password(custom_prompt: Option<&str>) -> Result<String, Str
         .map_err(|e| format!("Password prompt failed: {}", e))
 }
 
+/// Securely prompts the user for their password (if not already provided) and derives the 256-bit Master Key.
+pub fn prompt_and_derive_master_key(
+    password_arg: Option<String>,
+    email: &str,
+    kdf_type: u32,
+    iterations: u32,
+    memory: Option<u32>,
+    parallelism: Option<u32>,
+    prompt_msg: Option<&str>,
+) -> Result<[u8; 32], String> {
+    let password = match password_arg {
+        Some(pass) => pass,
+        None => prompt_master_password(prompt_msg)?,
+    };
+
+    match kdf_type {
+        0 => derive_master_key_pbkdf2(&password, email, iterations),
+        1 => {
+            let mem = memory.ok_or_else(|| {
+                "Argon2 memory parameter missing from KDF settings".to_string()
+            })?;
+            let para = parallelism.ok_or_else(|| {
+                "Argon2 parallelism parameter missing from KDF settings".to_string()
+            })?;
+            derive_master_key_argon2(&password, email, iterations, mem, para)
+        }
+        t => Err(format!("Unsupported KDF type: {}", t)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

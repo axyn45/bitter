@@ -3,12 +3,9 @@ use base64::prelude::BASE64_STANDARD;
 #[cfg(not(test))]
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
-pub use crate::api::{CipherSync, SyncResponse, ProfileSync, FolderSync, OrganizationSync};
+pub use crate::api::{CipherSync, FolderSync, OrganizationSync, ProfileSync, SyncResponse};
 use crate::config::Session;
 use crate::crypto;
 
@@ -72,14 +69,27 @@ pub fn db_path() -> Option<PathBuf> {
     cache_dir().map(|dir| dir.join(DB_FILE_NAME))
 }
 
-
-
 /// Load and decrypt the local cache database from disk
 fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS session_metadata (
+            user_id TEXT PRIMARY KEY,
+            email TEXT,
+            device_id TEXT NOT NULL,
+            access_token TEXT,
+            refresh_token TEXT,
+            last_sync_time TEXT,
+            server_url TEXT,
+            enc_key TEXT,
+            mac_key TEXT,
+            last_activated INTEGER NOT NULL,
+            timeout TEXT NOT NULL DEFAULT '15m',
+            timeout_action TEXT NOT NULL DEFAULT 'Lock'
+        );
+
         CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
+            id TEXT PRIMARY KEY REFERENCES session_metadata(user_id) ON DELETE CASCADE,
             email TEXT NOT NULL,
             email_verified INTEGER NOT NULL,
             name TEXT,
@@ -179,7 +189,7 @@ fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
         );
 
         CREATE TABLE IF NOT EXISTS sync_metadata (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
+            user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             domains TEXT,
             policies TEXT,
             sends TEXT,
@@ -187,25 +197,9 @@ fn init_tables(conn: &rusqlite::Connection) -> Result<(), String> {
             masterPasswordUnlock TEXT,
             extra TEXT
         );
-
-        CREATE TABLE IF NOT EXISTS session_metadata (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            email TEXT,
-            device_id TEXT NOT NULL,
-            access_token TEXT,
-            refresh_token TEXT,
-            last_sync_time TEXT,
-            server_url TEXT,
-            enc_key TEXT,
-            mac_key TEXT
-        );
-        "#
-    ).map_err(|e| format!("Failed to initialize database tables: {}", e))?;
-
-    conn.execute(
-        "INSERT OR IGNORE INTO session_metadata (id, device_id) VALUES (1, ?1)",
-        (uuid::Uuid::new_v4().to_string(),),
-    ).map_err(|e| format!("Failed to initialize session_metadata default row: {}", e))?;
+        "#,
+    )
+    .map_err(|e| format!("Failed to initialize database tables: {}", e))?;
 
     Ok(())
 }
@@ -214,8 +208,11 @@ pub struct VaultRepository {
     conn: rusqlite::Connection,
 }
 
-fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &str) -> Result<(), String> {
-    
+fn save_cipher_conn(
+    conn: &rusqlite::Connection,
+    cipher: &CipherSync,
+    user_id: &str,
+) -> Result<(), String> {
     let extra_json = serde_json::to_string(&cipher.extra).unwrap_or_default();
     conn.execute(
         "INSERT OR REPLACE INTO ciphers (id, user_id, organization_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
@@ -242,21 +239,36 @@ fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &
     ).map_err(|e| format!("Failed to save core cipher: {}", e))?;
 
     // 2. Clear old child rows
-    conn.execute("DELETE FROM cipher_logins WHERE cipher_id = ?1", (&cipher.id,))
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM cipher_ssh_keys WHERE cipher_id = ?1", (&cipher.id,))
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM cipher_fields WHERE cipher_id = ?1", (&cipher.id,))
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM attachments WHERE cipher_id = ?1", (&cipher.id,))
-        .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM folders_ciphers WHERE cipher_id = ?1", (&cipher.id,))
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM cipher_logins WHERE cipher_id = ?1",
+        (&cipher.id,),
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM cipher_ssh_keys WHERE cipher_id = ?1",
+        (&cipher.id,),
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM cipher_fields WHERE cipher_id = ?1",
+        (&cipher.id,),
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM attachments WHERE cipher_id = ?1",
+        (&cipher.id,),
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM folders_ciphers WHERE cipher_id = ?1",
+        (&cipher.id,),
+    )
+    .map_err(|e| e.to_string())?;
 
     // 3. Save nested login
     if let Some(ref login) = cipher.login {
         conn.execute(
-            "INSERT INTO cipher_logins (cipher_id, username, password, uri) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR REPLACE INTO cipher_logins (cipher_id, username, password, uri) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![&cipher.id, &login.username, &login.password, &login.uri],
         ).map_err(|e| format!("Failed to save cipher login: {}", e))?;
     }
@@ -264,9 +276,10 @@ fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &
     // 4. Save nested SSH key
     if let Some(ref ssh_key) = cipher.ssh_key {
         conn.execute(
-            "INSERT INTO cipher_ssh_keys (cipher_id, private_key, public_key) VALUES (?1, ?2, ?3)",
+            "INSERT OR REPLACE INTO cipher_ssh_keys (cipher_id, private_key, public_key) VALUES (?1, ?2, ?3)",
             rusqlite::params![&cipher.id, &ssh_key.private_key, &ssh_key.public_key],
-        ).map_err(|e| format!("Failed to save cipher SSH key: {}", e))?;
+        )
+        .map_err(|e| format!("Failed to save cipher SSH key: {}", e))?;
     }
 
     // 5. Save custom fields
@@ -275,7 +288,8 @@ fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &
             conn.execute(
                 "INSERT INTO cipher_fields (cipher_id, name, value, type) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![&cipher.id, &field.name, &field.value, field.r#type],
-            ).map_err(|e| format!("Failed to save cipher field: {}", e))?;
+            )
+            .map_err(|e| format!("Failed to save cipher field: {}", e))?;
         }
     }
 
@@ -283,9 +297,10 @@ fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &
     if let Some(ref attachments) = cipher.attachments {
         for att in attachments {
             conn.execute(
-                "INSERT INTO attachments (id, cipher_id, file_name, size) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO attachments (id, cipher_id, file_name, size) VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![&att.id, &cipher.id, &att.file_name, &att.size],
-            ).map_err(|e| format!("Failed to save cipher attachment: {}", e))?;
+            )
+            .map_err(|e| format!("Failed to save cipher attachment: {}", e))?;
         }
     }
 
@@ -294,7 +309,8 @@ fn save_cipher_conn(conn: &rusqlite::Connection, cipher: &CipherSync, user_id: &
         conn.execute(
             "INSERT OR REPLACE INTO folders_ciphers (cipher_id, folder_id) VALUES (?1, ?2)",
             rusqlite::params![&cipher.id, folder_id],
-        ).map_err(|e| format!("Failed to save folder cipher relationship: {}", e))?;
+        )
+        .map_err(|e| format!("Failed to save folder cipher relationship: {}", e))?;
     }
 
     Ok(())
@@ -307,52 +323,115 @@ impl VaultRepository {
         }
         let conn = rusqlite::Connection::open(path)
             .map_err(|e| format!("Failed to open cache database: {}", e))?;
-        
+
         conn.execute("PRAGMA foreign_keys = ON;", ())
             .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
-            
+
         init_tables(&conn)?;
         Ok(Self { conn })
     }
 
-    pub fn clear(&mut self) -> Result<(), String> {
-        self.conn.execute("DELETE FROM users", ()).map_err(|e| e.to_string())?;
-        self.conn.execute("DELETE FROM organizations", ()).map_err(|e| e.to_string())?;
-        self.conn.execute("DELETE FROM folders", ()).map_err(|e| e.to_string())?;
-        self.conn.execute("DELETE FROM ciphers", ()).map_err(|e| e.to_string())?;
-        self.conn.execute("DELETE FROM sync_metadata", ()).map_err(|e| e.to_string())?;
-        self.conn.execute("UPDATE session_metadata SET email = NULL, access_token = NULL, refresh_token = NULL, last_sync_time = NULL, enc_key = NULL, mac_key = NULL WHERE id = 1", ()).map_err(|e| e.to_string())?;
+    pub fn logout_active_user(&mut self) -> Result<(), String> {
+        let active_uid = self.get_active_user_id()?.unwrap_or_default();
+        if !active_uid.is_empty() {
+            self.conn
+                .execute(
+                    "DELETE FROM session_metadata WHERE user_id = ?1",
+                    (&active_uid,),
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        self.conn.execute("DELETE FROM organizations WHERE id NOT IN (SELECT DISTINCT organization_id FROM ciphers WHERE organization_id IS NOT NULL)", ()).map_err(|e| e.to_string())?;
         Ok(())
     }
 
+    pub fn get_active_user_id(&self) -> Result<Option<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_id FROM session_metadata ORDER BY last_activated DESC LIMIT 1")
+            .map_err(|e| e.to_string())?;
+        let res = stmt.query_row((), |row| row.get::<_, Option<String>>("user_id"));
+        match res {
+            Ok(Some(uid)) if !uid.is_empty() => Ok(Some(uid)),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn count_non_deleted_ciphers(&self, user_id: &str) -> Result<usize, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM ciphers WHERE user_id = ?1 AND deleted_date IS NULL")
+            .map_err(|e| e.to_string())?;
+        let count: i64 = stmt
+            .query_row(rusqlite::params![user_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(count as usize)
+    }
+
     pub fn save_session(&self, session: &Session) -> Result<(), String> {
+        let target_uid = session.user_id.as_deref().unwrap_or("");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         self.conn.execute(
-            "UPDATE session_metadata SET email = ?1, device_id = ?2, access_token = ?3, refresh_token = ?4, last_sync_time = ?5, server_url = ?6 WHERE id = 1",
+            "INSERT INTO session_metadata (user_id, email, device_id, access_token, refresh_token, last_sync_time, server_url, last_activated, timeout, timeout_action)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 email = excluded.email,
+                 device_id = excluded.device_id,
+                 access_token = excluded.access_token,
+                 refresh_token = excluded.refresh_token,
+                 last_sync_time = excluded.last_sync_time,
+                 server_url = excluded.server_url,
+                 last_activated = excluded.last_activated,
+                 timeout = excluded.timeout,
+                 timeout_action = excluded.timeout_action",
             rusqlite::params![
+                target_uid,
                 &session.email,
                 &session.device_id,
                 &session.access_token,
                 &session.refresh_token,
                 &session.last_sync_time,
                 &session.server_url,
+                now_ms,
+                &session.timeout,
+                &session.timeout_action.to_string(),
             ],
         ).map_err(|e| format!("Failed to save session: {}", e))?;
         Ok(())
     }
 
     pub fn load_session(&self) -> Result<Option<Session>, String> {
+        use std::str::FromStr;
         let mut stmt = self.conn.prepare(
-            "SELECT email, device_id, access_token, refresh_token, last_sync_time, server_url FROM session_metadata WHERE id = 1"
+            "SELECT user_id, email, device_id, access_token, refresh_token, last_sync_time, server_url, timeout, timeout_action FROM session_metadata ORDER BY last_activated DESC LIMIT 1"
         ).map_err(|e| e.to_string())?;
 
         let res = stmt.query_row((), |row| {
+            let timeout_action_str: String = row.get("timeout_action")?;
+            let timeout_action = crate::config::TimeoutAction::from_str(&timeout_action_str)
+                .unwrap_or(crate::config::TimeoutAction::Lock);
+
+            let user_id_raw: Option<String> = row.get("user_id")?;
+            let user_id = match user_id_raw {
+                Some(uid) if !uid.is_empty() => Some(uid),
+                _ => None,
+            };
+
             Ok(Session {
+                user_id,
                 email: row.get("email")?,
                 device_id: row.get("device_id")?,
                 access_token: row.get("access_token")?,
                 refresh_token: row.get("refresh_token")?,
                 last_sync_time: row.get("last_sync_time")?,
                 server_url: row.get("server_url")?,
+                timeout: row.get("timeout")?,
+                timeout_action,
             })
         });
 
@@ -364,21 +443,26 @@ impl VaultRepository {
     }
 
     pub fn save_saved_keys(&self, enc: &[u8; 32], mac: &[u8; 32]) -> Result<(), String> {
+        let active_uid = self.get_active_user_id()?.unwrap_or_default();
         let enc_hex = hex::encode(enc);
         let mac_hex = hex::encode(mac);
-        self.conn.execute(
-            "UPDATE session_metadata SET enc_key = ?1, mac_key = ?2 WHERE id = 1",
-            rusqlite::params![&enc_hex, &mac_hex],
-        ).map_err(|e| format!("Failed to save keys: {}", e))?;
+        self.conn
+            .execute(
+                "UPDATE session_metadata SET enc_key = ?1, mac_key = ?2 WHERE user_id = ?3",
+                rusqlite::params![&enc_hex, &mac_hex, active_uid],
+            )
+            .map_err(|e| format!("Failed to save keys: {}", e))?;
         Ok(())
     }
 
     pub fn load_saved_keys(&self) -> Result<Option<([u8; 32], [u8; 32])>, String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT enc_key, mac_key FROM session_metadata WHERE id = 1"
-        ).map_err(|e| e.to_string())?;
+        let active_uid = self.get_active_user_id()?.unwrap_or_default();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT enc_key, mac_key FROM session_metadata WHERE user_id = ?1")
+            .map_err(|e| e.to_string())?;
 
-        let res = stmt.query_row((), |row| {
+        let res = stmt.query_row((active_uid,), |row| {
             let enc: Option<String> = row.get("enc_key")?;
             let mac: Option<String> = row.get("mac_key")?;
             Ok((enc, mac))
@@ -408,10 +492,13 @@ impl VaultRepository {
     }
 
     pub fn clear_saved_keys(&self) -> Result<(), String> {
-        self.conn.execute(
-            "UPDATE session_metadata SET enc_key = NULL, mac_key = NULL WHERE id = 1",
-            (),
-        ).map_err(|e| format!("Failed to clear keys: {}", e))?;
+        let active_uid = self.get_active_user_id()?.unwrap_or_default();
+        self.conn
+            .execute(
+                "UPDATE session_metadata SET enc_key = NULL, mac_key = NULL WHERE user_id = ?1",
+                rusqlite::params![active_uid],
+            )
+            .map_err(|e| format!("Failed to clear keys: {}", e))?;
         Ok(())
     }
 
@@ -420,7 +507,8 @@ impl VaultRepository {
     }
 
     pub fn delete_cipher(&mut self, id: &str) -> Result<(), String> {
-        self.conn.execute("DELETE FROM ciphers WHERE id = ?1", (id,))
+        self.conn
+            .execute("DELETE FROM ciphers WHERE id = ?1", (id,))
             .map_err(|e| format!("Failed to delete cipher: {}", e))?;
         Ok(())
     }
@@ -434,7 +522,8 @@ impl VaultRepository {
     }
 
     pub fn delete_folder(&mut self, id: &str) -> Result<(), String> {
-        self.conn.execute("DELETE FROM folders WHERE id = ?1", (id,))
+        self.conn
+            .execute("DELETE FROM folders WHERE id = ?1", (id,))
             .map_err(|e| format!("Failed to delete folder: {}", e))?;
         Ok(())
     }
@@ -447,9 +536,373 @@ impl VaultRepository {
         Ok(())
     }
 
+    pub fn load_profile_and_organizations(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<(ProfileSync, Option<Vec<crate::api::OrganizationSync>>), String> {
+        use crate::api::OrganizationSync;
+
+        // 1. Load Profile
+        let mut stmt = if user_id.is_some() {
+            self.conn.prepare(
+                "SELECT u.id, u.email, u.email_verified, u.name, u.premium, u.premium_from_organization, u.private_key, u.public_key, u.security_stamp, u.two_factor_enabled, u.uses_key_connector, u.culture, u.creation_date, u.avatar_color, u.force_password_reset, u.key, u._status, u.extra FROM users u WHERE u.id = ?1"
+            ).map_err(|e| e.to_string())?
+        } else {
+            self.conn.prepare(
+                "SELECT u.id, u.email, u.email_verified, u.name, u.premium, u.premium_from_organization, u.private_key, u.public_key, u.security_stamp, u.two_factor_enabled, u.uses_key_connector, u.culture, u.creation_date, u.avatar_color, u.force_password_reset, u.key, u._status, u.extra FROM users u JOIN session_metadata s ON u.id = s.user_id ORDER BY s.last_activated DESC LIMIT 1"
+            ).map_err(|e| e.to_string())?
+        };
+
+        let res = if let Some(uid) = user_id {
+            stmt.query_row(rusqlite::params![uid], |row| {
+                let id: String = row.get("id")?;
+                let email: String = row.get("email")?;
+                let email_verified = row.get::<_, i32>("email_verified")? != 0;
+                let name: Option<String> = row.get("name")?;
+                let premium = row.get::<_, i32>("premium")? != 0;
+                let premium_from_organization = row.get::<_, i32>("premium_from_organization")? != 0;
+                let private_key: Option<String> = row.get("private_key")?;
+                let public_key: Option<String> = row.get("public_key")?;
+                let security_stamp: Option<String> = row.get("security_stamp")?;
+                let two_factor_enabled = row.get::<_, i32>("two_factor_enabled")? != 0;
+                let uses_key_connector = row.get::<_, i32>("uses_key_connector")? != 0;
+                let culture: String = row.get("culture")?;
+                let creation_date: String = row.get("creation_date")?;
+                let avatar_color: Option<String> = row.get("avatar_color")?;
+                let force_password_reset = row.get::<_, i32>("force_password_reset")? != 0;
+                let key: String = row.get("key")?;
+                let _status: Option<i32> = row.get("_status")?;
+                let extra_json: String = row.get("extra")?;
+
+                Ok((
+                    id,
+                    email,
+                    email_verified,
+                    name,
+                    premium,
+                    premium_from_organization,
+                    private_key,
+                    public_key,
+                    security_stamp,
+                    two_factor_enabled,
+                    uses_key_connector,
+                    culture,
+                    creation_date,
+                    avatar_color,
+                    force_password_reset,
+                    key,
+                    _status,
+                    extra_json,
+                ))
+            })
+        } else {
+            stmt.query_row((), |row| {
+                let id: String = row.get("id")?;
+                let email: String = row.get("email")?;
+                let email_verified = row.get::<_, i32>("email_verified")? != 0;
+                let name: Option<String> = row.get("name")?;
+                let premium = row.get::<_, i32>("premium")? != 0;
+                let premium_from_organization = row.get::<_, i32>("premium_from_organization")? != 0;
+                let private_key: Option<String> = row.get("private_key")?;
+                let public_key: Option<String> = row.get("public_key")?;
+                let security_stamp: Option<String> = row.get("security_stamp")?;
+                let two_factor_enabled = row.get::<_, i32>("two_factor_enabled")? != 0;
+                let uses_key_connector = row.get::<_, i32>("uses_key_connector")? != 0;
+                let culture: String = row.get("culture")?;
+                let creation_date: String = row.get("creation_date")?;
+                let avatar_color: Option<String> = row.get("avatar_color")?;
+                let force_password_reset = row.get::<_, i32>("force_password_reset")? != 0;
+                let key: String = row.get("key")?;
+                let _status: Option<i32> = row.get("_status")?;
+                let extra_json: String = row.get("extra")?;
+
+                Ok((
+                    id,
+                    email,
+                    email_verified,
+                    name,
+                    premium,
+                    premium_from_organization,
+                    private_key,
+                    public_key,
+                    security_stamp,
+                    two_factor_enabled,
+                    uses_key_connector,
+                    culture,
+                    creation_date,
+                    avatar_color,
+                    force_password_reset,
+                    key,
+                    _status,
+                    extra_json,
+                ))
+            })
+        };
+
+        let (
+            id,
+            email,
+            email_verified,
+            name,
+            premium,
+            premium_from_organization,
+            private_key,
+            public_key,
+            security_stamp,
+            two_factor_enabled,
+            uses_key_connector,
+            culture,
+            creation_date,
+            avatar_color,
+            force_password_reset,
+            key,
+            _status,
+            extra_json,
+        ) = match res {
+            Ok(val) => val,
+            Err(e) => return Err(format!("Failed to load user profile: {}", e)),
+        };
+        let extra_profile: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&extra_json).unwrap_or_default();
+
+        // Load organizations
+        let mut org_stmt = self
+            .conn
+            .prepare("SELECT id, name, key, object FROM organizations")
+            .map_err(|e| e.to_string())?;
+        let org_iter = org_stmt
+            .query_map((), |row| {
+                Ok(OrganizationSync {
+                    id: row.get("id")?,
+                    name: row.get("name")?,
+                    key: row.get("key")?,
+                    object: row.get("object")?,
+                    extra: std::collections::HashMap::new(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut organizations = Vec::new();
+        for org in org_iter {
+            organizations.push(org.map_err(|e| e.to_string())?);
+        }
+        let organizations_opt = if organizations.is_empty() {
+            None
+        } else {
+            Some(organizations)
+        };
+
+        let profile = ProfileSync {
+            id,
+            email,
+            email_verified,
+            name,
+            premium,
+            premium_from_organization,
+            private_key,
+            public_key,
+            security_stamp,
+            two_factor_enabled,
+            uses_key_connector,
+            culture,
+            creation_date,
+            avatar_color,
+            force_password_reset,
+            key,
+            organizations: None,
+            provider_organizations: None,
+            providers: None,
+            _status,
+            object: "profile".to_string(),
+            extra: extra_profile,
+        };
+
+        Ok((profile, organizations_opt))
+    }
+
+    pub fn list_ssh_ciphers(&self, user_id: &str) -> Result<Vec<CipherSync>, String> {
+        use crate::api::{FieldSync, LoginSync, SshKeySync};
+
+        // Query ciphers that are native SSH keys (type 5 or type 100)
+        // OR are Secure Notes (type 2) which may contain SSH keys in notes
+        // OR have fields with names like 'ssh_private_key', 'ssh-private-key', or containing 'ssh_key'
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT c.id, c.organization_id, c.type, c.name, c.notes, c.favorite, c.reprompt, c.organization_use_totp, c.edit, c.view_password, c.creation_date, c.revision_date, c.deleted_date, c.archived_date, c.key, c.object, c.extra
+             FROM ciphers c
+             LEFT JOIN cipher_ssh_keys s ON c.id = s.cipher_id
+             LEFT JOIN cipher_fields f ON c.id = f.cipher_id
+             WHERE c.user_id = ?1 AND (c.type IN (5, 100)
+                OR c.type = 2
+                OR LOWER(f.name) = 'ssh_private_key'
+                OR LOWER(f.name) = 'ssh-private-key'
+                OR LOWER(f.name) LIKE '%ssh_key%')"
+        ).map_err(|e| e.to_string())?;
+
+        // Load logins for those ciphers (just in case they are login ciphers with custom fields)
+        let mut login_stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT l.cipher_id, l.username, l.password, l.uri
+             FROM cipher_logins l
+             JOIN ciphers c ON l.cipher_id = c.id
+             LEFT JOIN cipher_fields f ON c.id = f.cipher_id
+             WHERE c.user_id = ?1 AND (c.type IN (5, 100)
+                OR c.type = 2
+                OR LOWER(f.name) = 'ssh_private_key'
+                OR LOWER(f.name) = 'ssh-private-key'
+                OR LOWER(f.name) LIKE '%ssh_key%')",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut logins_map = std::collections::HashMap::new();
+        let login_iter = login_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    LoginSync {
+                        username: row.get("username")?,
+                        password: row.get("password")?,
+                        uri: row.get("uri")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for item in login_iter {
+            let (cid, login) = item.map_err(|e| e.to_string())?;
+            logins_map.insert(cid, login);
+        }
+
+        // Load SSH Keys for those ciphers
+        let mut ssh_stmt = self
+            .conn
+            .prepare(
+                "SELECT s.cipher_id, s.private_key, s.public_key
+             FROM cipher_ssh_keys s
+             JOIN ciphers c ON s.cipher_id = c.id
+             WHERE c.user_id = ?1 AND c.type IN (5, 100)",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut ssh_map = std::collections::HashMap::new();
+        let ssh_iter = ssh_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    SshKeySync {
+                        private_key: row.get("private_key")?,
+                        public_key: row.get("public_key")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for item in ssh_iter {
+            let (cid, ssh) = item.map_err(|e| e.to_string())?;
+            ssh_map.insert(cid, ssh);
+        }
+
+        // Load fields for those ciphers
+        let mut field_stmt = self
+            .conn
+            .prepare(
+                "SELECT f.cipher_id, f.name, f.value, f.type
+             FROM cipher_fields f
+             JOIN ciphers c ON f.cipher_id = c.id
+             LEFT JOIN cipher_fields f2 ON c.id = f2.cipher_id
+             WHERE c.user_id = ?1 AND (c.type IN (5, 100)
+                OR c.type = 2
+                OR LOWER(f2.name) = 'ssh_private_key'
+                OR LOWER(f2.name) = 'ssh-private-key'
+                OR LOWER(f2.name) LIKE '%ssh_key%')",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut fields_map: std::collections::HashMap<String, Vec<FieldSync>> =
+            std::collections::HashMap::new();
+        let field_iter = field_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    FieldSync {
+                        name: row.get("name")?,
+                        value: row.get("value")?,
+                        r#type: row.get("type")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for item in field_iter {
+            let (cid, field) = item.map_err(|e| e.to_string())?;
+            fields_map.entry(cid).or_default().push(field);
+        }
+
+        let cipher_iter = stmt
+            .query_map((user_id,), |row| {
+                let id: String = row.get("id")?;
+                let organization_id: Option<String> = row.get("organization_id")?;
+                let r#type: i32 = row.get("type")?;
+                let name: Option<String> = row.get("name")?;
+                let notes: Option<String> = row.get("notes")?;
+                let favorite = row.get::<_, i32>("favorite")? != 0;
+                let reprompt: i32 = row.get("reprompt")?;
+                let organization_use_totp = row.get::<_, i32>("organization_use_totp")? != 0;
+                let edit = row.get::<_, i32>("edit")? != 0;
+                let view_password = row.get::<_, i32>("view_password")? != 0;
+                let creation_date: String = row.get("creation_date")?;
+                let revision_date: String = row.get("revision_date")?;
+                let deleted_date: Option<String> = row.get("deleted_date")?;
+                let archived_date: Option<String> = row.get("archived_date")?;
+                let key: Option<String> = row.get("key")?;
+                let object: String = row.get("object")?;
+                let extra_json: String = row.get("extra")?;
+
+                let login = logins_map.get(&id).cloned();
+                let ssh_key = ssh_map.get(&id).cloned();
+                let fields_opt = fields_map.get(&id).cloned();
+                let extra: std::collections::HashMap<String, serde_json::Value> =
+                    serde_json::from_str(&extra_json).unwrap_or_default();
+
+                Ok(CipherSync {
+                    id,
+                    organization_id,
+                    folder_id: None,
+                    r#type,
+                    name,
+                    notes,
+                    favorite,
+                    reprompt,
+                    organization_use_totp,
+                    edit,
+                    view_password,
+                    creation_date,
+                    revision_date,
+                    deleted_date,
+                    archived_date,
+                    key,
+                    login,
+                    card: None,
+                    identity: None,
+                    secure_note: None,
+                    ssh_key,
+                    fields: fields_opt,
+                    attachments: None,
+                    collection_ids: None,
+                    password_history: None,
+                    permissions: None,
+                    object,
+                    extra,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut ciphers = Vec::new();
+        for c in cipher_iter {
+            ciphers.push(c.map_err(|e| e.to_string())?);
+        }
+        Ok(ciphers)
+    }
+
     pub fn get_cipher(&self, id: &str) -> Result<Option<CipherSync>, String> {
-        use crate::api::{LoginSync, SshKeySync, FieldSync, AttachmentSync};
-        
+        use crate::api::{AttachmentSync, FieldSync, LoginSync, SshKeySync};
+
         let mut stmt = self.conn.prepare(
             "SELECT id, organization_id, folder_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra FROM ciphers WHERE id = ?1"
         ).map_err(|e| e.to_string())?;
@@ -473,19 +926,61 @@ impl VaultRepository {
             let key: Option<String> = row.get("key")?;
             let object: String = row.get("object")?;
             let extra_json: String = row.get("extra")?;
-            let extra: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
+            let extra: std::collections::HashMap<String, serde_json::Value> =
+                serde_json::from_str(&extra_json).unwrap_or_default();
 
-            Ok((id, org_id, folder_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra))
+            Ok((
+                id,
+                org_id,
+                folder_id,
+                r#type,
+                name,
+                notes,
+                favorite,
+                reprompt,
+                organization_use_totp,
+                edit,
+                view_password,
+                creation_date,
+                revision_date,
+                deleted_date,
+                archived_date,
+                key,
+                object,
+                extra,
+            ))
         });
 
-        let (id, org_id, folder_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra) = match res {
+        let (
+            id,
+            org_id,
+            folder_id,
+            r#type,
+            name,
+            notes,
+            favorite,
+            reprompt,
+            organization_use_totp,
+            edit,
+            view_password,
+            creation_date,
+            revision_date,
+            deleted_date,
+            archived_date,
+            key,
+            object,
+            extra,
+        ) = match res {
             Ok(val) => val,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
             Err(e) => return Err(e.to_string()),
         };
 
         // Query login
-        let mut login_stmt = self.conn.prepare("SELECT username, password, uri FROM cipher_logins WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
+        let mut login_stmt = self
+            .conn
+            .prepare("SELECT username, password, uri FROM cipher_logins WHERE cipher_id = ?1")
+            .map_err(|e| e.to_string())?;
         let login = match login_stmt.query_row(rusqlite::params![id], |row| {
             Ok(LoginSync {
                 username: row.get("username")?,
@@ -498,7 +993,10 @@ impl VaultRepository {
         };
 
         // Query SSH Key
-        let mut ssh_stmt = self.conn.prepare("SELECT private_key, public_key FROM cipher_ssh_keys WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
+        let mut ssh_stmt = self
+            .conn
+            .prepare("SELECT private_key, public_key FROM cipher_ssh_keys WHERE cipher_id = ?1")
+            .map_err(|e| e.to_string())?;
         let ssh_key = match ssh_stmt.query_row(rusqlite::params![id], |row| {
             Ok(SshKeySync {
                 private_key: row.get("private_key")?,
@@ -510,34 +1008,52 @@ impl VaultRepository {
         };
 
         // Query fields
-        let mut field_stmt = self.conn.prepare("SELECT name, value, type FROM cipher_fields WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
-        let field_iter = field_stmt.query_map(rusqlite::params![id], |row| {
-            Ok(FieldSync {
-                name: row.get("name")?,
-                value: row.get("value")?,
-                r#type: row.get("type")?,
+        let mut field_stmt = self
+            .conn
+            .prepare("SELECT name, value, type FROM cipher_fields WHERE cipher_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let field_iter = field_stmt
+            .query_map(rusqlite::params![id], |row| {
+                Ok(FieldSync {
+                    name: row.get("name")?,
+                    value: row.get("value")?,
+                    r#type: row.get("type")?,
+                })
             })
-        }).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         let mut fields = Vec::new();
         for f in field_iter {
             fields.push(f.map_err(|e| e.to_string())?);
         }
-        let fields_opt = if fields.is_empty() { None } else { Some(fields) };
+        let fields_opt = if fields.is_empty() {
+            None
+        } else {
+            Some(fields)
+        };
 
         // Query attachments
-        let mut att_stmt = self.conn.prepare("SELECT id, file_name, size FROM attachments WHERE cipher_id = ?1").map_err(|e| e.to_string())?;
-        let att_iter = att_stmt.query_map(rusqlite::params![id], |row| {
-            Ok(AttachmentSync {
-                id: row.get("id")?,
-                file_name: row.get("file_name")?,
-                size: row.get("size")?,
+        let mut att_stmt = self
+            .conn
+            .prepare("SELECT id, file_name, size FROM attachments WHERE cipher_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let att_iter = att_stmt
+            .query_map(rusqlite::params![id], |row| {
+                Ok(AttachmentSync {
+                    id: row.get("id")?,
+                    file_name: row.get("file_name")?,
+                    size: row.get("size")?,
+                })
             })
-        }).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         let mut attachments = Vec::new();
         for a in att_iter {
             attachments.push(a.map_err(|e| e.to_string())?);
         }
-        let attachments_opt = if attachments.is_empty() { None } else { Some(attachments) };
+        let attachments_opt = if attachments.is_empty() {
+            None
+        } else {
+            Some(attachments)
+        };
 
         Ok(Some(CipherSync {
             id,
@@ -571,119 +1087,191 @@ impl VaultRepository {
         }))
     }
 
-    pub fn list_ciphers(&self) -> Result<Vec<CipherSync>, String> {
-        use crate::api::{LoginSync, SshKeySync, FieldSync, AttachmentSync};
+    pub fn list_ciphers(&self, user_id: &str) -> Result<Vec<CipherSync>, String> {
+        use crate::api::{AttachmentSync, FieldSync, LoginSync, SshKeySync};
 
         // Query base ciphers
         let mut stmt = self.conn.prepare(
-            "SELECT id, organization_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra FROM ciphers"
+            "SELECT id, organization_id, type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra FROM ciphers WHERE user_id = ?1"
         ).map_err(|e| e.to_string())?;
 
-        // Batch load all logins
-        let mut login_stmt = self.conn.prepare("SELECT cipher_id, username, password, uri FROM cipher_logins").map_err(|e| e.to_string())?;
+        // Batch load logins for user
+        let mut login_stmt = self.conn.prepare(
+            "SELECT l.cipher_id, l.username, l.password, l.uri FROM cipher_logins l JOIN ciphers c ON l.cipher_id = c.id WHERE c.user_id = ?1"
+        ).map_err(|e| e.to_string())?;
         let mut logins_map = std::collections::HashMap::new();
-        let login_iter = login_stmt.query_map((), |row| {
-            let cid: String = row.get("cipher_id")?;
-            Ok((cid, LoginSync {
-                username: row.get("username")?,
-                password: row.get("password")?,
-                uri: row.get("uri")?,
-            }))
-        }).map_err(|e| e.to_string())?;
+        let login_iter = login_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    LoginSync {
+                        username: row.get("username")?,
+                        password: row.get("password")?,
+                        uri: row.get("uri")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
         for item in login_iter {
             let (cid, login) = item.map_err(|e| e.to_string())?;
             logins_map.insert(cid, login);
         }
 
-        // Batch load all SSH Keys
-        let mut ssh_stmt = self.conn.prepare("SELECT cipher_id, private_key, public_key FROM cipher_ssh_keys").map_err(|e| e.to_string())?;
+        // Batch load SSH Keys for user
+        let mut ssh_stmt = self.conn.prepare(
+            "SELECT s.cipher_id, s.private_key, s.public_key FROM cipher_ssh_keys s JOIN ciphers c ON s.cipher_id = c.id WHERE c.user_id = ?1"
+        ).map_err(|e| e.to_string())?;
         let mut ssh_map = std::collections::HashMap::new();
-        let ssh_iter = ssh_stmt.query_map((), |row| {
-            let cid: String = row.get("cipher_id")?;
-            Ok((cid, SshKeySync {
-                private_key: row.get("private_key")?,
-                public_key: row.get("public_key")?,
-            }))
-        }).map_err(|e| e.to_string())?;
+        let ssh_iter = ssh_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    SshKeySync {
+                        private_key: row.get("private_key")?,
+                        public_key: row.get("public_key")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
         for item in ssh_iter {
             let (cid, ssh) = item.map_err(|e| e.to_string())?;
             ssh_map.insert(cid, ssh);
         }
 
-        // Batch load all fields
-        let mut field_stmt = self.conn.prepare("SELECT cipher_id, name, value, type FROM cipher_fields").map_err(|e| e.to_string())?;
-        let mut fields_map: std::collections::HashMap<String, Vec<FieldSync>> = std::collections::HashMap::new();
-        let field_iter = field_stmt.query_map((), |row| {
-            let cid: String = row.get("cipher_id")?;
-            Ok((cid, FieldSync {
-                name: row.get("name")?,
-                value: row.get("value")?,
-                r#type: row.get("type")?,
-            }))
-        }).map_err(|e| e.to_string())?;
+        // Batch load fields for user
+        let mut field_stmt = self.conn.prepare(
+            "SELECT f.cipher_id, f.name, f.value, f.type FROM cipher_fields f JOIN ciphers c ON f.cipher_id = c.id WHERE c.user_id = ?1"
+        ).map_err(|e| e.to_string())?;
+        let mut fields_map: std::collections::HashMap<String, Vec<FieldSync>> =
+            std::collections::HashMap::new();
+        let field_iter = field_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    FieldSync {
+                        name: row.get("name")?,
+                        value: row.get("value")?,
+                        r#type: row.get("type")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
         for item in field_iter {
             let (cid, field) = item.map_err(|e| e.to_string())?;
             fields_map.entry(cid).or_default().push(field);
         }
 
-        // Batch load all attachments
-        let mut att_stmt = self.conn.prepare("SELECT id, cipher_id, file_name, size FROM attachments").map_err(|e| e.to_string())?;
-        let mut att_map: std::collections::HashMap<String, Vec<AttachmentSync>> = std::collections::HashMap::new();
-        let att_iter = att_stmt.query_map((), |row| {
-            let id: String = row.get("id")?;
-            let cid: String = row.get("cipher_id")?;
-            Ok((cid, AttachmentSync {
-                id,
-                file_name: row.get("file_name")?,
-                size: row.get("size")?,
-            }))
-        }).map_err(|e| e.to_string())?;
+        // Batch load attachments for user
+        let mut att_stmt = self.conn.prepare(
+            "SELECT a.id, a.cipher_id, a.file_name, a.size FROM attachments a JOIN ciphers c ON a.cipher_id = c.id WHERE c.user_id = ?1"
+        ).map_err(|e| e.to_string())?;
+        let mut att_map: std::collections::HashMap<String, Vec<AttachmentSync>> =
+            std::collections::HashMap::new();
+        let att_iter = att_stmt
+            .query_map((user_id,), |row| {
+                let id: String = row.get("id")?;
+                let cid: String = row.get("cipher_id")?;
+                Ok((
+                    cid,
+                    AttachmentSync {
+                        id,
+                        file_name: row.get("file_name")?,
+                        size: row.get("size")?,
+                    },
+                ))
+            })
+            .map_err(|e| e.to_string())?;
         for item in att_iter {
             let (cid, att) = item.map_err(|e| e.to_string())?;
             att_map.entry(cid).or_default().push(att);
         }
 
-        // Batch load folder mappings
-        let mut folder_stmt = self.conn.prepare("SELECT cipher_id, folder_id FROM folders_ciphers").map_err(|e| e.to_string())?;
+        // Batch load folder mappings for user
+        let mut folder_stmt = self.conn.prepare(
+            "SELECT fc.cipher_id, fc.folder_id FROM folders_ciphers fc JOIN ciphers c ON fc.cipher_id = c.id WHERE c.user_id = ?1"
+        ).map_err(|e| e.to_string())?;
         let mut folders_map = std::collections::HashMap::new();
-        let folder_iter = folder_stmt.query_map((), |row| {
-            let cid: String = row.get("cipher_id")?;
-            let fid: String = row.get("folder_id")?;
-            Ok((cid, fid))
-        }).map_err(|e| e.to_string())?;
+        let folder_iter = folder_stmt
+            .query_map((user_id,), |row| {
+                let cid: String = row.get("cipher_id")?;
+                let fid: String = row.get("folder_id")?;
+                Ok((cid, fid))
+            })
+            .map_err(|e| e.to_string())?;
         for item in folder_iter {
             let (cid, fid) = item.map_err(|e| e.to_string())?;
             folders_map.insert(cid, fid);
         }
 
         // Query base ciphers and build the final list
-        let cipher_iter = stmt.query_map((), |row| {
-            let id: String = row.get("id")?;
-            let org_id: Option<String> = row.get("organization_id")?;
-            let r#type: i32 = row.get("type")?;
-            let name: Option<String> = row.get("name")?;
-            let notes: Option<String> = row.get("notes")?;
-            let favorite = row.get::<_, i32>("favorite")? != 0;
-            let reprompt: i32 = row.get("reprompt")?;
-            let organization_use_totp = row.get::<_, i32>("organization_use_totp")? != 0;
-            let edit = row.get::<_, i32>("edit")? != 0;
-            let view_password = row.get::<_, i32>("view_password")? != 0;
-            let creation_date: String = row.get("creation_date")?;
-            let revision_date: String = row.get("revision_date")?;
-            let deleted_date: Option<String> = row.get("deleted_date")?;
-            let archived_date: Option<String> = row.get("archived_date")?;
-            let key: Option<String> = row.get("key")?;
-            let object: String = row.get("object")?;
-            let extra_json: String = row.get("extra")?;
+        let cipher_iter = stmt
+            .query_map((user_id,), |row| {
+                let id: String = row.get("id")?;
+                let org_id: Option<String> = row.get("organization_id")?;
+                let r#type: i32 = row.get("type")?;
+                let name: Option<String> = row.get("name")?;
+                let notes: Option<String> = row.get("notes")?;
+                let favorite = row.get::<_, i32>("favorite")? != 0;
+                let reprompt: i32 = row.get("reprompt")?;
+                let organization_use_totp = row.get::<_, i32>("organization_use_totp")? != 0;
+                let edit = row.get::<_, i32>("edit")? != 0;
+                let view_password = row.get::<_, i32>("view_password")? != 0;
+                let creation_date: String = row.get("creation_date")?;
+                let revision_date: String = row.get("revision_date")?;
+                let deleted_date: Option<String> = row.get("deleted_date")?;
+                let archived_date: Option<String> = row.get("archived_date")?;
+                let key: Option<String> = row.get("key")?;
+                let object: String = row.get("object")?;
+                let extra_json: String = row.get("extra")?;
 
-            Ok((id, org_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra_json))
-        }).map_err(|e| e.to_string())?;
+                Ok((
+                    id,
+                    org_id,
+                    r#type,
+                    name,
+                    notes,
+                    favorite,
+                    reprompt,
+                    organization_use_totp,
+                    edit,
+                    view_password,
+                    creation_date,
+                    revision_date,
+                    deleted_date,
+                    archived_date,
+                    key,
+                    object,
+                    extra_json,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
 
         let mut ciphers = Vec::new();
         for cipher_row in cipher_iter {
-            let (id, org_id, r#type, name, notes, favorite, reprompt, organization_use_totp, edit, view_password, creation_date, revision_date, deleted_date, archived_date, key, object, extra_json) = cipher_row.map_err(|e| e.to_string())?;
+            let (
+                id,
+                org_id,
+                r#type,
+                name,
+                notes,
+                favorite,
+                reprompt,
+                organization_use_totp,
+                edit,
+                view_password,
+                creation_date,
+                revision_date,
+                deleted_date,
+                archived_date,
+                key,
+                object,
+                extra_json,
+            ) = cipher_row.map_err(|e| e.to_string())?;
             let extra = serde_json::from_str(&extra_json).unwrap_or_default();
-            
+
             let login = logins_map.get(&id).cloned();
             let ssh_key = ssh_map.get(&id).cloned();
             let fields = fields_map.get(&id).cloned();
@@ -728,18 +1316,78 @@ impl VaultRepository {
     pub fn save_sync_response(&mut self, sync: &SyncResponse) -> Result<(), String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
 
-        // Clear existing data
-        tx.execute("DELETE FROM users", ()).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM organizations", ()).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM folders", ()).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM ciphers", ()).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM sync_metadata", ()).map_err(|e| e.to_string())?;
+        let profile = &sync.profile;
+
+        // Clear existing data for this user to avoid duplication/stale data
+        tx.execute("DELETE FROM folders WHERE user_id = ?1", (&profile.id,))
+            .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM ciphers WHERE user_id = ?1", (&profile.id,))
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM sync_metadata WHERE user_id = ?1",
+            (&profile.id,),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM organizations", ())
+            .map_err(|e| e.to_string())?;
+
+        // 0. Ensure session_metadata exists for this profile.id before users table insertion
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM session_metadata WHERE user_id = ?1",
+                rusqlite::params![&profile.id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !exists {
+            let temp_exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM session_metadata WHERE user_id = ''",
+                    (),
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if temp_exists {
+                tx.execute(
+                    "INSERT OR REPLACE INTO session_metadata (user_id, email, device_id, access_token, refresh_token, last_sync_time, server_url, enc_key, mac_key, last_activated)
+                     SELECT ?1, email, device_id, access_token, refresh_token, last_sync_time, server_url, enc_key, mac_key, ?2
+                     FROM session_metadata WHERE user_id = ''",
+                    rusqlite::params![&profile.id, now_ms],
+                ).map_err(|e| format!("Failed to transition session_metadata: {}", e))?;
+
+                // Delete the temporary/anonymous session row completely
+                tx.execute(
+                    "DELETE FROM session_metadata WHERE user_id = ''",
+                    (),
+                ).map_err(|e| format!("Failed to delete temporary session: {}", e))?;
+            } else {
+                // Fallback for tests or direct calls where no pre-existing session exists.
+                // Generate a random UUID for device_id since the actual device_id is maintained in the global config.
+                let fallback_device_id = uuid::Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT OR REPLACE INTO session_metadata (user_id, email, device_id, last_activated)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![&profile.id, &profile.email, fallback_device_id, now_ms],
+                ).map_err(|e| format!("Failed to insert default/test session: {}", e))?;
+            }
+        } else {
+            tx.execute(
+                "UPDATE session_metadata SET last_activated = ?1 WHERE user_id = ?2",
+                rusqlite::params![now_ms, &profile.id],
+            )
+            .map_err(|e| format!("Failed to update active session: {}", e))?;
+        }
 
         // 1. Save profile
-        let profile = &sync.profile;
         let extra_profile_json = serde_json::to_string(&profile.extra).unwrap_or_default();
         tx.execute(
-            "INSERT INTO users (id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT OR REPLACE INTO users (id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             rusqlite::params![
                 &profile.id,
                 &profile.email,
@@ -766,9 +1414,10 @@ impl VaultRepository {
         if let Some(ref orgs) = profile.organizations {
             for org in orgs {
                 tx.execute(
-                    "INSERT INTO organizations (id, name, key, object) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR REPLACE INTO organizations (id, name, key, object) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![&org.id, &org.name, &org.key, &org.object],
-                ).map_err(|e| format!("Failed to save organization: {}", e))?;
+                )
+                .map_err(|e| format!("Failed to save organization: {}", e))?;
             }
         }
 
@@ -776,7 +1425,7 @@ impl VaultRepository {
         if let Some(ref folders) = sync.folders {
             for folder in folders {
                 tx.execute(
-                    "INSERT INTO folders (id, user_id, name, object, revision_date) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT OR REPLACE INTO folders (id, user_id, name, object, revision_date) VALUES (?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![&folder.id, &profile.id, &folder.name, &folder.object, &folder.revision_date],
                 ).map_err(|e| format!("Failed to save folder: {}", e))?;
             }
@@ -794,8 +1443,8 @@ impl VaultRepository {
         };
 
         tx.execute(
-            "INSERT OR REPLACE INTO sync_metadata (id, domains, policies, sends, object, masterPasswordUnlock, extra) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![&domains_json, &policies_json, &sends_json, &sync.object, &mpu_json, &extra_sync_json],
+            "INSERT OR REPLACE INTO sync_metadata (user_id, domains, policies, sends, object, masterPasswordUnlock, extra) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![&profile.id, &domains_json, &policies_json, &sends_json, &sync.object, &mpu_json, &extra_sync_json],
         ).map_err(|e| format!("Failed to save sync metadata: {}", e))?;
 
         // 5. Save ciphers
@@ -803,16 +1452,19 @@ impl VaultRepository {
             save_cipher_conn(&tx, cipher, &profile.id)?;
         }
 
-        tx.commit().map_err(|e| format!("Failed to commit transaction: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
         Ok(())
     }
 
     pub fn load_sync_response(&self) -> Result<SyncResponse, String> {
-        use crate::api::{OrganizationSync, FolderSync, MasterPasswordUnlockSync, UserDecryptionSync};
+        use crate::api::{
+            FolderSync, MasterPasswordUnlockSync, OrganizationSync, UserDecryptionSync,
+        };
 
-        // 1. Load Profile
+        // 1. Load Profile of the active user
         let mut stmt = self.conn.prepare(
-            "SELECT id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra FROM users LIMIT 1"
+            "SELECT u.id, u.email, u.email_verified, u.name, u.premium, u.premium_from_organization, u.private_key, u.public_key, u.security_stamp, u.two_factor_enabled, u.uses_key_connector, u.culture, u.creation_date, u.avatar_color, u.force_password_reset, u.key, u._status, u.extra FROM users u JOIN session_metadata s ON u.id = s.user_id ORDER BY s.last_activated DESC LIMIT 1"
         ).map_err(|e| e.to_string())?;
 
         let res = stmt.query_row((), |row| {
@@ -835,34 +1487,82 @@ impl VaultRepository {
             let _status: Option<i32> = row.get("_status")?;
             let extra_json: String = row.get("extra")?;
 
-            Ok((id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra_json))
+            Ok((
+                id,
+                email,
+                email_verified,
+                name,
+                premium,
+                premium_from_organization,
+                private_key,
+                public_key,
+                security_stamp,
+                two_factor_enabled,
+                uses_key_connector,
+                culture,
+                creation_date,
+                avatar_color,
+                force_password_reset,
+                key,
+                _status,
+                extra_json,
+            ))
         });
 
-        let (id, email, email_verified, name, premium, premium_from_organization, private_key, public_key, security_stamp, two_factor_enabled, uses_key_connector, culture, creation_date, avatar_color, force_password_reset, key, _status, extra_json) = match res {
+        let (
+            id,
+            email,
+            email_verified,
+            name,
+            premium,
+            premium_from_organization,
+            private_key,
+            public_key,
+            security_stamp,
+            two_factor_enabled,
+            uses_key_connector,
+            culture,
+            creation_date,
+            avatar_color,
+            force_password_reset,
+            key,
+            _status,
+            extra_json,
+        ) = match res {
             Ok(val) => val,
             Err(e) => return Err(format!("Failed to load user profile: {}", e)),
         };
-        let extra_profile: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
+        let extra_profile: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&extra_json).unwrap_or_default();
 
         // Load organizations
-        let mut org_stmt = self.conn.prepare("SELECT id, name, key, object FROM organizations").map_err(|e| e.to_string())?;
-        let org_iter = org_stmt.query_map((), |row| {
-            Ok(OrganizationSync {
-                id: row.get("id")?,
-                name: row.get("name")?,
-                key: row.get("key")?,
-                object: row.get("object")?,
-                extra: std::collections::HashMap::new(),
+        let mut org_stmt = self
+            .conn
+            .prepare("SELECT id, name, key, object FROM organizations")
+            .map_err(|e| e.to_string())?;
+        let org_iter = org_stmt
+            .query_map((), |row| {
+                Ok(OrganizationSync {
+                    id: row.get("id")?,
+                    name: row.get("name")?,
+                    key: row.get("key")?,
+                    object: row.get("object")?,
+                    extra: std::collections::HashMap::new(),
+                })
             })
-        }).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         let mut organizations = Vec::new();
         for org in org_iter {
             organizations.push(org.map_err(|e| e.to_string())?);
         }
-        let organizations_opt = if organizations.is_empty() { None } else { Some(organizations) };
+        let organizations_opt = if organizations.is_empty() {
+            None
+        } else {
+            Some(organizations)
+        };
 
         let profile = ProfileSync {
-            id,
+            id: id.clone(),
             email,
             email_verified,
             name,
@@ -886,28 +1586,37 @@ impl VaultRepository {
             extra: extra_profile,
         };
 
-        // 2. Load folders
-        let mut fold_stmt = self.conn.prepare("SELECT id, name, object, revision_date FROM folders").map_err(|e| e.to_string())?;
-        let fold_iter = fold_stmt.query_map((), |row| {
-            Ok(FolderSync {
-                id: row.get("id")?,
-                name: row.get("name")?,
-                object: row.get("object")?,
-                revision_date: row.get("revision_date")?,
+        // 2. Load folders for this user
+        let mut fold_stmt = self
+            .conn
+            .prepare("SELECT id, name, object, revision_date FROM folders WHERE user_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let fold_iter = fold_stmt
+            .query_map((&id,), |row| {
+                Ok(FolderSync {
+                    id: row.get("id")?,
+                    name: row.get("name")?,
+                    object: row.get("object")?,
+                    revision_date: row.get("revision_date")?,
+                })
             })
-        }).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         let mut folders = Vec::new();
         for f in fold_iter {
             folders.push(f.map_err(|e| e.to_string())?);
         }
-        let folders_opt = if folders.is_empty() { None } else { Some(folders) };
+        let folders_opt = if folders.is_empty() {
+            None
+        } else {
+            Some(folders)
+        };
 
-        // 3. Load ciphers
-        let ciphers = self.list_ciphers()?;
+        // 3. Load ciphers for this user
+        let ciphers = self.list_ciphers(&id)?;
 
-        // 4. Load metadata & KDF parameters
-        let mut meta_stmt = self.conn.prepare("SELECT domains, policies, sends, object, masterPasswordUnlock, extra FROM sync_metadata LIMIT 1").map_err(|e| e.to_string())?;
-        let meta_res = meta_stmt.query_row((), |row| {
+        // 4. Load metadata & KDF parameters for this user
+        let mut meta_stmt = self.conn.prepare("SELECT domains, policies, sends, object, masterPasswordUnlock, extra FROM sync_metadata WHERE user_id = ?1").map_err(|e| e.to_string())?;
+        let meta_res = meta_stmt.query_row((&id,), |row| {
             let domains_json: String = row.get("domains")?;
             let policies_json: String = row.get("policies")?;
             let sends_json: String = row.get("sends")?;
@@ -916,21 +1625,41 @@ impl VaultRepository {
             let extra_json: String = row.get("extra")?;
 
             let domains: Option<serde_json::Value> = serde_json::from_str(&domains_json).ok();
-            let policies: Option<Vec<serde_json::Value>> = serde_json::from_str(&policies_json).ok();
+            let policies: Option<Vec<serde_json::Value>> =
+                serde_json::from_str(&policies_json).ok();
             let sends: Option<Vec<serde_json::Value>> = serde_json::from_str(&sends_json).ok();
-            let master_password_unlock: Option<MasterPasswordUnlockSync> = serde_json::from_str(&mpu_json).ok();
-            let extra: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(&extra_json).unwrap_or_default();
+            let master_password_unlock: Option<MasterPasswordUnlockSync> =
+                serde_json::from_str(&mpu_json).ok();
+            let extra: std::collections::HashMap<String, serde_json::Value> =
+                serde_json::from_str(&extra_json).unwrap_or_default();
 
-            Ok((domains, policies, sends, object, master_password_unlock, extra))
+            Ok((
+                domains,
+                policies,
+                sends,
+                object,
+                master_password_unlock,
+                extra,
+            ))
         });
 
-        let (domains, policies, sends, object, master_password_unlock, extra_sync) = match meta_res {
+        let (domains, policies, sends, object, master_password_unlock, extra_sync) = match meta_res
+        {
             Ok(val) => val,
-            Err(_) => (None, None, None, "sync".to_string(), None, std::collections::HashMap::new()),
+            Err(_) => (
+                None,
+                None,
+                None,
+                "sync".to_string(),
+                None,
+                std::collections::HashMap::new(),
+            ),
         };
 
         let user_decryption = if master_password_unlock.is_some() {
-            Some(UserDecryptionSync { master_password_unlock })
+            Some(UserDecryptionSync {
+                master_password_unlock,
+            })
         } else {
             None
         };
@@ -949,28 +1678,12 @@ impl VaultRepository {
     }
 }
 
-/// Delete the local cache database from disk (used on logout)
-pub fn wipe_db() -> Result<(), String> {
+/// Nuclear delete of the local database file on the filesystem
+pub fn nuclear_db() -> Result<(), String> {
     let path = db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
     if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|e| format!("Failed to delete cache database file: {}", e))?;
-    }
-    Ok(())
-}
-
-pub fn handle_post_sync(
-    _sync_response: &SyncResponse,
-    repo: &VaultRepository,
-    enc_key: &[u8; 32],
-    mac_key: &[u8; 32],
-) -> Result<(), String> {
-    if let Ok(config) = crate::config::Config::load() {
-        if config.timeout.trim().to_lowercase() == "never" {
-            repo.save_saved_keys(enc_key, mac_key)?;
-        } else {
-            repo.clear_saved_keys()?;
-        }
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("Failed to delete database file: {}", e))?;
     }
     Ok(())
 }
@@ -978,7 +1691,8 @@ pub fn handle_post_sync(
 /// Extracts SSH keys from generic decrypted ciphers list
 pub fn extract_ssh_keys_from_ciphers(ciphers: &[CipherItem]) -> Vec<SshKeyItem> {
     let mut ssh_keys = Vec::new();
-    let is_ssh_private_key = |text: &str| -> bool { text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") };
+    let is_ssh_private_key =
+        |text: &str| -> bool { text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") };
 
     for cipher in ciphers {
         // Scenario 1: Native SSH Key Item (type 100)
@@ -1044,19 +1758,30 @@ fn decrypt_org_key(org_key_str: &str, priv_key_der: &[u8]) -> Result<([u8; 32], 
     if parts.len() < 2 {
         return Err("Invalid organization key format".to_string());
     }
-    let enc_type: u32 = parts[0].parse().map_err(|_| "Invalid enc_type".to_string())?;
+    let enc_type: u32 = parts[0]
+        .parse()
+        .map_err(|_| "Invalid enc_type".to_string())?;
     let data_parts: Vec<&str> = parts[1].split('|').collect();
-    let ciphertext = BASE64_STANDARD.decode(data_parts[0])
+    let ciphertext = BASE64_STANDARD
+        .decode(data_parts[0])
         .map_err(|e| format!("Failed to base64 decode organization key ciphertext: {}", e))?;
 
     let decrypted = match enc_type {
         3 | 5 => crypto::decrypt_rsa_oaep_sha256(priv_key_der, &ciphertext)?,
         4 | 6 => crypto::decrypt_rsa_oaep_sha1(priv_key_der, &ciphertext)?,
-        t => return Err(format!("Unsupported organization key encryption type: {}", t)),
+        t => {
+            return Err(format!(
+                "Unsupported organization key encryption type: {}",
+                t
+            ));
+        }
     };
 
     if decrypted.len() != 64 {
-        return Err(format!("Decrypted organization key has invalid length: {} (expected 64)", decrypted.len()));
+        return Err(format!(
+            "Decrypted organization key has invalid length: {} (expected 64)",
+            decrypted.len()
+        ));
     }
 
     let mut enc = [0u8; 32];
@@ -1087,14 +1812,19 @@ pub fn parse_and_decrypt_all_ciphers(
 
     // 2. Decrypt all organization keys
     let mut org_keys = std::collections::HashMap::new();
-    if let (Some(organizations), Some(priv_key_der)) = (&sync_response.profile.organizations, &rsa_priv_key_der) {
+    if let (Some(organizations), Some(priv_key_der)) =
+        (&sync_response.profile.organizations, &rsa_priv_key_der)
+    {
         for org in organizations {
             match decrypt_org_key(&org.key, priv_key_der) {
                 Ok((org_enc, org_mac)) => {
                     org_keys.insert(org.id.clone(), (org_enc, org_mac));
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to decrypt organization key for {}: {}", org.id, e);
+                    eprintln!(
+                        "Warning: Failed to decrypt organization key for {}: {}",
+                        org.id, e
+                    );
                 }
             }
         }
@@ -1194,8 +1924,10 @@ fn decrypt_single_cipher(
 
             let field_value = if let Some(ref enc_val) = field.value {
                 let val_bytes = crypto::decrypt_cipher_string(enc_val, enc_key, mac_key)?;
-                Some(String::from_utf8(val_bytes)
-                    .map_err(|e| format!("Decrypted field value is not valid UTF-8: {}", e))?)
+                Some(
+                    String::from_utf8(val_bytes)
+                        .map_err(|e| format!("Decrypted field value is not valid UTF-8: {}", e))?,
+                )
             } else {
                 None
             };
@@ -1214,22 +1946,28 @@ fn decrypt_single_cipher(
     let decrypted_login = if let Some(ref login) = cipher.login {
         let username = if let Some(ref enc_user) = login.username {
             let user_bytes = crypto::decrypt_cipher_string(enc_user, enc_key, mac_key)?;
-            Some(String::from_utf8(user_bytes)
-                .map_err(|e| format!("Decrypted username is not valid UTF-8: {}", e))?)
+            Some(
+                String::from_utf8(user_bytes)
+                    .map_err(|e| format!("Decrypted username is not valid UTF-8: {}", e))?,
+            )
         } else {
             None
         };
         let password = if let Some(ref enc_pass) = login.password {
             let pass_bytes = crypto::decrypt_cipher_string(enc_pass, enc_key, mac_key)?;
-            Some(String::from_utf8(pass_bytes)
-                .map_err(|e| format!("Decrypted password is not valid UTF-8: {}", e))?)
+            Some(
+                String::from_utf8(pass_bytes)
+                    .map_err(|e| format!("Decrypted password is not valid UTF-8: {}", e))?,
+            )
         } else {
             None
         };
         let uri = if let Some(ref enc_uri) = login.uri {
             let uri_bytes = crypto::decrypt_cipher_string(enc_uri, enc_key, mac_key)?;
-            Some(String::from_utf8(uri_bytes)
-                .map_err(|e| format!("Decrypted URI is not valid UTF-8: {}", e))?)
+            Some(
+                String::from_utf8(uri_bytes)
+                    .map_err(|e| format!("Decrypted URI is not valid UTF-8: {}", e))?,
+            )
         } else {
             None
         };
@@ -1246,15 +1984,19 @@ fn decrypt_single_cipher(
     let decrypted_ssh_key = if let Some(ref ssh_key) = cipher.ssh_key {
         let private_key = if let Some(ref enc_priv) = ssh_key.private_key {
             let priv_bytes = crypto::decrypt_cipher_string(enc_priv, enc_key, mac_key)?;
-            Some(String::from_utf8(priv_bytes)
-                .map_err(|e| format!("Decrypted private key is not valid UTF-8: {}", e))?)
+            Some(
+                String::from_utf8(priv_bytes)
+                    .map_err(|e| format!("Decrypted private key is not valid UTF-8: {}", e))?,
+            )
         } else {
             None
         };
         let public_key = if let Some(ref enc_pub) = ssh_key.public_key {
             let pub_bytes = crypto::decrypt_cipher_string(enc_pub, enc_key, mac_key)?;
-            Some(String::from_utf8(pub_bytes)
-                .map_err(|e| format!("Decrypted public key is not valid UTF-8: {}", e))?)
+            Some(
+                String::from_utf8(pub_bytes)
+                    .map_err(|e| format!("Decrypted public key is not valid UTF-8: {}", e))?,
+            )
         } else {
             None
         };
@@ -1285,40 +2027,142 @@ pub fn decrypt_sync_response_offline(
     password: &str,
 ) -> Result<(Vec<CipherItem>, [u8; 32], [u8; 32]), String> {
     // 1. Get KDF parameters from user_decryption
-    let (kdf_type, iterations, memory, parallelism, salt_email) = if let Some(ref ud) = sync_resp.user_decryption {
-        if let Some(ref mpu) = ud.master_password_unlock {
-            (
-                mpu.kdf.kdf_type,
-                mpu.kdf.iterations,
-                mpu.kdf.memory,
-                mpu.kdf.parallelism,
-                mpu.salt.clone(),
-            )
+    let (kdf_type, iterations, memory, parallelism, salt_email) =
+        if let Some(ref ud) = sync_resp.user_decryption {
+            if let Some(ref mpu) = ud.master_password_unlock {
+                (
+                    mpu.kdf.kdf_type,
+                    mpu.kdf.iterations,
+                    mpu.kdf.memory,
+                    mpu.kdf.parallelism,
+                    mpu.salt.clone(),
+                )
+            } else {
+                return Err("Offline KDF data missing from local cache".to_string());
+            }
         } else {
-            return Err("Offline KDF data missing from local cache".to_string());
-        }
-    } else {
-        return Err("Offline decryption settings missing from local cache. Please sync online first.".to_string());
-    };
+            return Err(
+                "Offline decryption settings missing from local cache. Please sync online first."
+                    .to_string(),
+            );
+        };
 
     // 2. Derive master key
     let master_key = match kdf_type {
         0 => crate::crypto::derive_master_key_pbkdf2(password, &salt_email, iterations)?,
         1 => {
             let mem = memory.ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
-            let para = parallelism.ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
+            let para =
+                parallelism.ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
             crate::crypto::derive_master_key_argon2(password, &salt_email, iterations, mem, para)?
         }
         t => return Err(format!("Unsupported KDF type: {}", t)),
     };
 
     // 3. Decrypt user symmetric keys
-    let (enc_key, mac_key) = crate::crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)?;
+    let (enc_key, mac_key) =
+        crate::crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)?;
 
     // 4. Decrypt ciphers
     let ciphers = parse_and_decrypt_all_ciphers(sync_resp, &enc_key, &mac_key);
 
     Ok((ciphers, enc_key, mac_key))
+}
+
+pub fn decrypt_ssh_keys_from_db(
+    repo: &VaultRepository,
+    user_id: Option<&str>,
+    enc_key: &[u8; 32],
+    mac_key: &[u8; 32],
+) -> Result<Vec<SshKeyItem>, String> {
+    // 1. Load User Profile and organizations
+    let (profile, orgs_opt) = repo.load_profile_and_organizations(user_id)?;
+    let rsa_priv_key_der = if let Some(ref enc_private_key) = profile.private_key {
+        match crypto::decrypt_cipher_string(enc_private_key, enc_key, mac_key) {
+            Ok(der) => Some(der),
+            Err(e) => {
+                eprintln!("Warning: Failed to decrypt user RSA private key: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 2. Decrypt all organization keys
+    let mut org_keys = std::collections::HashMap::new();
+    if let (Some(organizations), Some(priv_key_der)) = (&orgs_opt, &rsa_priv_key_der) {
+        for org in organizations {
+            match decrypt_org_key(&org.key, priv_key_der) {
+                Ok((org_enc, org_mac)) => {
+                    org_keys.insert(org.id.clone(), (org_enc, org_mac));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to decrypt organization key for {}: {}",
+                        org.id, e
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. List only the ciphers that are SSH keys or contain custom fields indicating SSH keys
+    tracing::debug!("Listing SSH ciphers for profile ID: {}", profile.id);
+    let ssh_ciphers = repo.list_ssh_ciphers(&profile.id)?;
+    tracing::debug!("Found {} SSH ciphers from list_ssh_ciphers", ssh_ciphers.len());
+
+    // 4. Decrypt only these SSH ciphers
+    let mut decrypted_ciphers = Vec::new();
+    for cipher in &ssh_ciphers {
+        tracing::debug!(
+            "Decrypting cipher ID: {}, type: {}, name: {:?}",
+            cipher.id,
+            cipher.r#type,
+            cipher.name
+        );
+        let len_before = decrypted_ciphers.len();
+        match decrypt_single_cipher(cipher, enc_key, mac_key, &org_keys, &mut decrypted_ciphers) {
+            Ok(_) => {
+                if decrypted_ciphers.len() > len_before {
+                    let added = decrypted_ciphers.last().unwrap();
+                    tracing::debug!(
+                        "Decrypted successfully. ID: {}, Name: {}, Type: {}, has_ssh_key: {}",
+                        added.id,
+                        added.name,
+                        added.r#type,
+                        added.ssh_key.is_some()
+                    );
+                    if let Some(ref sk) = added.ssh_key {
+                        tracing::debug!(
+                            "Decrypted SSH key fields: has_private: {}, has_public: {}",
+                            sk.private_key.is_some(),
+                            sk.public_key.is_some()
+                        );
+                    }
+                } else {
+                    tracing::debug!("Cipher ID {} was skipped (e.g. deleted/archived)", cipher.id);
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Skipping SSH cipher ID {} due to decryption error: {}",
+                    cipher.id, e
+                );
+            }
+        }
+    }
+
+    // 5. Extract SSH keys from the decrypted ciphers
+    let keys = extract_ssh_keys_from_ciphers(&decrypted_ciphers);
+    tracing::debug!("Extracted {} SSH keys from decrypted ciphers", keys.len());
+    for key in &keys {
+        tracing::debug!(
+            "Extracted Key - ID: {}, Name: {}, Note: {:?}",
+            key.id, key.name, key.note
+        );
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -1335,16 +2179,26 @@ mod tests {
         }
 
         let content = std::fs::read_to_string(path).expect("Failed to read docs/example-sync.json");
-        let sync_resp: SyncResponse = serde_json::from_str(&content).expect("Failed to deserialize SyncResponse");
+        let sync_resp: SyncResponse =
+            serde_json::from_str(&content).expect("Failed to deserialize SyncResponse");
 
         // Verify key fields
         assert_eq!(sync_resp.profile.email, "alex@okkk.cc");
         assert!(!sync_resp.ciphers.is_empty());
-        assert_eq!(sync_resp.ciphers[0].id, "0075d6b8-7e7c-4a93-8131-39102849d2ca");
+        assert_eq!(
+            sync_resp.ciphers[0].id,
+            "0075d6b8-7e7c-4a93-8131-39102849d2ca"
+        );
 
         // Verify user decryption KDF data
-        let ud = sync_resp.user_decryption.as_ref().expect("Missing user_decryption");
-        let mpu = ud.master_password_unlock.as_ref().expect("Missing master_password_unlock");
+        let ud = sync_resp
+            .user_decryption
+            .as_ref()
+            .expect("Missing user_decryption");
+        let mpu = ud
+            .master_password_unlock
+            .as_ref()
+            .expect("Missing master_password_unlock");
         assert_eq!(mpu.kdf.kdf_type, 1);
         assert_eq!(mpu.kdf.iterations, 2);
         assert_eq!(mpu.kdf.memory, Some(32));
@@ -1359,7 +2213,8 @@ mod tests {
 
         // Round-trip serialization
         let serialized = serde_json::to_string(&sync_resp).expect("Failed to serialize");
-        let sync_resp_2: SyncResponse = serde_json::from_str(&serialized).expect("Failed to deserialize second time");
+        let sync_resp_2: SyncResponse =
+            serde_json::from_str(&serialized).expect("Failed to deserialize second time");
 
         // Verify round-tripped fields
         assert!(sync_resp_2.folders.is_some());
@@ -1369,15 +2224,17 @@ mod tests {
 
     #[test]
     fn test_save_load_db_roundtrip() {
-        // Clean up any existing test cache directory first
-        let cache_d = cache_dir().expect("Missing cache dir");
-        let _ = std::fs::remove_dir_all(&cache_d);
+        let unique_dir = std::env::temp_dir().join(format!("bitter_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&unique_dir);
 
         let mut extra_profile = std::collections::HashMap::new();
         extra_profile.insert("customField".to_string(), serde_json::json!("Custom Value"));
 
         let mut extra_sync = std::collections::HashMap::new();
-        extra_sync.insert("customSyncField".to_string(), serde_json::json!("Custom Sync Value"));
+        extra_sync.insert(
+            "customSyncField".to_string(),
+            serde_json::json!("Custom Sync Value"),
+        );
 
         let sync_resp = SyncResponse {
             profile: ProfileSync {
@@ -1415,21 +2272,188 @@ mod tests {
         };
 
         // Save it using VaultRepository
-        let path = cache_d.join(DB_FILE_NAME);
+        let path = unique_dir.join(DB_FILE_NAME);
         let mut repo = VaultRepository::open(&path).expect("VaultRepository::open failed");
-        repo.save_sync_response(&sync_resp).expect("save_sync_response failed");
+        repo.save_sync_response(&sync_resp)
+            .expect("save_sync_response failed");
 
         // Load it back
-        let loaded = repo.load_sync_response().expect("load_sync_response failed");
+        let loaded = repo
+            .load_sync_response()
+            .expect("load_sync_response failed");
 
         assert_eq!(loaded.profile.id, "user-123");
         assert_eq!(loaded.profile.email, "test@example.com");
         assert_eq!(loaded.profile.key, "wrapped-key");
         assert_eq!(loaded.profile.name.as_deref(), Some("Test User"));
-        assert_eq!(loaded.profile.extra.get("customField").unwrap(), "Custom Value");
-        assert_eq!(loaded.extra.get("customSyncField").unwrap(), "Custom Sync Value");
+        assert_eq!(
+            loaded.profile.extra.get("customField").unwrap(),
+            "Custom Value"
+        );
+        assert_eq!(
+            loaded.extra.get("customSyncField").unwrap(),
+            "Custom Sync Value"
+        );
+
+        // Verify active user_id update in session_metadata
+        assert_eq!(
+            repo.get_active_user_id().unwrap(),
+            Some("user-123".to_string())
+        );
 
         // Clean up
-        let _ = std::fs::remove_dir_all(&cache_d);
+        let _ = std::fs::remove_dir_all(&unique_dir);
+    }
+
+    #[test]
+    fn test_list_ssh_ciphers() {
+        use crate::api::{CipherSync, FieldSync, SshKeySync};
+
+        let unique_dir = std::env::temp_dir().join(format!("bitter_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&unique_dir);
+
+        let path = unique_dir.join(DB_FILE_NAME);
+        let mut repo = VaultRepository::open(&path).expect("VaultRepository::open failed");
+
+        // 1. Create a native SSH Key Cipher (type 100)
+        let ssh_cipher = CipherSync {
+            id: "ssh-123".to_string(),
+            organization_id: None,
+            folder_id: None,
+            r#type: 100,
+            name: Some("My SSH Key".to_string()),
+            notes: None,
+            favorite: false,
+            reprompt: 0,
+            organization_use_totp: false,
+            edit: false,
+            view_password: false,
+            creation_date: String::new(),
+            revision_date: String::new(),
+            deleted_date: None,
+            archived_date: None,
+            key: Some("dummy-key".to_string()),
+            login: None,
+            card: None,
+            identity: None,
+            secure_note: None,
+            ssh_key: Some(SshKeySync {
+                private_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----".to_string()),
+                public_key: Some("ssh-rsa ...".to_string()),
+            }),
+            fields: None,
+            attachments: None,
+            collection_ids: None,
+            password_history: None,
+            permissions: None,
+            object: "cipher".to_string(),
+            extra: std::collections::HashMap::new(),
+        };
+
+        // 2. Create a normal login cipher that has a custom field containing 'ssh_private_key'
+        let login_cipher = CipherSync {
+            id: "login-456".to_string(),
+            organization_id: None,
+            folder_id: None,
+            r#type: 1, // Login
+            name: Some("My Server Login".to_string()),
+            notes: None,
+            favorite: false,
+            reprompt: 0,
+            organization_use_totp: false,
+            edit: false,
+            view_password: false,
+            creation_date: String::new(),
+            revision_date: String::new(),
+            deleted_date: None,
+            archived_date: None,
+            key: Some("dummy-key-2".to_string()),
+            login: None,
+            card: None,
+            identity: None,
+            secure_note: None,
+            ssh_key: None,
+            fields: Some(vec![FieldSync {
+                name: "ssh_private_key".to_string(),
+                value: Some("-----BEGIN OPENSSH PRIVATE KEY-----".to_string()),
+                r#type: 0,
+            }]),
+            attachments: None,
+            collection_ids: None,
+            password_history: None,
+            permissions: None,
+            object: "cipher".to_string(),
+            extra: std::collections::HashMap::new(),
+        };
+
+        // 3. Create a normal login cipher without any SSH keys
+        let ordinary_cipher = CipherSync {
+            id: "login-789".to_string(),
+            organization_id: None,
+            folder_id: None,
+            r#type: 1,
+            name: Some("Ordinary Login".to_string()),
+            notes: None,
+            favorite: false,
+            reprompt: 0,
+            organization_use_totp: false,
+            edit: false,
+            view_password: false,
+            creation_date: String::new(),
+            revision_date: String::new(),
+            deleted_date: None,
+            archived_date: None,
+            key: Some("dummy-key-3".to_string()),
+            login: None,
+            card: None,
+            identity: None,
+            secure_note: None,
+            ssh_key: None,
+            fields: Some(vec![FieldSync {
+                name: "some_other_field".to_string(),
+                value: Some("ordinary value".to_string()),
+                r#type: 0,
+            }]),
+            attachments: None,
+            collection_ids: None,
+            password_history: None,
+            permissions: None,
+            object: "cipher".to_string(),
+            extra: std::collections::HashMap::new(),
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        repo.conn.execute(
+            "INSERT INTO session_metadata (user_id, device_id, last_activated) VALUES (?1, 'device-123', ?2)",
+            rusqlite::params!["user-123", now_ms],
+        ).expect("Failed to insert dummy session");
+
+        repo.conn.execute(
+            "INSERT INTO users (id, email, email_verified, name, premium, premium_from_organization, two_factor_enabled, uses_key_connector, culture, creation_date, force_password_reset, key, extra) VALUES (?1, ?2, 0, ?3, 0, 0, 0, 0, 'en-US', '', 0, 'key', '{}')",
+            rusqlite::params!["user-123", "test@example.com", "Test User"],
+        ).expect("Failed to insert dummy user");
+
+        repo.save_cipher(&ssh_cipher, "user-123")
+            .expect("Failed to save ssh cipher");
+        repo.save_cipher(&login_cipher, "user-123")
+            .expect("Failed to save login cipher");
+        repo.save_cipher(&ordinary_cipher, "user-123")
+            .expect("Failed to save ordinary cipher");
+
+        let ssh_ciphers = repo
+            .list_ssh_ciphers("user-123")
+            .expect("Failed to list ssh ciphers");
+
+        assert_eq!(ssh_ciphers.len(), 2);
+        let ids: Vec<String> = ssh_ciphers.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&"ssh-123".to_string()));
+        assert!(ids.contains(&"login-456".to_string()));
+        assert!(!ids.contains(&"login-789".to_string()));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&unique_dir);
     }
 }

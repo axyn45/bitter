@@ -123,3 +123,5 @@ This document tracks the step-by-step progress of the `bitter` project, includin
   - [ ] Retrieve and decrypt organization keys using decrypted user symmetric key
   - [ ] Decrypt organization-owned ciphers using their respective organization keys
 - [ ] Add organization filtering layouts to CLI list commands and TUI dashboard
+
+## Phase 12: Multi user accounts

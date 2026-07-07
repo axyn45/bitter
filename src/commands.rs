@@ -1,116 +1,61 @@
 use crate::api::ApiClient;
-use crate::cli::{Commands, KeysCommands};
+use crate::cli::{Commands, KeysCommands, ResetArgs};
 use crate::config::{Config, Session, TimeoutAction};
 use crate::{crypto, daemon, storage};
 use std::io::{self, Write};
 use std::str::FromStr;
 
-pub enum KeySource {
-    MasterKey([u8; 32]),
-    DecryptedKeys {
-        enc_key: [u8; 32],
-        mac_key: [u8; 32],
-    },
-}
-
-pub async fn perform_sync_and_reload(
+pub async fn perform_sync(
     api_client: &ApiClient,
     token: &str,
-    key_source: KeySource,
     session: &mut Session,
-) -> Result<Vec<storage::CipherItem>, String> {
-    // 1. Fetch sync data
+) -> Result<(), String> {
+    // 1. Fetch sync data from server
     let sync_data = api_client
         .sync(token)
         .await
         .map_err(|e| format!("Failed to sync vault from server: {}", e))?;
 
-    // 2. Obtain symmetric keys
-    let (enc_key, mac_key) = match key_source {
-        KeySource::MasterKey(master_key) => {
-            crypto::decrypt_symmetric_key(&master_key, &sync_data.profile.key)
-                .map_err(|e| format!("Failed to decrypt symmetric keys: {}", e))?
-        }
-        KeySource::DecryptedKeys { enc_key, mac_key } => (enc_key, mac_key),
-    };
-
-    // 3. Decrypt all ciphers
-    let decrypted_ciphers = storage::parse_and_decrypt_all_ciphers(&sync_data, &enc_key, &mac_key);
-
-    // 4. Update session fields and save
+    // 2. Update session fields and save
+    session.user_id = Some(sync_data.profile.id.clone());
+    session.email = Some(sync_data.profile.email.clone());
     session.last_sync_time = Some(get_current_time_string());
-    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let db_path =
+        storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
     let mut repo = storage::VaultRepository::open(&db_path)?;
     repo.save_session(session)
         .map_err(|e| format!("Failed to save session: {}", e))?;
 
-    // 5. Save sync response to database cache
+    // 3. Save sync response to database cache
     repo.save_sync_response(&sync_data)
         .map_err(|e| format!("Failed to save cache database: {}", e))?;
-    storage::handle_post_sync(&sync_data, &repo, &enc_key, &mac_key)?;
 
-    // 6. Automatically unlock running agent daemon if it is running
+    // 4. Send Reload signal to background agent daemon if it is running
     if daemon::is_agent_running() {
-        let ssh_keys = storage::extract_ssh_keys_from_ciphers(&decrypted_ciphers);
-        let enc_hex = hex::encode(&enc_key);
-        let mac_hex = hex::encode(&mac_key);
-        let daemon_keys: Vec<daemon::SshKeyData> = ssh_keys
-            .into_iter()
-            .map(|k| daemon::SshKeyData {
-                name: k.name,
-                private_key: k.private_key,
-            })
-            .collect();
-
-        match daemon::send_control_request(daemon::ControlRequest::Unlock {
-            keys: daemon_keys,
-            enc_key: enc_hex,
-            mac_key: mac_hex,
-        })
-        .await
-        {
+        match daemon::send_control_request(daemon::ControlRequest::Reload).await {
             Ok(resp) => {
                 if resp.status == "ok" {
-                    println!(
-                        "Agent unlocked/updated successfully. Loaded {} keys to memory.",
-                        resp.key_count.unwrap_or(0)
-                    );
+                    println!("Agent notified of sync reload.");
                 } else {
                     eprintln!(
-                        "Warning: Failed to unlock agent: {}",
+                        "Warning: Agent failed to reload: {}",
                         resp.error.unwrap_or_default()
                     );
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: Failed to communicate with running agent to unlock: {}",
-                    e
-                );
+                eprintln!("Warning: Failed to communicate reload to agent: {}", e);
             }
         }
     }
 
-    Ok(decrypted_ciphers)
+    Ok(())
 }
 
 pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), String> {
-    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let repo = storage::VaultRepository::open(&db_path)?;
-    let mut session = repo.load_session()?.unwrap_or_default();
-
-    let is_logout = matches!(command, Commands::Logout);
-
     match command {
-        Commands::Login(args) => handle_login(args, config, &mut session).await?,
-        Commands::Logout => handle_logout(config).await?,
-        Commands::Sync => handle_sync(config, &mut session).await?,
-        Commands::Settings(args) => handle_settings(args, config, &mut session).await?,
-        Commands::Keys(args) => handle_keys(args.command, &session).await?,
-        Commands::Unlock => handle_unlock(config, &mut session).await?,
-        Commands::Status => handle_status(config, &session).await?,
-        Commands::Start(_) => {
-            unreachable!("Start command handled synchronously in main()");
+        Commands::Reset(args) => {
+            handle_reset(args).await?;
         }
         Commands::Stop => {
             daemon::stop_agent()?;
@@ -145,10 +90,39 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
                 ));
             }
         }
-    }
+        other => {
+            let db_path = storage::db_path()
+                .ok_or_else(|| "Could not determine cache database path".to_string())?;
+            let mut repo = storage::VaultRepository::open(&db_path)?;
+            let mut session = repo.load_session()?.unwrap_or_else(|| {
+                let mut s = Session::default();
+                if let Some(ref d_id) = config.device_id {
+                    s.device_id = d_id.clone();
+                }
+                s
+            });
 
-    if !is_logout {
-        repo.save_session(&session)?;
+            let is_logout = matches!(other, Commands::Logout);
+
+            match other {
+                Commands::Login(args) => handle_login(args, config, &mut session).await?,
+                Commands::Logout => handle_logout(config, &mut session, &mut repo).await?,
+                Commands::Sync => handle_sync(config, &mut session).await?,
+                Commands::Settings(args) => handle_settings(args, config, &mut session).await?,
+                Commands::Keys(args) => handle_keys(args.command, &session).await?,
+                Commands::Unlock => handle_unlock(config, &mut session).await?,
+                Commands::Status => handle_status(config, &session).await?,
+                Commands::Start(_) => {
+                    unreachable!("Start command handled synchronously in main()");
+                }
+                Commands::Reset(_) => unreachable!(),
+                _ => {}
+            }
+
+            if !is_logout {
+                repo.save_session(&session)?;
+            }
+        }
     }
     Ok(())
 }
@@ -157,7 +131,9 @@ fn parse_auth_code(input: &str) -> Result<String, String> {
     if input.contains("code=") {
         // It's a full URL or query string, parse it
         let url_parts: Vec<&str> = input.split('?').collect();
-        let query = url_parts.last().ok_or_else(|| "Invalid URL format".to_string())?;
+        let query = url_parts
+            .last()
+            .ok_or_else(|| "Invalid URL format".to_string())?;
         for pair in query.split('&') {
             let key_val: Vec<&str> = pair.split('=').collect();
             if key_val.len() == 2 && key_val[0] == "code" {
@@ -171,6 +147,53 @@ fn parse_auth_code(input: &str) -> Result<String, String> {
         // It's already the raw code
         Ok(input.to_string())
     }
+}
+
+fn derive_and_verify_keys_from_response(
+    resp: &crate::api::TokenResponse,
+    password_arg: Option<String>,
+    email_arg: Option<String>,
+    session_email: Option<String>,
+    error_context: &str,
+) -> Result<([u8; 32], String), String> {
+    let decrypt_opts = resp.user_decryption_options.as_ref().ok_or_else(|| {
+        format!(
+            "UserDecryptionOptions missing from {}. Ensure your account is fully set up.",
+            error_context
+        )
+    })?;
+
+    let unlock_data = decrypt_opts
+        .master_password_unlock
+        .as_ref()
+        .ok_or_else(|| "MasterPasswordUnlock data missing from response.".to_string())?;
+
+    let email = email_arg
+        .or(session_email)
+        .unwrap_or_else(|| unlock_data.salt.clone());
+
+    let kdf_type = unlock_data.kdf.kdf_type;
+    let iterations = unlock_data.kdf.iterations;
+    let memory = unlock_data.kdf.memory;
+    let parallelism = unlock_data.kdf.parallelism;
+    let salt_email = &unlock_data.salt;
+
+    println!("Deriving master key to verify password...");
+    let master_key = crypto::prompt_and_derive_master_key(
+        password_arg,
+        salt_email,
+        kdf_type,
+        iterations,
+        memory,
+        parallelism,
+        Some("Master Password (to decrypt vault keys): "),
+    )?;
+
+    println!("Decrypting vault symmetric keys...");
+    let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
+    println!("Vault keys decrypted and verified successfully.");
+
+    Ok((master_key, email))
 }
 
 async fn handle_login(
@@ -190,7 +213,7 @@ async fn handle_login(
 
     let (token_resp, master_key, email) = if args.sso {
         println!("Logging in using Single Sign-On (SSO)...");
-        
+
         let org_id = match args.org_id.clone() {
             Some(o) => o,
             None => {
@@ -214,17 +237,17 @@ async fn handle_login(
 
         // Try to fetch Vaultwarden SSO prevalidate token if available
         println!("Retrieving SSO pre-validation token...");
-        let sso_token = api_client.fetch_sso_prevalidate_token().await.unwrap_or(None);
+        let sso_token = api_client
+            .fetch_sso_prevalidate_token()
+            .await
+            .unwrap_or(None);
 
         let (client_id, redirect_uri) = match sso_token {
             Some(_) => (
                 "web",
                 format!("{}/sso-connector.html", server_url.trim_end_matches('/')),
             ),
-            None => (
-                "cli",
-                "http://localhost:8081/sso-callback".to_string(),
-            ),
+            None => ("cli", "http://localhost:8081/sso-callback".to_string()),
         };
 
         // 2. Build the authorization URL
@@ -260,67 +283,45 @@ async fn handle_login(
             }
         };
 
-        println!("\nPlease open the following URL in a browser on your local device to authenticate:\n");
+        println!(
+            "\nPlease open the following URL in a browser on your local device to authenticate:\n"
+        );
         println!("{}\n", auth_url);
 
         // 3. Prompt the user for the redirect URL or auth code
-        println!("Once logged in, your browser will redirect to a page starting with '{}'.", redirect_uri);
+        println!(
+            "Once logged in, your browser will redirect to a page starting with '{}'.",
+            redirect_uri
+        );
         print!("Paste the redirected URL (or the 'code' parameter value): ");
         io::stdout().flush().unwrap();
         let mut callback_input = String::new();
         io::stdin()
             .read_line(&mut callback_input)
             .map_err(|e| format!("Failed to read redirect input: {}", e))?;
-        
+
         let code = parse_auth_code(callback_input.trim())?;
 
         // 4. Exchange authorization code for token
         println!("Exchanging authorization code for access token...");
-        let resp = api_client.exchange_sso_code(client_id, &code, &code_verifier, &redirect_uri, &session.device_id).await?;
+        let resp = api_client
+            .exchange_sso_code(
+                client_id,
+                &code,
+                &code_verifier,
+                &redirect_uri,
+                &session.device_id,
+            )
+            .await?;
 
-        // 5. Prompt for Master Password to verify master key and decrypt vault keys
-        let password = match args.password.clone() {
-            Some(pass) => pass,
-            None => crypto::prompt_master_password(Some("Master Password (to decrypt vault keys): "))?,
-        };
-
-        // Extract KDF parameters from the login response
-        let decrypt_opts = resp.user_decryption_options.as_ref()
-            .ok_or_else(|| "UserDecryptionOptions missing from SSO response. Ensure your account is fully set up.".to_string())?;
-
-        let unlock_data = decrypt_opts
-            .master_password_unlock
-            .as_ref()
-            .ok_or_else(|| "MasterPasswordUnlock data missing from response.".to_string())?;
-
-        let email = args.email.clone()
-            .or_else(|| session.email.clone())
-            .unwrap_or_else(|| unlock_data.salt.clone());
-
-        let kdf_type = unlock_data.kdf.kdf_type;
-        let iterations = unlock_data.kdf.iterations;
-        let memory = unlock_data.kdf.memory;
-        let parallelism = unlock_data.kdf.parallelism;
-        let salt_email = &unlock_data.salt;
-
-        println!("Deriving master key to verify password...");
-        let master_key = match kdf_type {
-            0 => crypto::derive_master_key_pbkdf2(&password, salt_email, iterations)?,
-            1 => {
-                let mem = memory.ok_or_else(|| {
-                    "Argon2 memory parameter missing from KDF settings".to_string()
-                })?;
-                let para = parallelism.ok_or_else(|| {
-                    "Argon2 parallelism parameter missing from KDF settings".to_string()
-                })?;
-                crypto::derive_master_key_argon2(&password, salt_email, iterations, mem, para)?
-            }
-            t => return Err(format!("Unsupported KDF type: {}", t)),
-        };
-
-        println!("Decrypting vault symmetric keys...");
-        let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
-        println!("Vault keys decrypted and verified successfully.");
+        // 5. Prompt for Master Password, derive keys, and verify
+        let (master_key, email) = derive_and_verify_keys_from_response(
+            &resp,
+            args.password.clone(),
+            args.email.clone(),
+            session.email.clone(),
+            "SSO response",
+        )?;
 
         (resp, master_key, email)
     } else if let (Some(cid), Some(csec)) = (client_id, client_secret) {
@@ -334,49 +335,14 @@ async fn handle_login(
         config.client_id = Some(cid.clone());
         config.client_secret = Some(csec.clone());
 
-        // Prompt for master password to verify we can derive the Master Key and decrypt the symmetric key
-        let password = match args.password.clone() {
-            Some(pass) => pass,
-            None => crypto::prompt_master_password(Some("Master Password (to decrypt vault keys): "))?,
-        };
-
-        // Extract KDF parameters from the login response (under UserDecryptionOptions)
-        let decrypt_opts = resp.user_decryption_options.as_ref()
-            .ok_or_else(|| "UserDecryptionOptions missing from API Key login response. Ensure your account is fully set up.".to_string())?;
-
-        let unlock_data = decrypt_opts
-            .master_password_unlock
-            .as_ref()
-            .ok_or_else(|| "MasterPasswordUnlock data missing from response.".to_string())?;
-
-        let email = args.email.clone()
-            .or_else(|| session.email.clone())
-            .unwrap_or_else(|| unlock_data.salt.clone());
-
-        let kdf_type = unlock_data.kdf.kdf_type;
-        let iterations = unlock_data.kdf.iterations;
-        let memory = unlock_data.kdf.memory;
-        let parallelism = unlock_data.kdf.parallelism;
-        let salt_email = &unlock_data.salt;
-
-        println!("Deriving master key to verify password...");
-        let master_key = match kdf_type {
-            0 => crypto::derive_master_key_pbkdf2(&password, salt_email, iterations)?,
-            1 => {
-                let mem = memory.ok_or_else(|| {
-                    "Argon2 memory parameter missing from KDF settings".to_string()
-                })?;
-                let para = parallelism.ok_or_else(|| {
-                    "Argon2 parallelism parameter missing from KDF settings".to_string()
-                })?;
-                crypto::derive_master_key_argon2(&password, salt_email, iterations, mem, para)?
-            }
-            t => return Err(format!("Unsupported KDF type: {}", t)),
-        };
-
-        println!("Decrypting vault symmetric keys...");
-        let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
-        println!("Vault keys decrypted and verified successfully.");
+        // Prompt for Master Password, derive keys, and verify
+        let (master_key, email) = derive_and_verify_keys_from_response(
+            &resp,
+            args.password.clone(),
+            args.email.clone(),
+            session.email.clone(),
+            "API Key response",
+        )?;
 
         (resp, master_key, email)
     } else {
@@ -403,25 +369,15 @@ async fn handle_login(
         let prelogin = api_client.prelogin(&email).await?;
 
         println!("Deriving master key locally...");
-        let master_key = match prelogin.kdf {
-            0 => crypto::derive_master_key_pbkdf2(&password, &email, prelogin.kdf_iterations)?,
-            1 => {
-                let mem = prelogin.kdf_memory.ok_or_else(|| {
-                    "Argon2 memory parameter missing from prelogin settings".to_string()
-                })?;
-                let para = prelogin.kdf_parallelism.ok_or_else(|| {
-                    "Argon2 parallelism parameter missing from prelogin settings".to_string()
-                })?;
-                crypto::derive_master_key_argon2(
-                    &password,
-                    &email,
-                    prelogin.kdf_iterations,
-                    mem,
-                    para,
-                )?
-            }
-            t => return Err(format!("Unsupported KDF type: {}", t)),
-        };
+        let master_key = crypto::prompt_and_derive_master_key(
+            Some(password.clone()),
+            &email,
+            prelogin.kdf,
+            prelogin.kdf_iterations,
+            prelogin.kdf_memory,
+            prelogin.kdf_parallelism,
+            None,
+        )?;
 
         let login_hash = crypto::derive_login_hash(&master_key, &password);
         println!("Authenticating with server...");
@@ -452,35 +408,59 @@ async fn handle_login(
     // Automatically perform synchronization
     println!("Automatically syncing ciphers from server...");
 
-    match perform_sync_and_reload(
-        &api_client,
-        &token_resp.access_token,
-        KeySource::MasterKey(master_key),
-        session,
-    )
-    .await
-    {
-        Ok(ciphers) => {
-            println!("Synced {} items.", ciphers.len());
+    let (enc_key, mac_key) = crypto::decrypt_symmetric_key(&master_key, &token_resp.key)
+        .map_err(|e| format!("Failed to decrypt symmetric keys: {}", e))?;
+
+    perform_sync(&api_client, &token_resp.access_token, session).await?;
+
+    // Save keys to SQLite if timeout is unlocked
+    if session.timeout.trim().to_lowercase() == "unlocked" {
+        let db_path = storage::db_path()
+            .ok_or_else(|| "Could not determine cache database path".to_string())?;
+        let repo = storage::VaultRepository::open(&db_path)?;
+        if let Err(e) = repo.save_saved_keys(&enc_key, &mac_key) {
+            eprintln!("Warning: Failed to save decryption keys: {}", e);
         }
-        Err(e) => {
-            eprintln!("Warning: Automatic sync failed: {}", e);
+    }
+
+    // Send keys to agent if running
+    if daemon::is_agent_running() {
+        let enc_hex = hex::encode(enc_key);
+        let mac_hex = hex::encode(mac_key);
+        match daemon::send_control_request(daemon::ControlRequest::Unlock {
+            user_id: session.user_id.clone().unwrap_or_default(),
+            enc_key: enc_hex,
+            mac_key: mac_hex,
+        })
+        .await
+        {
+            Ok(resp) => {
+                if resp.status == "ok" {
+                    println!("Agent unlocked successfully.");
+                } else {
+                    eprintln!(
+                        "Warning: Failed to unlock agent: {}",
+                        resp.error.unwrap_or_default()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to communicate with running agent: {}", e);
+            }
         }
     }
 
     Ok(())
 }
 
-async fn handle_logout(config: &mut Config) -> Result<(), String> {
+async fn handle_logout(
+    config: &mut Config,
+    _session: &mut Session,
+    repo: &mut storage::VaultRepository,
+) -> Result<(), String> {
     println!("Logging out...");
-    if daemon::is_agent_running() {
-        println!("Locking and clearing background agent memory...");
-        if let Err(e) = daemon::send_control_request(daemon::ControlRequest::Lock).await {
-            eprintln!("Warning: Failed to notify agent to lock/clear keys: {}", e);
-        }
-    }
-    if let Err(e) = storage::wipe_db() {
-        eprintln!("Warning: Failed to delete local database cache: {}", e);
+    if let Err(e) = repo.logout_active_user() {
+        eprintln!("Warning: Failed to wipe local database cache: {}", e);
     }
     config.client_id = None;
     config.client_secret = None;
@@ -488,7 +468,43 @@ async fn handle_logout(config: &mut Config) -> Result<(), String> {
         .save()
         .map_err(|e| format!("Failed to save configuration: {}", e))?;
 
+    if daemon::is_agent_running() {
+        println!("Locking and clearing background agent memory...");
+        if let Err(e) = daemon::send_control_request(daemon::ControlRequest::Reload).await {
+            eprintln!("Warning: Failed to notify agent to lock/clear keys: {}", e);
+        }
+    }
+
     println!("Logged out successfully. Configuration and local cache cleared.");
+    Ok(())
+}
+
+async fn handle_reset(args: ResetArgs) -> Result<(), String> {
+    if args.config {
+        if let Some(path) = Config::config_path() {
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("Failed to remove config file: {}", e))?;
+                println!("Configuration file reset successfully.");
+            } else {
+                println!("Configuration file does not exist.");
+            }
+        } else {
+            return Err("Could not determine config path".to_string());
+        }
+    }
+    if args.db {
+        if let Err(e) = storage::nuclear_db() {
+            eprintln!("Failed to reset database file: {}", e);
+        } else {
+            println!("Database file reset successfully.");
+        }
+    }
+    if !args.config && !args.db {
+        println!(
+            "Nothing to reset. Use --config to reset configuration, and/or --db to reset database."
+        );
+    }
     Ok(())
 }
 
@@ -498,63 +514,8 @@ async fn handle_sync(config: &mut Config, session: &mut Session) -> Result<(), S
     let api_client = ApiClient::new(&config.server_url);
     println!("Syncing ciphers from server {}...", config.server_url);
 
-    let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let repo = storage::VaultRepository::open(&db_path)?;
-
-    let mut cached_keys = None;
-    if config.timeout.trim().to_lowercase() == "never" {
-        if let Some((enc, mac)) = repo.load_saved_keys()? {
-            println!("Using cached decryption keys for passwordless sync...");
-            cached_keys = Some((enc, mac));
-        }
-    }
-
-    let key_source = match cached_keys {
-        Some((enc, mac)) => KeySource::DecryptedKeys {
-            enc_key: enc,
-            mac_key: mac,
-        },
-        None => {
-            let password = crypto::prompt_master_password(Some("Master Password (to decrypt vault keys): "))?;
-
-            let email = session.email.as_ref().ok_or_else(|| {
-                "Email address missing from session. Please log in again.".to_string()
-            })?;
-
-            println!("Fetching KDF settings...");
-            let prelogin = api_client.prelogin(email).await?;
-
-            println!("Deriving keys...");
-            let master_key = match prelogin.kdf {
-                0 => crypto::derive_master_key_pbkdf2(&password, email, prelogin.kdf_iterations)?,
-                1 => {
-                    let mem = prelogin
-                        .kdf_memory
-                        .ok_or_else(|| "Argon2 memory parameter missing".to_string())?;
-                    let para = prelogin
-                        .kdf_parallelism
-                        .ok_or_else(|| "Argon2 parallelism parameter missing".to_string())?;
-                    crypto::derive_master_key_argon2(
-                        &password,
-                        email,
-                        prelogin.kdf_iterations,
-                        mem,
-                        para,
-                    )?
-                }
-                t => return Err(format!("Unsupported KDF type: {}", t)),
-            };
-
-            KeySource::MasterKey(master_key)
-        }
-    };
-
-    match perform_sync_and_reload(&api_client, &token, key_source, session).await {
-        Ok(ciphers) => {
-            println!("Synced {} items.", ciphers.len());
-        }
-        Err(e) => return Err(e),
-    }
+    perform_sync(&api_client, &token, session).await?;
+    println!("Sync completed successfully.");
 
     Ok(())
 }
@@ -567,84 +528,55 @@ async fn handle_settings(
     let mut updated = false;
 
     if let Some(t) = args.timeout {
-        if t.trim().to_lowercase() == "never" {
+        if t.trim().to_lowercase() == "unlocked" {
             if let Some(ref email) = session.email {
-                let token = session
-                    .access_token
-                    .clone()
-                    .ok_or_else(|| "Access token missing from session".to_string())?;
-
-                let password = crypto::prompt_master_password(Some("Enter Master Password to verify and enable 'never' timeout: "))?;
+                let password = crypto::prompt_master_password(Some(
+                    "Enter Master Password to verify and enable 'unlocked' mode: ",
+                ))?;
 
                 let path = storage::db_path().ok_or_else(|| "Invalid cache path".to_string())?;
                 let mut verified = false;
-                let mut verified_locally = false;
-                let mut loaded_sync_resp = None;
-                let mut decrypted_keys = None;
+                let mut enc_key_opt = None;
+                let mut mac_key_opt = None;
                 let repo = storage::VaultRepository::open(&path)?;
 
                 if path.exists() {
                     if let Ok(sync_resp) = repo.load_sync_response() {
-                        if let Ok((_ciphers, enc, mac)) = storage::decrypt_sync_response_offline(&sync_resp, &password) {
+                        if let Ok((_ciphers, enc, mac)) =
+                            storage::decrypt_sync_response_offline(&sync_resp, &password)
+                        {
                             verified = true;
-                            verified_locally = true;
-                            loaded_sync_resp = Some(sync_resp);
-                            decrypted_keys = Some((enc, mac));
+                            enc_key_opt = Some(enc);
+                            mac_key_opt = Some(mac);
                         }
                     }
                 }
 
-                // If not verified locally, verify with server
+                // If not verified locally, verify with server using KDF settings
                 if !verified {
                     println!("Verifying master password with server...");
                     let api_client = ApiClient::new(&config.server_url);
                     let prelogin = api_client.prelogin(email).await?;
-                    let master_key_res = match prelogin.kdf {
-                        0 => crypto::derive_master_key_pbkdf2(
-                            &password,
-                            email,
-                            prelogin.kdf_iterations,
-                        ),
-                        1 => {
-                            if let (Some(mem), Some(para)) =
-                                (prelogin.kdf_memory, prelogin.kdf_parallelism)
-                            {
-                                crypto::derive_master_key_argon2(
-                                    &password,
-                                    email,
-                                    prelogin.kdf_iterations,
-                                    mem,
-                                    para,
-                                )
-                            } else {
-                                Err("Argon2 parameters missing".to_string())
-                            }
-                        }
-                        t => Err(format!("Unsupported KDF type: {}", t)),
-                    };
+                    let master_key_res = crypto::prompt_and_derive_master_key(
+                        Some(password.clone()),
+                        email,
+                        prelogin.kdf,
+                        prelogin.kdf_iterations,
+                        prelogin.kdf_memory,
+                        prelogin.kdf_parallelism,
+                        None,
+                    );
 
-                    match master_key_res {
-                        Ok(master_key) => {
-                            let old_timeout = config.timeout.clone();
-                            config.timeout = t.clone();
-                            match perform_sync_and_reload(
-                                &api_client,
-                                &token,
-                                KeySource::MasterKey(master_key),
-                                session,
-                             )
-                            .await
+                    if let Ok(master_key) = master_key_res {
+                        if let Ok(sync_resp) = repo.load_sync_response() {
+                            if let Ok((enc, mac)) =
+                                crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)
                             {
-                                Ok(_) => {
-                                    verified = true;
-                                    println!("Timeout updated to: {}", t);
-                                }
-                                Err(_) => {
-                                    config.timeout = old_timeout;
-                                }
+                                verified = true;
+                                enc_key_opt = Some(enc);
+                                mac_key_opt = Some(mac);
                             }
                         }
-                        Err(_) => {}
                     }
                 }
 
@@ -654,29 +586,35 @@ async fn handle_settings(
                     );
                 }
 
-                if verified_locally {
-                    // Verified locally. Save config and save decryption keys.
-                    config.timeout = t.clone();
-                    println!("Timeout updated to: {}", t);
-                    config
-                        .save()
-                        .map_err(|e| format!("Failed to save configuration: {}", e))?;
+                // Save config and save decryption keys
+                session.timeout = t.clone();
+                println!("Timeout updated to: {}", t);
+                updated = true;
 
-                    if let (Some(sync_resp), Some((enc, mac))) = (loaded_sync_resp, decrypted_keys) {
-                        println!("Saving decryption keys to database...");
-                        if let Err(e) = storage::handle_post_sync(&sync_resp, &repo, &enc, &mac) {
-                            eprintln!("Warning: Failed to save decryption keys: {}", e);
-                        }
+                if let (Some(enc), Some(mac)) = (enc_key_opt, mac_key_opt) {
+                    println!("Saving decryption keys to database...");
+                    if let Err(e) = repo.save_saved_keys(&enc, &mac) {
+                        eprintln!("Warning: Failed to save decryption keys: {}", e);
+                    }
+
+                    // Send keys to daemon if running
+                    if daemon::is_agent_running() {
+                        let _ = daemon::send_control_request(daemon::ControlRequest::Unlock {
+                            user_id: session.user_id.clone().unwrap_or_default(),
+                            enc_key: hex::encode(enc),
+                            mac_key: hex::encode(mac),
+                        })
+                        .await;
                     }
                 }
             } else {
-                // Not logged in, allow setting timeout to "never"
-                config.timeout = t.clone();
+                // Not logged in, allow setting timeout to "unlocked" (keys will be saved on next login)
+                session.timeout = t.clone();
                 println!("Timeout updated to: {}", t);
                 updated = true;
             }
         } else {
-            config.timeout = t.clone();
+            session.timeout = t.clone();
             println!("Timeout updated to: {}", t);
             if let Some(path) = storage::db_path() {
                 if let Ok(repo) = storage::VaultRepository::open(&path) {
@@ -691,7 +629,7 @@ async fn handle_settings(
 
     if let Some(act_str) = args.timeout_action {
         let action = TimeoutAction::from_str(&act_str)?;
-        config.timeout_action = action;
+        session.timeout_action = action;
         println!("Timeout action updated to: {:?}", action);
         updated = true;
     }
@@ -736,8 +674,8 @@ async fn handle_settings(
             "  Email:          {}",
             session.email.as_deref().unwrap_or("<not logged in>")
         );
-        println!("  Session Timeout: {}", config.timeout);
-        println!("  Timeout Action:  {:?}", config.timeout_action);
+        println!("  Session Timeout: {}", session.timeout);
+        println!("  Timeout Action:  {:?}", session.timeout_action);
         println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
     }
 
@@ -768,116 +706,85 @@ async fn handle_unlock(config: &mut Config, session: &mut Session) -> Result<(),
         .email
         .clone()
         .ok_or_else(|| "Email address missing from session. Please log in first.".to_string())?;
-    let token = session
-        .access_token
-        .clone()
-        .ok_or_else(|| "Not logged in. Please run 'bitter login' first.".to_string())?;
 
     let password = crypto::prompt_master_password(None)?;
 
+    let db_path =
+        storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
+    let repo = storage::VaultRepository::open(&db_path)?;
+
+    // Attempt online sync of KDF settings first
     let api_client = ApiClient::new(&config.server_url);
+    let mut derived_key = None;
 
-    // Attempt online sync first
-    println!("Syncing ciphers and decrypting keys from server...");
-    let mut synced_successfully = false;
-
+    println!("Deriving master key...");
     match api_client.prelogin(&email).await {
         Ok(prelogin) => {
-            let master_key_res = match prelogin.kdf {
-                0 => crypto::derive_master_key_pbkdf2(&password, &email, prelogin.kdf_iterations),
-                1 => {
-                    if let (Some(mem), Some(para)) = (prelogin.kdf_memory, prelogin.kdf_parallelism)
-                    {
-                        crypto::derive_master_key_argon2(
-                            &password,
-                            &email,
-                            prelogin.kdf_iterations,
-                            mem,
-                            para,
-                        )
-                    } else {
-                        Err("Argon2 parameters missing from prelogin response".to_string())
-                    }
-                }
-                t => Err(format!("Unsupported KDF type: {}", t)),
-            };
-
-            match master_key_res {
-                Ok(master_key) => {
-                    match perform_sync_and_reload(
-                        &api_client,
-                        &token,
-                        KeySource::MasterKey(master_key),
-                        session,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            synced_successfully = true;
-                            println!("Unlock and sync completed successfully.");
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Failed to sync vault: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: Key derivation failed: {}", e);
-                }
+            if let Ok(master_key) = crypto::prompt_and_derive_master_key(
+                Some(password.clone()),
+                &email,
+                prelogin.kdf,
+                prelogin.kdf_iterations,
+                prelogin.kdf_memory,
+                prelogin.kdf_parallelism,
+                None,
+            ) {
+                derived_key = Some(master_key);
             }
         }
         Err(e) => {
-            eprintln!("Warning: Prelogin failed: {}", e);
+            eprintln!(
+                "Warning: Failed to fetch online KDF settings: {}. Falling back to offline derivation.",
+                e
+            );
         }
     }
 
-    if !synced_successfully {
-        println!("Falling back to decrypting local cache database...");
-        let db_path = storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
-        let repo = storage::VaultRepository::open(&db_path)?;
-        let sync_resp = repo.load_sync_response()?;
-        let (ciphers, enc_key, mac_key) = storage::decrypt_sync_response_offline(&sync_resp, &password)?;
-        if config.timeout.trim().to_lowercase() == "never" {
-            repo.save_saved_keys(&enc_key, &mac_key)?;
+    let (enc_key, mac_key) = match derived_key {
+        Some(master_key) => {
+            // Decrypt symmetric keys from the local database
+            let sync_resp = repo.load_sync_response()?;
+            crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key)
+                .map_err(|e| format!("Failed to decrypt symmetric keys: {}", e))?
         }
-        let cache_keys = storage::extract_ssh_keys_from_ciphers(&ciphers);
-        if cache_keys.is_empty() {
-            return Err(
-                "No keys found in local cache database. Please check your network and try again."
-                    .to_string(),
-            );
+        None => {
+            // Fallback: use offline KDF settings from SQLite sync response
+            let sync_resp = repo.load_sync_response()?;
+            let (_ciphers, enc, mac) =
+                storage::decrypt_sync_response_offline(&sync_resp, &password)?;
+            (enc, mac)
         }
-        println!("Warning: Running in offline mode. Live background sync will be unavailable.");
+    };
 
+    // If timeout is "unlocked", save keys to SQLite
+    if session.timeout.trim().to_lowercase() == "unlocked" {
+        repo.save_saved_keys(&enc_key, &mac_key)?;
+    }
+
+    // Send keys to daemon if running
+    if daemon::is_agent_running() {
+        println!("Sending decryption keys to background agent daemon...");
         let enc_hex = hex::encode(enc_key);
         let mac_hex = hex::encode(mac_key);
-        let daemon_keys: Vec<daemon::SshKeyData> = cache_keys
-            .into_iter()
-            .map(|k| daemon::SshKeyData {
-                name: k.name,
-                private_key: k.private_key,
-            })
-            .collect();
-
-        println!("Sending keys to background agent daemon...");
         let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
-            keys: daemon_keys,
+            user_id: session.user_id.clone().unwrap_or_default(),
             enc_key: enc_hex,
             mac_key: mac_hex,
         })
         .await?;
 
         if resp.status == "ok" {
-            println!(
-                "Agent unlocked successfully. Synced {} keys to memory.",
-                resp.key_count.unwrap_or(0)
-            );
+            println!("Agent unlocked successfully.");
         } else {
             return Err(format!(
                 "Failed to unlock agent: {}",
                 resp.error.unwrap_or_default()
             ));
         }
+    } else {
+        println!(
+            "Keys derived successfully. (Agent daemon is not running, so keys were not sent.)"
+        );
     }
 
     Ok(())
@@ -904,7 +811,7 @@ async fn handle_status(config: &Config, session: &Session) -> Result<(), String>
 
     let agent_running = daemon::is_agent_running();
     println!(
-        "  Agent Status:   {}",
+        "  Daemon Status:   {}",
         if agent_running {
             "Running"
         } else {
@@ -913,14 +820,16 @@ async fn handle_status(config: &Config, session: &Session) -> Result<(), String>
     );
 
     if agent_running {
-        match daemon::send_control_request(daemon::ControlRequest::Status).await {
+        match daemon::send_control_request(daemon::ControlRequest::Status {
+            user_id: session.user_id.clone(),
+        }).await {
             Ok(resp) => {
                 let unlocked = resp.unlocked.unwrap_or(false);
                 println!(
-                    "  Agent Vault:    {}",
+                    "  Daemon Vault:    {}",
                     if unlocked { "Unlocked" } else { "Locked" }
                 );
-                println!("  Keys in Memory: {}", resp.key_count.unwrap_or(0));
+                println!("  Keys in vault: {}", resp.key_count.unwrap_or(0));
                 if let Some(ttl) = resp.time_to_lock {
                     let mins = ttl / 60;
                     let secs = ttl % 60;
@@ -937,8 +846,8 @@ async fn handle_status(config: &Config, session: &Session) -> Result<(), String>
         }
     }
 
-    println!("  Timeout Setting: {}", config.timeout);
-    println!("  Timeout Action:  {:?}", config.timeout_action);
+    println!("  Timeout Setting: {}", session.timeout);
+    println!("  Timeout Action:  {:?}", session.timeout_action);
     println!("  SSH Agent Auto-Start: {}", config.ssh_agent_auto_start);
 
     if let Some(ref sync_time) = session.last_sync_time {

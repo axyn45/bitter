@@ -46,6 +46,9 @@ pub enum Commands {
 
     /// View global status of bitter
     Status,
+
+    /// Reset bitter's local configuration or database
+    Reset(ResetArgs),
 }
 
 #[derive(Debug, Args)]
@@ -81,7 +84,7 @@ pub struct LoginArgs {
 
 #[derive(Debug, Args)]
 pub struct SettingsArgs {
-    /// Set session timeout (e.g., 'immediately', '1m', '15m', 'never', 'custom 300')
+    /// Set session timeout (e.g., 'immediately', '1m', '15m', 'never', 'unlocked', 'custom 300')
     #[arg(short, long)]
     pub timeout: Option<String>,
 
@@ -134,4 +137,15 @@ pub struct DaemonArgs {
     /// Path to the Unix domain socket for the SSH agent listener
     #[arg(short, long)]
     pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ResetArgs {
+    /// Reset configuration file (removes it)
+    #[arg(long)]
+    pub config: bool,
+
+    /// Reset database file (removes it)
+    #[arg(long)]
+    pub db: bool,
 }

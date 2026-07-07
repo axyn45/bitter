@@ -2,7 +2,6 @@ use crate::api::ApiClient;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use directories::ProjectDirs;
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
@@ -36,27 +35,34 @@ impl FromStr for TimeoutAction {
     }
 }
 
+impl std::fmt::Display for TimeoutAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimeoutAction::Lock => write!(f, "Lock"),
+            TimeoutAction::Logout => write!(f, "Logout"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server_url: String,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
-    pub timeout: String,
-    pub timeout_action: TimeoutAction,
     pub socket_path: Option<PathBuf>,
     pub vault_cache_path: Option<PathBuf>,
     #[serde(default = "default_ssh_agent_auto_start")]
     pub ssh_agent_auto_start: bool,
+    pub device_id: Option<String>,
 }
 
 fn default_ssh_agent_auto_start() -> bool {
-    false
+    true
 }
 
 fn generate_device_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
-
 
 impl Default for Config {
     fn default() -> Self {
@@ -64,51 +70,15 @@ impl Default for Config {
             server_url: "https://api.bitwarden.com".to_string(),
             client_id: None,
             client_secret: None,
-            timeout: "15m".to_string(),
-            timeout_action: TimeoutAction::Lock,
             socket_path: None,
             vault_cache_path: None,
             ssh_agent_auto_start: false,
+            device_id: None,
         }
     }
 }
 
 impl Config {
-    /// Parses the timeout string into a Duration, or None if set to 'never'
-    pub fn parse_timeout_duration(&self) -> Result<Option<std::time::Duration>, String> {
-        let s = self.timeout.trim().to_lowercase();
-        if s == "never" {
-            return Ok(None);
-        }
-        if s == "immediately" {
-            return Ok(Some(std::time::Duration::ZERO));
-        }
-        if s.starts_with("custom ") {
-            let secs_str = s.strip_prefix("custom ").unwrap();
-            let secs: u64 = secs_str
-                .parse()
-                .map_err(|e| format!("Invalid custom seconds '{}': {}", secs_str, e))?;
-            return Ok(Some(std::time::Duration::from_secs(secs)));
-        }
-        // Check for suffixes: s, m, h, d
-        let (val_str, multiplier) = if s.ends_with('s') {
-            (s.strip_suffix('s').unwrap(), 1)
-        } else if s.ends_with('m') {
-            (s.strip_suffix('m').unwrap(), 60)
-        } else if s.ends_with('h') {
-            (s.strip_suffix('h').unwrap(), 3600)
-        } else if s.ends_with('d') {
-            (s.strip_suffix('d').unwrap(), 86400)
-        } else {
-            // Assume minutes if no suffix
-            (s.as_str(), 60)
-        };
-
-        let val: u64 = val_str
-            .parse()
-            .map_err(|e| format!("Invalid timeout duration value '{}': {}", val_str, e))?;
-        Ok(Some(std::time::Duration::from_secs(val * multiplier)))
-    }
     /// Gets the standard configuration directory for bitter
     pub fn config_dir() -> Option<PathBuf> {
         ProjectDirs::from("com", "", APP_NAME).map(|proj| proj.config_dir().to_path_buf())
@@ -132,16 +102,24 @@ impl Config {
         };
 
         if !path.exists() {
-            return Ok(Config::default());
+            let mut config = Config::default();
+            config.device_id = Some(generate_device_id());
+            let _ = config.save();
+            return Ok(config);
         }
 
         let content = fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content).map_err(|e| {
+        let mut config: Config = toml::from_str(&content).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Failed to parse config: {}", e),
             )
         })?;
+
+        if config.device_id.is_none() {
+            config.device_id = Some(generate_device_id());
+            let _ = config.save();
+        }
 
         Ok(config)
     }
@@ -189,6 +167,7 @@ impl Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    pub user_id: Option<String>,
     pub email: Option<String>,
     #[serde(default = "generate_device_id")]
     pub device_id: String,
@@ -196,17 +175,22 @@ pub struct Session {
     pub refresh_token: Option<String>,
     pub last_sync_time: Option<String>,
     pub server_url: Option<String>,
+    pub timeout: String,
+    pub timeout_action: TimeoutAction,
 }
 
 impl Default for Session {
     fn default() -> Self {
         Session {
+            user_id: None,
             email: None,
             device_id: generate_device_id(),
             access_token: None,
             refresh_token: None,
             last_sync_time: None,
             server_url: None,
+            timeout: "15m".to_string(),
+            timeout_action: TimeoutAction::Lock,
         }
     }
 }
@@ -277,5 +261,50 @@ impl Session {
         }
 
         Ok(access_token.clone())
+    }
+
+    /// Logs out by clearing all in-memory credentials and session details
+    pub fn logout(&mut self) {
+        self.user_id = None;
+        self.email = None;
+        self.access_token = None;
+        self.refresh_token = None;
+        self.last_sync_time = None;
+    }
+
+    /// Parses the timeout string into a Duration, or None if set to 'never'
+    pub fn parse_timeout_duration(&self) -> Result<Option<std::time::Duration>, String> {
+        let s = self.timeout.trim().to_lowercase();
+        if s == "never" || s == "unlocked" {
+            return Ok(None);
+        }
+        if s == "immediately" {
+            return Ok(Some(std::time::Duration::ZERO));
+        }
+        if s.starts_with("custom ") {
+            let secs_str = s.strip_prefix("custom ").unwrap();
+            let secs: u64 = secs_str
+                .parse()
+                .map_err(|e| format!("Invalid custom seconds '{}': {}", secs_str, e))?;
+            return Ok(Some(std::time::Duration::from_secs(secs)));
+        }
+        // Check for suffixes: s, m, h, d
+        let (val_str, multiplier) = if s.ends_with('s') {
+            (s.strip_suffix('s').unwrap(), 1)
+        } else if s.ends_with('m') {
+            (s.strip_suffix('m').unwrap(), 60)
+        } else if s.ends_with('h') {
+            (s.strip_suffix('h').unwrap(), 3600)
+        } else if s.ends_with('d') {
+            (s.strip_suffix('d').unwrap(), 86400)
+        } else {
+            // Assume minutes if no suffix
+            (s.as_str(), 60)
+        };
+
+        let val: u64 = val_str
+            .parse()
+            .map_err(|e| format!("Invalid timeout duration value '{}': {}", val_str, e))?;
+        Ok(Some(std::time::Duration::from_secs(val * multiplier)))
     }
 }
