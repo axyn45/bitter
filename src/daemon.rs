@@ -54,6 +54,7 @@ pub struct ControlResponse {
 }
 
 type SharedKeysContext = Arc<RwLock<Option<KeysContext>>>;
+type SharedDb = Arc<tokio::sync::Mutex<storage::VaultRepository>>;
 
 /// Starts the agent background process
 pub fn start_agent(background: bool, custom_socket_path: Option<PathBuf>) -> Result<(), String> {
@@ -237,6 +238,7 @@ async fn start_ssh_agent_task(
     socket_path: PathBuf,
     last_activity: Arc<RwLock<Instant>>,
     keys_context: SharedKeysContext,
+    shared_db: SharedDb,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), String> {
     let _ = fs::remove_file(&socket_path);
@@ -258,8 +260,9 @@ async fn start_ssh_agent_task(
                     Ok((stream, _)) => {
                         let la = last_activity.clone();
                         let kc = keys_context.clone();
+                        let db_clone = shared_db.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_ssh_agent_connection(stream, la, kc).await {
+                            if let Err(e) = handle_ssh_agent_connection(stream, la, kc, db_clone).await {
                                 if e.kind() == std::io::ErrorKind::BrokenPipe || e.kind() == std::io::ErrorKind::ConnectionReset {
                                     debug!("SSH Agent connection terminated gracefully: {}", e);
                                 } else {
@@ -306,9 +309,14 @@ async fn run_daemon_loops(
     let timeout = session.parse_timeout_duration().unwrap_or(None);
     let timeout_action = session.timeout_action;
 
+    let saved_keys_opt = repo.load_saved_keys().ok().flatten();
+
+    // Persist and wrap the VaultRepository in a SharedDb (Arc<Mutex<VaultRepository>>)
+    let shared_db: SharedDb = Arc::new(tokio::sync::Mutex::new(repo));
+
     // If timeout is "unlocked", try to load decryption keys automatically
     if session.timeout.trim().to_lowercase() == "unlocked" {
-        if let Ok(Some((enc, mac))) = repo.load_saved_keys() {
+        if let Some((enc, mac)) = saved_keys_opt {
             *keys_context.write().await = Some(KeysContext {
                 user_id: session.user_id.clone().unwrap_or_default(),
                 enc_key: enc,
@@ -330,8 +338,9 @@ async fn run_daemon_loops(
         let sp = socket_path.clone();
         let la = last_activity.clone();
         let kc = keys_context.clone();
+        let db_clone = shared_db.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_ssh_agent_task(sp, la, kc, rx).await {
+            if let Err(e) = start_ssh_agent_task(sp, la, kc, db_clone, rx).await {
                 error!("SSH Agent task error: {}", e);
             }
         });
@@ -354,6 +363,7 @@ async fn run_daemon_loops(
     let sp_clone = socket_path.clone();
     let cp_clone = control_socket_path.clone();
     let pp_clone = pid_path.clone();
+    let db_clone = shared_db.clone();
     tokio::spawn(async move {
         let username = get_current_username();
 
@@ -387,11 +397,8 @@ async fn run_daemon_loops(
                         }
                         crate::config::TimeoutAction::Logout => {
                             *kc.write().await = None;
-                            if let Some(path) = storage::db_path() {
-                                if let Ok(mut repo) = storage::VaultRepository::open(&path) {
-                                    let _ = repo.logout_active_user();
-                                }
-                            }
+                            let mut repo_guard = db_clone.lock().await;
+                            let _ = repo_guard.logout_active_user();
                             info!("Logged out due to inactivity.");
                         }
                     }
@@ -402,6 +409,7 @@ async fn run_daemon_loops(
 
     // Spawn the background WebSocket live-sync listener
     let kc_ws = keys_context.clone();
+    let db_clone = shared_db.clone();
     tokio::spawn(async move {
         let mut backoff = 10;
         loop {
@@ -412,7 +420,7 @@ async fn run_daemon_loops(
                 continue;
             }
 
-            if let Err(e) = run_websocket_sync_loop(kc_ws.clone()).await {
+            if let Err(e) = run_websocket_sync_loop(kc_ws.clone(), db_clone.clone()).await {
                 error!(
                     "WebSocket live sync loop error: {}. Reconnecting in {} seconds...",
                     e, backoff
@@ -444,8 +452,9 @@ async fn run_daemon_loops(
                 let kc = keys_context.clone();
                 let active_agent = active_ssh_agent.clone();
                 let sp = socket_path.clone();
+                let db_clone = shared_db.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_control_connection(stream, la, st, sta, kc, active_agent, sp).await {
+                    if let Err(e) = handle_control_connection(stream, la, st, sta, kc, active_agent, sp, db_clone).await {
                         error!("Control connection error: {}", e);
                     }
                 });
@@ -465,6 +474,7 @@ async fn handle_ssh_agent_connection(
     mut stream: UnixStream,
     last_activity: Arc<RwLock<Instant>>,
     keys_context: SharedKeysContext,
+    shared_db: SharedDb,
 ) -> Result<(), std::io::Error> {
     debug!("New SSH Agent connection accepted.");
     loop {
@@ -489,7 +499,7 @@ async fn handle_ssh_agent_connection(
         let is_locked = keys_context.read().await.is_none();
         if is_locked && (msg_type == 11 || msg_type == 13) {
             if let Some(peer_pid) = stream.peer_cred().ok().and_then(|cred| cred.pid()) {
-                if let Err(err) = prompt_tty_for_unlock(peer_pid, &keys_context, &mut stream).await {
+                if let Err(err) = prompt_tty_for_unlock(peer_pid, &keys_context, &mut stream, shared_db.clone()).await {
                     warn!("TTY unlock failed: {}", err);
                 }
             }
@@ -500,41 +510,32 @@ async fn handle_ssh_agent_connection(
         let response = if let Some(keys) = keys_opt {
             let mut decrypt_err = None;
             let mut parsed_keys = Vec::new();
-            if let Some(db_path) = storage::db_path() {
-                match storage::VaultRepository::open(&db_path) {
-                    Ok(repo) => {
-                        match storage::decrypt_ssh_keys_from_db(
-                            &repo,
-                            Some(&keys.user_id),
-                            &keys.enc_key,
-                            &keys.mac_key,
-                        )
-                        {
-                            Ok(ssh_items) => {
-                                for item in ssh_items {
-                                    if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(
-                                        &item.private_key,
-                                    ) {
-                                        pkey.set_comment(&item.name);
-                                        parsed_keys.push(pkey);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                decrypt_err = Some(format!(
-                                    "Failed to decrypt SSH keys from database: {}",
-                                    e
-                                ));
-                            }
+            
+            let repo_guard = shared_db.lock().await;
+            match storage::decrypt_ssh_keys_from_db(
+                &repo_guard,
+                Some(&keys.user_id),
+                &keys.enc_key,
+                &keys.mac_key,
+            ) {
+                Ok(ssh_items) => {
+                    for item in ssh_items {
+                        if let Ok(mut pkey) = ssh_key::private::PrivateKey::from_openssh(
+                            &item.private_key,
+                        ) {
+                            pkey.set_comment(&item.name);
+                            parsed_keys.push(pkey);
                         }
                     }
-                    Err(e) => {
-                        decrypt_err = Some(format!("Failed to open DB: {}", e));
-                    }
                 }
-            } else {
-                decrypt_err = Some("Could not determine DB path".to_string());
+                Err(e) => {
+                    decrypt_err = Some(format!(
+                        "Failed to decrypt SSH keys from database: {}",
+                        e
+                    ));
+                }
             }
+            drop(repo_guard);
 
             if let Some(err) = decrypt_err {
                 error!("Decryption error during agent request: {}", err);
@@ -569,28 +570,18 @@ async fn handle_ssh_agent_connection(
     }
 }
 
-async fn count_keys_in_db(keys_context: &SharedKeysContext) -> usize {
+async fn count_keys_in_db(keys_context: &SharedKeysContext, shared_db: &SharedDb) -> usize {
     let keys_opt = keys_context.read().await.clone();
     if let Some(keys) = keys_opt {
-        if let Some(db_path) = storage::db_path() {
-            match storage::VaultRepository::open(&db_path) {
-                Ok(repo) => {
-                    match repo.count_non_deleted_ciphers(&keys.user_id) {
-                        Ok(count) => {
-                            debug!("Successfully counted {} non-deleted items in database", count);
-                            return count;
-                        }
-                        Err(e) => {
-                            error!("count_non_deleted_ciphers failed: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("VaultRepository::open failed for path {:?}: {}", db_path, e);
-                }
+        let repo_guard = shared_db.lock().await;
+        match repo_guard.count_non_deleted_ciphers(&keys.user_id) {
+            Ok(count) => {
+                debug!("Successfully counted {} non-deleted items in database", count);
+                return count;
             }
-        } else {
-            error!("db_path() returned None");
+            Err(e) => {
+                error!("count_non_deleted_ciphers failed: {}", e);
+            }
         }
     } else {
         debug!("keys_context is None (vault is locked)");
@@ -607,6 +598,7 @@ async fn handle_control_connection(
     keys_context: SharedKeysContext,
     active_ssh_agent: Arc<RwLock<Option<tokio::sync::oneshot::Sender<()>>>>,
     socket_path: PathBuf,
+    shared_db: SharedDb,
 ) -> Result<(), std::io::Error> {
     let mut request_bytes = Vec::new();
     stream.read_to_end(&mut request_bytes).await?;
@@ -651,7 +643,7 @@ async fn handle_control_connection(
                     // Reset inactivity timer on successful unlock!
                     *last_activity.write().await = Instant::now();
 
-                    let count = count_keys_in_db(&keys_context).await;
+                    let count = count_keys_in_db(&keys_context, &shared_db).await;
 
                     ControlResponse {
                         status: "ok".to_string(),
@@ -666,7 +658,7 @@ async fn handle_control_connection(
                         status: "error".to_string(),
                         error: Some("Security keys must be exactly 32 bytes".to_string()),
                         unlocked: Some(keys_context.read().await.is_some()),
-                        key_count: Some(count_keys_in_db(&keys_context).await),
+                        key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                         time_to_lock: None,
                         ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                     }
@@ -676,7 +668,7 @@ async fn handle_control_connection(
                     status: "error".to_string(),
                     error: Some("Failed to decode hex security keys".to_string()),
                     unlocked: Some(keys_context.read().await.is_some()),
-                    key_count: Some(count_keys_in_db(&keys_context).await),
+                    key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                     time_to_lock: None,
                     ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                 }
@@ -703,7 +695,7 @@ async fn handle_control_connection(
                 }
             };
             let key_count = if unlocked {
-                count_keys_in_db(&keys_context).await
+                count_keys_in_db(&keys_context, &shared_db).await
             } else {
                 0
             };
@@ -729,12 +721,10 @@ async fn handle_control_connection(
         }
         ControlRequest::Reload => {
             // Re-load session from DB for timeout settings
-            let db_path = storage::db_path();
-            let session_res = db_path.as_ref().and_then(|p| {
-                storage::VaultRepository::open(p).ok().and_then(|repo| {
-                    repo.load_session().ok().flatten()
-                })
-            });
+            let session_res = {
+                let repo_guard = shared_db.lock().await;
+                repo_guard.load_session().ok().flatten()
+            };
 
             if let Some(session) = session_res {
                 let t = session.parse_timeout_duration().unwrap_or(None);
@@ -758,18 +748,15 @@ async fn handle_control_connection(
 
                 // If timeout is not "unlocked", clear saved keys if they exist
                 if session.timeout.trim().to_lowercase() != "unlocked" {
-                    if let Some(path) = db_path {
-                        if let Ok(repo) = storage::VaultRepository::open(&path) {
-                            let _ = repo.clear_saved_keys();
-                        }
-                    }
+                    let repo_guard = shared_db.lock().await;
+                    let _ = repo_guard.clear_saved_keys();
                 }
 
                 ControlResponse {
                     status: "ok".to_string(),
                     error: None,
                     unlocked: Some(is_unlocked),
-                    key_count: Some(count_keys_in_db(&keys_context).await),
+                    key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                     time_to_lock: None,
                     ssh_agent_active: Some(active_ssh_agent.read().await.is_some()),
                 }
@@ -795,7 +782,7 @@ async fn handle_control_connection(
                     status: "error".to_string(),
                     error: Some("SSH agent is already running".to_string()),
                     unlocked: Some(keys_context.read().await.is_some()),
-                    key_count: Some(count_keys_in_db(&keys_context).await),
+                    key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                     time_to_lock: None,
                     ssh_agent_active: Some(true),
                 }
@@ -804,8 +791,9 @@ async fn handle_control_connection(
                 let sp = socket_path.clone();
                 let la = last_activity.clone();
                 let kc = keys_context.clone();
+                let db_clone = shared_db.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = start_ssh_agent_task(sp, la, kc, rx).await {
+                    if let Err(e) = start_ssh_agent_task(sp, la, kc, db_clone, rx).await {
                         error!("SSH Agent task error: {}", e);
                     }
                 });
@@ -814,7 +802,7 @@ async fn handle_control_connection(
                     status: "ok".to_string(),
                     error: None,
                     unlocked: Some(keys_context.read().await.is_some()),
-                    key_count: Some(count_keys_in_db(&keys_context).await),
+                    key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                     time_to_lock: None,
                     ssh_agent_active: Some(true),
                 }
@@ -828,7 +816,7 @@ async fn handle_control_connection(
                     status: "ok".to_string(),
                     error: None,
                     unlocked: Some(keys_context.read().await.is_some()),
-                    key_count: Some(count_keys_in_db(&keys_context).await),
+                    key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                     time_to_lock: None,
                     ssh_agent_active: Some(false),
                 }
@@ -837,7 +825,7 @@ async fn handle_control_connection(
                     status: "error".to_string(),
                     error: Some("SSH agent is not running".to_string()),
                     unlocked: Some(keys_context.read().await.is_some()),
-                    key_count: Some(count_keys_in_db(&keys_context).await),
+                    key_count: Some(count_keys_in_db(&keys_context, &shared_db).await),
                     time_to_lock: None,
                     ssh_agent_active: Some(false),
                 }
@@ -855,6 +843,7 @@ async fn handle_surgical_cipher_update(
     token: &str,
     cipher_id: &str,
     keys_context: &SharedKeysContext,
+    shared_db: &SharedDb,
 ) -> Result<(), String> {
     let ctx_opt = keys_context.read().await;
     let ctx = match &*ctx_opt {
@@ -887,12 +876,8 @@ async fn handle_surgical_cipher_update(
         }
     }
 
-    // Open cache database repository
-    let db_path =
-        storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let mut repo = storage::VaultRepository::open(&db_path)?;
-
     // Get current active user ID to update
+    let mut repo = shared_db.lock().await;
     let user_id = repo
         .get_active_user_id()?
         .ok_or_else(|| "No active user logged in".to_string())?;
@@ -911,25 +896,26 @@ async fn handle_surgical_cipher_update(
     Ok(())
 }
 
-async fn run_websocket_sync_loop(keys_context: SharedKeysContext) -> Result<(), String> {
+async fn run_websocket_sync_loop(keys_context: SharedKeysContext, shared_db: SharedDb) -> Result<(), String> {
     let config =
         crate::config::Config::load().map_err(|e| format!("Failed to load config: {}", e))?;
-    let db_path =
-        storage::db_path().ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let repo = storage::VaultRepository::open(&db_path)?;
-    let mut session: crate::config::Session = repo.load_session()?.unwrap_or_else(|| {
-        let mut s = crate::config::Session::default();
-        if let Some(ref d_id) = config.device_id {
-            s.device_id = d_id.clone();
-        }
-        s
-    });
-
-    let token = match session.get_valid_token(&config.server_url).await {
-        Ok(t) => t,
-        Err(e) => return Err(e),
+    let mut session = {
+        let db = shared_db.lock().await;
+        db.load_session()?.unwrap_or_else(|| {
+            let mut s = crate::config::Session::default();
+            if let Some(ref d_id) = config.device_id {
+                s.device_id = d_id.clone();
+            }
+            s
+        })
     };
-    repo.save_session(&session)?;
+
+    let token = session.get_valid_token(&config.server_url).await?;
+
+    {
+        let db = shared_db.lock().await;
+        db.save_session(&session)?;
+    }
 
     let notifications_url = crate::api::get_notifications_endpoints(&config.server_url);
     let client = ApiClient::new(&config.server_url);
@@ -1010,14 +996,16 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext) -> Result<(), 
                                             let client_clone = client.clone();
                                             let kc_clone = keys_context.clone();
                                             let cipher_id_str = cipher_id.to_string();
+                                            let db_clone = shared_db.clone();
                                             tokio::spawn(async move {
                                                 let current_token =
-                                                    get_valid_token_from_db("").await;
+                                                    get_valid_token_from_db(&db_clone, "").await;
                                                 if let Err(e) = handle_surgical_cipher_update(
                                                     &client_clone,
                                                     &current_token,
                                                     &cipher_id_str,
                                                     &kc_clone,
+                                                    &db_clone,
                                                 )
                                                 .await
                                                 {
@@ -1035,21 +1023,12 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext) -> Result<(), 
                                             ut
                                         );
 
-                                        let current_token = get_valid_token_from_db(&token).await;
+                                        let current_token = get_valid_token_from_db(&shared_db, &token).await;
                                         match client.sync(&current_token).await {
                                             Ok(sync_data) => {
-                                                let repo_res = if let Some(db_path) =
-                                                    storage::db_path()
-                                                {
-                                                    match storage::VaultRepository::open(&db_path) {
-                                                        Ok(mut repo) => {
-                                                            repo.save_sync_response(&sync_data)
-                                                        }
-                                                        Err(e) => Err(e),
-                                                    }
-                                                } else {
-                                                    Err("Could not determine cache database path"
-                                                        .to_string())
+                                                let repo_res = {
+                                                    let mut db = shared_db.lock().await;
+                                                    db.save_sync_response(&sync_data)
                                                 };
 
                                                 if let Err(err) = repo_res {
@@ -1134,9 +1113,10 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext) -> Result<(), 
                                                             let kc_clone = keys_context.clone();
                                                             let cipher_id_str =
                                                                 cipher_id.to_string();
+                                                            let db_clone = shared_db.clone();
                                                             tokio::spawn(async move {
                                                                 let current_token =
-                                                                    get_valid_token_from_db("")
+                                                                    get_valid_token_from_db(&db_clone, "")
                                                                         .await;
                                                                 if let Err(e) =
                                                                     handle_surgical_cipher_update(
@@ -1144,6 +1124,7 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext) -> Result<(), 
                                                                         &current_token,
                                                                         &cipher_id_str,
                                                                         &kc_clone,
+                                                                        &db_clone,
                                                                     )
                                                                     .await
                                                                 {
@@ -1164,22 +1145,12 @@ async fn run_websocket_sync_loop(keys_context: SharedKeysContext) -> Result<(), 
                                                             ut_val
                                                         );
                                                         let current_token =
-                                                            get_valid_token_from_db(&token).await;
+                                                            get_valid_token_from_db(&shared_db, &token).await;
                                                         match client.sync(&current_token).await {
                                                             Ok(sync_data) => {
-                                                                let repo_res = if let Some(
-                                                                    db_path,
-                                                                ) =
-                                                                    storage::db_path()
-                                                                {
-                                                                    match storage::VaultRepository::open(&db_path) {
-                                                                        Ok(mut repo) => {
-                                                                            repo.save_sync_response(&sync_data)
-                                                                        }
-                                                                        Err(e) => Err(e),
-                                                                    }
-                                                                } else {
-                                                                    Err("Could not determine cache database path".to_string())
+                                                                let repo_res = {
+                                                                    let mut db = shared_db.lock().await;
+                                                                    db.save_sync_response(&sync_data)
                                                                 };
                                                                 if let Err(err) = repo_res {
                                                                     error!(
@@ -1301,6 +1272,7 @@ async fn prompt_tty_for_unlock(
     peer_pid: i32,
     keys_context: &SharedKeysContext,
     stream: &mut tokio::net::UnixStream,
+    shared_db: SharedDb,
 ) -> Result<(), String> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -1317,10 +1289,10 @@ async fn prompt_tty_for_unlock(
     }
 
     // Load session to check if logged in
-    let db_path = crate::storage::db_path()
-        .ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let repo = crate::storage::VaultRepository::open(&db_path)?;
-    let session = repo.load_session()?.unwrap_or_default();
+    let session = {
+        let db = shared_db.lock().await;
+        db.load_session()?.unwrap_or_default()
+    };
 
     if session.email.is_none() {
         return Err("Not logged in".to_string());
@@ -1471,12 +1443,11 @@ async fn prompt_tty_for_unlock(
     }
 
     // Load local database
-    let db_path = crate::storage::db_path()
-        .ok_or_else(|| "Could not determine cache database path".to_string())?;
-    let repo = crate::storage::VaultRepository::open(&db_path)?;
-    let sync_resp = repo
-        .load_sync_response()
-        .map_err(|e| format!("Password incorrect or local database load failed: {}", e))?;
+    let sync_resp = {
+        let db = shared_db.lock().await;
+        db.load_sync_response()
+            .map_err(|e| format!("Password incorrect or local database load failed: {}", e))?
+    };
 
     // Decrypt symmetric keys offline using master password
     let (_items, enc_key, mac_key) =
@@ -1534,20 +1505,17 @@ fn count_active_user_sessions(username: &str) -> usize {
     count
 }
 
-async fn get_valid_token_from_db(fallback: &str) -> String {
+async fn get_valid_token_from_db(shared_db: &SharedDb, fallback: &str) -> String {
     if let Ok(cfg) = crate::config::Config::load() {
-        if let Some(db_path) = storage::db_path() {
-            if let Ok(repo) = storage::VaultRepository::open(&db_path) {
-                if let Ok(Some(mut sess)) = repo.load_session() {
-                    match sess.get_valid_token(&cfg.server_url).await {
-                        Ok(t) => {
-                            let _ = repo.save_session(&sess);
-                            return t;
-                        }
-                        Err(e) => {
-                            error!("Failed to get valid token: {}", e);
-                        }
-                    }
+        let db = shared_db.lock().await;
+        if let Ok(Some(mut sess)) = db.load_session() {
+            match sess.get_valid_token(&cfg.server_url).await {
+                Ok(t) => {
+                    let _ = db.save_session(&sess);
+                    return t;
+                }
+                Err(e) => {
+                    error!("Failed to get valid token: {}", e);
                 }
             }
         }
