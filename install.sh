@@ -120,18 +120,7 @@ else
     info "Service was not started."
 fi
 
-# Option C: Enable user lingering
-prompt "Do you want to enable systemd user lingering (keeps daemon running even when you log out)? [y/N]"
-read -r response
-if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-    info "Enabling user lingering..."
-    loginctl enable-linger || true
-    success "User lingering enabled."
-else
-    info "User lingering was not enabled."
-fi
-
-# Option D: Configure environment variables (SSH_AUTH_SOCK and PATH)
+# Option C: Configure environment variables (SSH_AUTH_SOCK and PATH)
 prompt "Do you want to configure your shell profile (adds SSH_AUTH_SOCK and PATH)? [y/N]"
 read -r response
 if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
