@@ -318,6 +318,7 @@ async fn run_daemon_loops(
                 mac_key: mac,
             });
             info!("Agent started: loaded decryption keys from secure cache.");
+            spawn_background_sync(shared_db.clone());
         } else {
             info!("Agent started: decryption keys missing, running in locked state.");
         }
@@ -638,6 +639,9 @@ async fn handle_control_connection(
                     // Reset inactivity timer on successful unlock!
                     *last_activity.write().await = Instant::now();
 
+                    // Trigger background sync on manual unlock
+                    spawn_background_sync(shared_db.clone());
+
                     let count = count_keys_in_db(&keys_context, &shared_db).await;
 
                     ControlResponse {
@@ -831,6 +835,40 @@ async fn handle_control_connection(
     let resp_bytes = serde_json::to_vec(&response).unwrap();
     stream.write_all(&resp_bytes).await?;
     Ok(())
+}
+
+fn spawn_background_sync(shared_db: SharedDb) {
+    tokio::spawn(async move {
+        info!("Background daemon sync: Fetching latest vault updates from server...");
+        match crate::config::Config::load() {
+            Ok(config) => {
+                let client = ApiClient::new(&config.server_url);
+                match storage::VaultRepository::get_valid_token_shared(&shared_db).await {
+                    Ok(token) => {
+                        match client.sync(&token).await {
+                            Ok(sync_data) => {
+                                let mut db = shared_db.lock().await;
+                                if let Err(e) = db.save_sync_response(&sync_data) {
+                                    error!("Background daemon sync: Failed to save to database: {}", e);
+                                } else {
+                                    info!("Background daemon sync: Vault updated successfully.");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Background daemon sync: API request failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Background daemon sync: Failed to retrieve session token: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Background daemon sync: Failed to load config: {}", e);
+            }
+        }
+    });
 }
 
 async fn handle_surgical_cipher_update(
