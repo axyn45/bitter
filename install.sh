@@ -120,6 +120,96 @@ else
     info "Service was not started."
 fi
 
+# Option C: Enable user lingering
+prompt "Do you want to enable systemd user lingering (keeps daemon running even when you log out)? [y/N]"
+read -r response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    info "Enabling user lingering..."
+    loginctl enable-linger || true
+    success "User lingering enabled."
+else
+    info "User lingering was not enabled."
+fi
+
+# Option D: Configure environment variables (SSH_AUTH_SOCK and PATH)
+prompt "Do you want to configure your shell profile (adds SSH_AUTH_SOCK and PATH)? [y/N]"
+read -r response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    # Detect shell profiles
+    PROFILES=()
+    [ -f "$HOME/.bashrc" ] && PROFILES+=("$HOME/.bashrc")
+    [ -f "$HOME/.zshrc" ] && PROFILES+=("$HOME/.zshrc")
+    [ -f "$HOME/.profile" ] && PROFILES+=("$HOME/.profile")
+    [ -f "$HOME/.bash_profile" ] && PROFILES+=("$HOME/.bash_profile")
+    
+    if [ ${#PROFILES[@]} -eq 0 ]; then
+        warning "No shell profile files (like .bashrc or .zshrc) were detected."
+    else
+        echo "Detected shell profiles:"
+        for i in "${!PROFILES[@]}"; do
+            echo "  [$i] $(basename "${PROFILES[$i]}")"
+        done
+        prompt "Select profile to update (e.g. 0, or enter a custom path):"
+        read -r choice
+        
+        TARGET_PROFILE=""
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -lt "${#PROFILES[@]}" ]; then
+            TARGET_PROFILE="${PROFILES[$choice]}"
+        elif [ -n "$choice" ]; then
+            if [[ "$choice" != /* ]]; then
+                TARGET_PROFILE="$HOME/$choice"
+            else
+                TARGET_PROFILE="$choice"
+            fi
+        fi
+        
+        if [ -n "$TARGET_PROFILE" ]; then
+            info "Updating $TARGET_PROFILE..."
+            
+            # Check if our block is already present
+            if grep -q "# >>> bitter ssh-agent configuration >>>" "$TARGET_PROFILE" 2>/dev/null; then
+                info "bitter configuration block is already present in $TARGET_PROFILE."
+            else
+                # Check for individual configs outside our block to avoid duplicating
+                ADD_AUTH=true
+                ADD_PATH=true
+                
+                if grep -q "SSH_AUTH_SOCK" "$TARGET_PROFILE" 2>/dev/null; then
+                    ADD_AUTH=false
+                    info "SSH_AUTH_SOCK is already configured in $TARGET_PROFILE."
+                fi
+                
+                if grep -q "\.local/bin" "$TARGET_PROFILE" 2>/dev/null; then
+                    ADD_PATH=false
+                    info "PATH already contains .local/bin in $TARGET_PROFILE."
+                fi
+                
+                # Write the block if at least one export is needed
+                if [ "$ADD_AUTH" = true ] || [ "$ADD_PATH" = true ]; then
+                    echo "" >> "$TARGET_PROFILE"
+                    echo "# >>> bitter ssh-agent configuration >>>" >> "$TARGET_PROFILE"
+                    
+                    if [ "$ADD_AUTH" = true ]; then
+                        echo 'export SSH_AUTH_SOCK="$HOME/.cache/bitter/ssh-agent.sock"' >> "$TARGET_PROFILE"
+                        success "Added SSH_AUTH_SOCK to $TARGET_PROFILE"
+                    fi
+                    
+                    if [ "$ADD_PATH" = true ]; then
+                        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$TARGET_PROFILE"
+                        success "Added $HOME/.local/bin to PATH in $TARGET_PROFILE"
+                    fi
+                    
+                    echo "# <<< bitter ssh-agent configuration <<<" >> "$TARGET_PROFILE"
+                fi
+            fi
+            
+            echo -e "${YELLOW}ℹ Please run: source $TARGET_PROFILE (or restart your terminal) to apply changes.${NC}"
+        fi
+    fi
+else
+    info "Shell profile was not modified."
+fi
+
 # 7. Print summary
 echo ""
 echo -e "${BOLD}${GREEN}=========================================${NC}"
