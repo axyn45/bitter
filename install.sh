@@ -59,71 +59,40 @@ cp target/release/bitter "$BINARY_DIR/bitter"
 chmod +x "$BINARY_DIR/bitter"
 success "Binary copied to $BINARY_DIR/bitter"
 
-# Ensure binary is in user PATH or print warning
-if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    warning "$HOME/.local/bin is not in your PATH. You might need to add it to your shell profile (~/.bashrc, ~/.zshrc, etc.)."
+# Clean up legacy systemd service file if it exists
+LEGACY_SERVICE="$HOME/.config/systemd/user/bitter.service"
+if [ -f "$LEGACY_SERVICE" ]; then
+    info "Removing old systemd service file..."
+    systemctl --user stop bitter.service 2>/dev/null || true
+    systemctl --user disable bitter.service 2>/dev/null || true
+    rm -f "$LEGACY_SERVICE"
+    systemctl --user daemon-reload 2>/dev/null || true
+    success "Legacy systemd service removed successfully."
 fi
 
-# 4. Create systemd user service file
-SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
-SERVICE_FILE="$SYSTEMD_USER_DIR/bitter.service"
-
-info "Creating systemd user service..."
-mkdir -p "$SYSTEMD_USER_DIR"
-
-cat << EOF > "$SERVICE_FILE"
-[Unit]
-Description=Bitter Bitwarden Daemon & SSH Agent
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/bitter start
-Restart=on-failure
-RestartSec=5s
-Environment=RUST_LOG=info
-
-[Install]
-WantedBy=default.target
-EOF
-
-success "Systemd service file created at $SERVICE_FILE"
-
-# 5. Reload systemd user daemon
-info "Reloading systemd user daemon..."
-systemctl --user daemon-reload
-success "Systemd user daemon reloaded."
-
-# 6. Interactive installation options
+# 4. Interactive installation options
 echo ""
 echo -e "${BOLD}Configuration options:${NC}"
 
-# Option A: Enable service
-prompt "Do you want to enable the service to start automatically at login? [y/N]"
+CONFIGURE_ENV=false
+CONFIGURE_AUTOSTART=false
+
+# Option A: Shell environment variables (SSH_AUTH_SOCK and PATH)
+prompt "Do you want to configure your shell profile environment variables (adds SSH_AUTH_SOCK and PATH)? [y/N]"
 read -r response
 if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-    info "Enabling bitter.service..."
-    systemctl --user enable bitter.service
-    success "Service enabled."
-else
-    info "Service was not enabled."
+    CONFIGURE_ENV=true
 fi
 
-# Option B: Start service now
-prompt "Do you want to start the service right now? [y/N]"
+# Option B: Shell auto-start at login
+prompt "Do you want to enable automatic daemon start when you open a terminal? [y/N]"
 read -r response
 if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-    info "Starting bitter.service..."
-    systemctl --user start bitter.service
-    success "Service started."
-else
-    info "Service was not started."
+    CONFIGURE_AUTOSTART=true
 fi
 
-# Option C: Configure environment variables (SSH_AUTH_SOCK and PATH)
-prompt "Do you want to configure your shell profile (adds SSH_AUTH_SOCK and PATH)? [y/N]"
-read -r response
-if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+# Update shell profile if either option is selected
+if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
     # Detect shell profiles
     PROFILES=()
     [ -f "$HOME/.bashrc" ] && PROFILES+=("$HOME/.bashrc")
@@ -157,39 +126,39 @@ if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             
             # Check if our block is already present
             if grep -q "# >>> bitter ssh-agent configuration >>>" "$TARGET_PROFILE" 2>/dev/null; then
-                info "bitter configuration block is already present in $TARGET_PROFILE."
+                info "bitter configuration block is already present in $TARGET_PROFILE. Skipping."
             else
-                # Check for individual configs outside our block to avoid duplicating
-                ADD_AUTH=true
-                ADD_PATH=true
+                echo "" >> "$TARGET_PROFILE"
+                echo "# >>> bitter ssh-agent configuration >>>" >> "$TARGET_PROFILE"
                 
-                if grep -q "SSH_AUTH_SOCK" "$TARGET_PROFILE" 2>/dev/null; then
-                    ADD_AUTH=false
-                    info "SSH_AUTH_SOCK is already configured in $TARGET_PROFILE."
-                fi
-                
-                if grep -q "\.local/bin" "$TARGET_PROFILE" 2>/dev/null; then
-                    ADD_PATH=false
-                    info "PATH already contains .local/bin in $TARGET_PROFILE."
-                fi
-                
-                # Write the block if at least one export is needed
-                if [ "$ADD_AUTH" = true ] || [ "$ADD_PATH" = true ]; then
-                    echo "" >> "$TARGET_PROFILE"
-                    echo "# >>> bitter ssh-agent configuration >>>" >> "$TARGET_PROFILE"
-                    
-                    if [ "$ADD_AUTH" = true ]; then
+                if [ "$CONFIGURE_ENV" = true ]; then
+                    # Check if SSH_AUTH_SOCK is already configured in profile
+                    if grep -q "SSH_AUTH_SOCK" "$TARGET_PROFILE" 2>/dev/null; then
+                        info "SSH_AUTH_SOCK is already configured in $TARGET_PROFILE."
+                    else
                         echo 'export SSH_AUTH_SOCK="$HOME/.cache/bitter/ssh-agent.sock"' >> "$TARGET_PROFILE"
                         success "Added SSH_AUTH_SOCK to $TARGET_PROFILE"
                     fi
                     
-                    if [ "$ADD_PATH" = true ]; then
+                    # Check if PATH already contains ~/.local/bin in active environment or profile
+                    if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] || grep -q "\.local/bin" "$TARGET_PROFILE" 2>/dev/null; then
+                        info "PATH already contains $HOME/.local/bin. Skipping path addition."
+                    else
                         echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$TARGET_PROFILE"
                         success "Added $HOME/.local/bin to PATH in $TARGET_PROFILE"
                     fi
-                    
-                    echo "# <<< bitter ssh-agent configuration <<<" >> "$TARGET_PROFILE"
                 fi
+                
+                if [ "$CONFIGURE_AUTOSTART" = true ]; then
+                    echo "" >> "$TARGET_PROFILE"
+                    echo "# Start the daemon silently if the socket is not active" >> "$TARGET_PROFILE"
+                    echo 'if [ ! -S "$HOME/.cache/bitter/ssh-agent.sock" ]; then' >> "$TARGET_PROFILE"
+                    echo '    "$HOME/.local/bin/bitter" start -b >/dev/null 2>&1' >> "$TARGET_PROFILE"
+                    echo 'fi' >> "$TARGET_PROFILE"
+                    success "Added daemon auto-start logic to $TARGET_PROFILE"
+                fi
+                
+                echo "# <<< bitter ssh-agent configuration <<<" >> "$TARGET_PROFILE"
             fi
             
             echo -e "${YELLOW}ℹ Please run: source $TARGET_PROFILE (or restart your terminal) to apply changes.${NC}"
@@ -199,15 +168,31 @@ else
     info "Shell profile was not modified."
 fi
 
-# 7. Print summary
+# Option C: Start daemon now
+prompt "Do you want to start the daemon right now? [y/N]"
+read -r response
+if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+    info "Starting bitter daemon..."
+    # Stop existing instance if running
+    "$BINARY_DIR/bitter" stop >/dev/null 2>&1 || true
+    if "$BINARY_DIR/bitter" start -b; then
+        success "Daemon started successfully."
+    else
+        error "Failed to start daemon."
+    fi
+else
+    info "Daemon was not started."
+fi
+
+# 5. Print summary
 echo ""
 echo -e "${BOLD}${GREEN}=========================================${NC}"
 echo -e "${BOLD}${GREEN}     bitter Installation Completed!      ${NC}"
 echo -e "${BOLD}${GREEN}=========================================${NC}"
 echo ""
-echo -e "You can manage the daemon using standard systemctl commands:"
-echo -e "  - Check status:     ${CYAN}systemctl --user status bitter.service${NC}"
-echo -e "  - View live logs:   ${CYAN}journalctl --user -u bitter.service -f${NC}"
-echo -e "  - Stop daemon:      ${CYAN}systemctl --user stop bitter.service${NC}"
-echo -e "  - Start daemon:     ${CYAN}systemctl --user start bitter.service${NC}"
+echo -e "You can manage the daemon using standard bitter CLI commands:"
+echo -e "  - Check status:     ${CYAN}bitter status${NC}"
+echo -e "  - Stop daemon:      ${CYAN}bitter stop${NC}"
+echo -e "  - Start daemon:     ${CYAN}bitter start -b${NC}"
+echo -e "  - Unlock vault:     ${CYAN}bitter unlock${NC}"
 echo ""
