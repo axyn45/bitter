@@ -105,20 +105,20 @@ This document tracks the step-by-step progress of the `bitter` project, includin
   - [ ] Implement asynchronous polling status checks on terminal
 
 ## Phase 10: TUI Dashboard & CRUD Management
-- [ ] Add `ratatui` and `crossterm` dependencies to `Cargo.toml`
-- [ ] Establish TUI App Framework (App State, Event Loop, and raw terminal handlers)
-- [ ] Build Multi-Pane Interactive Dashboard Layout
-  - [ ] **Left Pane (Navigation Panel):** Hierarchical view showing Categories (Logins, Cards, Identities, Secure Notes) and Folders list
-  - [ ] **Middle Pane (Item List Panel):** List of ciphers filtered by current Category/Folder, with fuzzy-search input
-  - [ ] **Right Pane (Details Panel):** Render detailed properties (Title, credentials, notes, custom fields, SSH keys)
-- [ ] Implement Keyboard Interaction Scheme
-  - [ ] Arrow keys for list selection and navigation
-  - [ ] `Tab` / `Shift-Tab` to switch focus between Left, Middle, and Right panes
-  - [ ] Keyboard shortcuts for core actions (Add, Edit, Delete, Copy, Lock, Sync, Logout)
-- [ ] Build Authentication Flow Screens
-  - [ ] TUI Login form (Email/Password credentials and Server URL input)
-  - [ ] TUI Lock Overlay (Wipes screen and prompts for master password on inactivity or lock command)
-  - [ ] TUI Logout support
+- [x] Add `ratatui` and `crossterm` dependencies to `Cargo.toml`
+- [x] Establish TUI App Framework (App State, Event Loop, and raw terminal handlers)
+- [x] Build Multi-Pane Interactive Dashboard Layout
+  - [x] **Left Pane (Navigation Panel):** Hierarchical view showing Categories (Logins, Cards, Identities, Secure Notes) and Folders list
+  - [x] **Middle Pane (Item List Panel):** List of ciphers filtered by current Category/Folder, with fuzzy-search input
+  - [x] **Right Pane (Details Panel):** Render detailed properties (Title, credentials, notes, custom fields, SSH keys)
+- [x] Implement Keyboard Interaction Scheme
+  - [x] Arrow keys for list selection and navigation
+  - [x] `Tab` / `Shift-Tab` to switch focus between Left, Middle, and Right panes
+  - [x] Keyboard shortcuts for core actions (Add, Edit, Delete, Copy, Lock, Sync, Logout)
+- [x] Build Authentication Flow Screens
+  - [x] TUI Login form (Email/Password credentials and Server URL input)
+  - [x] TUI Lock Overlay (Wipes screen and prompts for master password on inactivity or lock command)
+  - [x] TUI Logout support
 - [ ] Implement Vault Item CRUD Actions
   - [ ] Input Form component for Adding and Updating ciphers (name, type, credentials, custom fields)
   - [ ] Folder selector dropdown and custom fields builder in forms
