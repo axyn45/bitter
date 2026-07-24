@@ -47,6 +47,9 @@ pub enum Commands {
     /// View global status of bitter
     Status,
 
+    /// Open the interactive Terminal User Interface (TUI)
+    Tui,
+
     /// Reset bitter's local configuration or database
     Reset(ResetArgs),
 }

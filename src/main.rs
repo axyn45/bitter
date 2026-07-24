@@ -6,6 +6,8 @@ mod config;
 mod crypto;
 mod daemon;
 mod storage;
+mod tui;
+
 
 use clap::Parser;
 use cli::{Cli, Commands};

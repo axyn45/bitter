@@ -9,6 +9,7 @@ pub async fn perform_sync(
     api_client: &ApiClient,
     token: &str,
     session: &mut Session,
+    quiet: bool,
 ) -> Result<(), String> {
     // 1. Fetch sync data from server
     let sync_data = api_client
@@ -35,16 +36,22 @@ pub async fn perform_sync(
         match daemon::send_control_request(daemon::ControlRequest::Reload).await {
             Ok(resp) => {
                 if resp.status == "ok" {
-                    println!("Agent notified of sync reload.");
+                    if !quiet {
+                        println!("Agent notified of sync reload.");
+                    }
                 } else {
-                    eprintln!(
-                        "Warning: Agent failed to reload: {}",
-                        resp.error.unwrap_or_default()
-                    );
+                    if !quiet {
+                        eprintln!(
+                            "Warning: Agent failed to reload: {}",
+                            resp.error.unwrap_or_default()
+                        );
+                    }
                 }
             }
             Err(e) => {
-                eprintln!("Warning: Failed to communicate reload to agent: {}", e);
+                if !quiet {
+                    eprintln!("Warning: Failed to communicate reload to agent: {}", e);
+                }
             }
         }
     }
@@ -57,6 +64,7 @@ pub async fn unlock_with_keys(
     session: &Session,
     enc_key: &[u8; 32],
     mac_key: &[u8; 32],
+    quiet: bool,
 ) -> Result<(), String> {
     // If timeout is "unlocked", save keys to SQLite
     if session.timeout.trim().to_lowercase() == "unlocked" {
@@ -66,7 +74,9 @@ pub async fn unlock_with_keys(
 
     // Send keys to daemon if running
     if daemon::is_agent_running() {
-        println!("Sending decryption keys to background agent daemon...");
+        if !quiet {
+            println!("Sending decryption keys to background agent daemon...");
+        }
         let enc_hex = hex::encode(enc_key);
         let mac_hex = hex::encode(mac_key);
         let resp = daemon::send_control_request(daemon::ControlRequest::Unlock {
@@ -77,7 +87,9 @@ pub async fn unlock_with_keys(
         .await?;
 
         if resp.status == "ok" {
-            println!("Agent unlocked successfully.");
+            if !quiet {
+                println!("Agent unlocked successfully.");
+            }
         } else {
             return Err(format!(
                 "Failed to unlock agent: {}",
@@ -85,9 +97,11 @@ pub async fn unlock_with_keys(
             ));
         }
     } else {
-        println!(
-            "Keys derived successfully. (Agent daemon is not running, so keys were not sent.)"
-        );
+        if !quiet {
+            println!(
+                "Keys derived successfully. (Agent daemon is not running, so keys were not sent.)"
+            );
+        }
     }
 
     Ok(())
@@ -145,6 +159,7 @@ pub async fn run_command(command: Commands, config: &mut Config) -> Result<(), S
                 Commands::Keys(args) => handle_keys(args.command, &mut repo).await?,
                 Commands::Unlock => handle_unlock(config, &mut repo).await?,
                 Commands::Status => handle_status(config, &mut repo).await?,
+                Commands::Tui => handle_tui(config, &mut repo).await?,
                 Commands::Start(_) => {
                     unreachable!("Start command handled synchronously in main()");
                 }
@@ -178,10 +193,11 @@ fn parse_auth_code(input: &str) -> Result<String, String> {
     }
 }
 
-fn derive_and_verify_keys_from_response(
+pub fn derive_and_verify_keys_from_response(
     resp: &crate::api::TokenResponse,
     password_arg: Option<String>,
     error_context: &str,
+    quiet: bool,
 ) -> Result<([u8; 32], String), String> {
     let decrypt_opts = resp.user_decryption_options.as_ref().ok_or_else(|| {
         format!(
@@ -203,7 +219,9 @@ fn derive_and_verify_keys_from_response(
     let parallelism = unlock_data.kdf.parallelism;
     let salt_email = &unlock_data.salt;
 
-    println!("Deriving master key to verify password...");
+    if !quiet {
+        println!("Deriving master key to verify password...");
+    }
     let master_key = crypto::prompt_and_derive_master_key(
         password_arg,
         salt_email,
@@ -211,12 +229,16 @@ fn derive_and_verify_keys_from_response(
         iterations,
         memory,
         parallelism,
-        Some("Master Password (to decrypt vault keys): "),
+        if quiet { None } else { Some("Master Password (to decrypt vault keys): ") },
     )?;
 
-    println!("Decrypting vault symmetric keys...");
+    if !quiet {
+        println!("Decrypting vault symmetric keys...");
+    }
     let _sym_keys = crypto::decrypt_symmetric_key(&master_key, &resp.key)?;
-    println!("Vault keys decrypted and verified successfully.");
+    if !quiet {
+        println!("Vault keys decrypted and verified successfully.");
+    }
 
     Ok((master_key, email))
 }
@@ -355,6 +377,7 @@ async fn handle_login(
             &resp,
             args.password.clone(),
             "SSO response",
+            false,
         )?;
 
         (resp, master_key, email)
@@ -374,6 +397,7 @@ async fn handle_login(
             &resp,
             args.password.clone(),
             "API Key response",
+            false,
         )?;
 
         (resp, master_key, email)
@@ -456,9 +480,9 @@ async fn handle_login(
     let (enc_key, mac_key) = crypto::decrypt_symmetric_key(&master_key, &token_resp.key)
         .map_err(|e| format!("Failed to decrypt symmetric keys: {}", e))?;
 
-    perform_sync(&api_client, &token_resp.access_token, &mut session).await?;
+    perform_sync(&api_client, &token_resp.access_token, &mut session, false).await?;
 
-    if let Err(e) = unlock_with_keys(repo, &session, &enc_key, &mac_key).await {
+    if let Err(e) = unlock_with_keys(repo, &session, &enc_key, &mac_key, false).await {
         eprintln!("Warning: Failed to unlock vault: {}", e);
     }
 
@@ -528,7 +552,7 @@ async fn handle_sync(config: &mut Config, repo: &mut storage::VaultRepository) -
     let api_client = ApiClient::new(&config.server_url);
     println!("Syncing ciphers from server {}...", config.server_url);
 
-    perform_sync(&api_client, &token, &mut session).await?;
+    perform_sync(&api_client, &token, &mut session, false).await?;
     println!("Sync completed successfully.");
 
     Ok(())
@@ -750,7 +774,7 @@ async fn handle_unlock(config: &mut Config, repo: &mut storage::VaultRepository)
         }
     };
 
-    unlock_with_keys(repo, &session, &enc_key, &mac_key).await?;
+    unlock_with_keys(repo, &session, &enc_key, &mac_key, false).await?;
 
     Ok(())
 }
@@ -853,4 +877,8 @@ fn get_current_time_string() -> String {
             "Unknown".to_string()
         }
     }
+}
+
+async fn handle_tui(config: &mut Config, repo: &mut storage::VaultRepository) -> Result<(), String> {
+    crate::tui::run(config, repo).await
 }

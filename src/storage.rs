@@ -1355,6 +1355,29 @@ impl VaultRepository {
         Ok(ciphers)
     }
 
+    pub fn list_folders(&self, user_id: &str) -> Result<Vec<FolderSync>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, object, revision_date FROM folders WHERE user_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![user_id], |row| {
+                Ok(FolderSync {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    object: row.get(2)?,
+                    revision_date: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        
+        let mut folders = Vec::new();
+        for r in rows {
+            folders.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(folders)
+    }
+
     pub fn save_sync_response(&mut self, sync: &SyncResponse) -> Result<(), String> {
         let tx = self.conn.transaction().map_err(|e| e.to_string())?;
 
