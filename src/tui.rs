@@ -878,6 +878,7 @@ fn draw_middle_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App<'_>) {
                 2 => "📝", // Secure Note
                 3 => "💳", // Card
                 4 => "👤", // Identity
+                5 | 100 => "🗝️", // SSH Key
                 _ => "📦",
             };
             let mut line_spans = vec![Span::raw(format!("{} {}", icon, name))];
@@ -956,6 +957,7 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
             2 => "Secure Note",
             3 => "Card",
             4 => "Identity",
+            5 | 100 => "SSH Key",
             _ => "Unknown",
         }),
         Style::default().fg(Color::DarkGray),
@@ -1005,6 +1007,20 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
             details_lines.push(Line::from(""));
             details_lines.push(Line::from(Span::styled("Notes:", Style::default().fg(Color::Yellow))));
             details_lines.push(Line::from(decrypted_notes));
+        }
+
+        // Native SSH Key details
+        if let Some(ref ssh_key_sync) = c.ssh_key {
+            details_lines.push(Line::from(""));
+            details_lines.push(Line::from(Span::styled("SSH Key Details:", Style::default().fg(Color::Yellow))));
+            if let Some(ref enc_priv) = ssh_key_sync.private_key {
+                let decrypted_priv = decrypt_to_string(enc_priv, &cipher_keys);
+                add_field(&mut details_lines, "Private Key", Some(&decrypted_priv), true);
+            }
+            if let Some(ref enc_pub) = ssh_key_sync.public_key {
+                let decrypted_pub = decrypt_to_string(enc_pub, &cipher_keys);
+                add_field(&mut details_lines, "Public Key", Some(&decrypted_pub), false);
+            }
         }
         
         // Associated SSH Key (if extracted by agent module)
