@@ -96,10 +96,10 @@ This document tracks the step-by-step progress of the `bitter` project, includin
 - [x] Refactor `storage` and CLI endpoints (`login`, `logout`, `sync`) to use separated files
 
 ## Phase 9: API Key, SSO, and Device Push Login
-- [ ] Implement API Key Login CLI commands and backend validation
-- [ ] Implement SSO OAuth authorization
-  - [ ] Spin up temporary local HTTP redirect server
-  - [ ] Launch browser flow and capture authorization codes
+- [x] Implement API Key Login CLI commands and backend validation
+- [x] Implement SSO OAuth authorization
+  - [x] Spin up temporary local HTTP redirect server
+  - [x] Launch browser flow and capture authorization codes
 - [ ] Implement Device Push Approval Login
   - [ ] Trigger push notification on registered device
   - [ ] Implement asynchronous polling status checks on terminal
