@@ -3,7 +3,7 @@ use crate::config::{Config, Session};
 use crate::storage::VaultRepository;
 use crate::{crypto, storage};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -87,6 +87,7 @@ impl<'a> App<'a> {
                 "All Items",
                 "Favorites",
                 "Logins",
+                "SSH Keys",
                 "Cards",
                 "Identities",
                 "Secure Notes",
@@ -319,6 +320,7 @@ impl<'a> App<'a> {
                     "All Items" => true,
                     "Favorites" => c.favorite,
                     "Logins" => c.r#type == 1,
+                    "SSH Keys" => c.r#type == 5 || c.r#type == 100 || c.ssh_key.is_some(),
                     "Cards" => c.r#type == 3,
                     "Identities" => c.r#type == 4,
                     "Secure Notes" => c.r#type == 2,
@@ -356,7 +358,7 @@ impl<'a> App<'a> {
 pub async fn run(config: &mut Config, repo: &mut VaultRepository) -> Result<(), String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
+    execute!(stdout, EnterAlternateScreen).map_err(|e| e.to_string())?;
     
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
@@ -369,8 +371,7 @@ pub async fn run(config: &mut Config, repo: &mut VaultRepository) -> Result<(), 
     disable_raw_mode().map_err(|e| e.to_string())?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )
     .map_err(|e| e.to_string())?;
     terminal.show_cursor().map_err(|e| e.to_string())?;
@@ -874,11 +875,11 @@ fn draw_middle_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App<'_>) {
             let cipher_keys = decrypt_cipher_key(c, &app.keys);
             let name = decrypt_to_string(raw_name, &cipher_keys);
             let icon = match c.r#type {
-                1 => "🔑", // Login
+                1 => "🔒", // Login
                 2 => "📝", // Secure Note
                 3 => "💳", // Card
                 4 => "👤", // Identity
-                5 | 100 => "🗝️", // SSH Key
+                5 | 100 => "🔑", // SSH Key
                 _ => "📦",
             };
             let mut line_spans = vec![Span::raw(format!("{} {}", icon, name))];
