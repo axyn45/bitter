@@ -871,7 +871,8 @@ fn draw_middle_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App<'_>) {
         .iter()
         .map(|c| {
             let raw_name = c.name.as_deref().unwrap_or("[No Name]");
-            let name = decrypt_to_string(raw_name, &app.keys);
+            let cipher_keys = decrypt_cipher_key(c, &app.keys);
+            let name = decrypt_to_string(raw_name, &cipher_keys);
             let icon = match c.r#type {
                 1 => "🔑", // Login
                 2 => "📝", // Secure Note
@@ -927,6 +928,7 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
     }
 
     let c = filtered[selected_idx];
+    let cipher_keys = decrypt_cipher_key(c, &app.keys);
     let mut details_lines = Vec::new();
 
     let add_field = |lines: &mut Vec<Line>, label: &str, val: Option<&str>, is_secret: bool| {
@@ -943,7 +945,7 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
     };
 
     // Title / Header
-    let decrypted_title = c.name.as_deref().map(|n| decrypt_to_string(n, &app.keys)).unwrap_or_else(|| "[No Name]".to_string());
+    let decrypted_title = c.name.as_deref().map(|n| decrypt_to_string(n, &cipher_keys)).unwrap_or_else(|| "[No Name]".to_string());
     details_lines.push(Line::from(Span::styled(
         decrypted_title,
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -966,13 +968,13 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
             // Login Item
             if let Some(login_sync) = &c.login {
                 let decrypted_username = login_sync.username.as_ref().map(|u| {
-                    decrypt_to_string(u, &app.keys)
+                    decrypt_to_string(u, &cipher_keys)
                 });
                 let decrypted_password = login_sync.password.as_ref().map(|p| {
-                    decrypt_to_string(p, &app.keys)
+                    decrypt_to_string(p, &cipher_keys)
                 });
                 let decrypted_uri = login_sync.uri.as_ref().map(|u| {
-                    decrypt_to_string(u, &app.keys)
+                    decrypt_to_string(u, &cipher_keys)
                 });
 
                 add_field(&mut details_lines, "Username", decrypted_username.as_deref(), false);
@@ -988,10 +990,10 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
                 details_lines.push(Line::from(Span::styled("Custom Fields:", Style::default().fg(Color::Yellow))));
                 for f in fields {
                     let decrypted_val = f.value.as_ref().map(|v| {
-                        decrypt_to_string(v, &app.keys)
+                        decrypt_to_string(v, &cipher_keys)
                     });
                     let is_secret = f.r#type == 1; // Secret field type in Bitwarden
-                    let decrypted_field_name = decrypt_to_string(&f.name, &app.keys);
+                    let decrypted_field_name = decrypt_to_string(&f.name, &cipher_keys);
                     add_field(&mut details_lines, &decrypted_field_name, decrypted_val.as_deref(), is_secret);
                 }
             }
@@ -999,7 +1001,7 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
 
         // Notes
         if let Some(notes) = &c.notes {
-            let decrypted_notes = decrypt_to_string(notes, &app.keys);
+            let decrypted_notes = decrypt_to_string(notes, &cipher_keys);
             details_lines.push(Line::from(""));
             details_lines.push(Line::from(Span::styled("Notes:", Style::default().fg(Color::Yellow))));
             details_lines.push(Line::from(decrypted_notes));
@@ -1066,4 +1068,26 @@ fn decrypt_to_string(cipher_text: &str, keys: &Option<([u8; 32], [u8; 32])>) -> 
         Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| cipher_text.to_string()),
         Err(_) => cipher_text.to_string(),
     }
+}
+
+fn decrypt_cipher_key(
+    cipher: &CipherSync,
+    keys: &Option<([u8; 32], [u8; 32])>,
+) -> Option<([u8; 32], [u8; 32])> {
+    let (user_enc, user_mac) = keys.as_ref()?;
+    let (active_enc, active_mac) = (*user_enc, *user_mac);
+
+    if let Some(ref cipher_key_str) = cipher.key {
+        if let Ok(decrypted) = crypto::decrypt_cipher_string(cipher_key_str, &active_enc, &active_mac) {
+            if decrypted.len() == 64 {
+                let mut ck_enc = [0u8; 32];
+                let mut ck_mac = [0u8; 32];
+                ck_enc.copy_from_slice(&decrypted[0..32]);
+                ck_mac.copy_from_slice(&decrypted[32..64]);
+                return Some((ck_enc, ck_mac));
+            }
+        }
+    }
+
+    Some((active_enc, active_mac))
 }
