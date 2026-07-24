@@ -106,16 +106,26 @@ This document tracks the step-by-step progress of the `bitter` project, includin
 
 ## Phase 10: TUI Dashboard & CRUD Management
 - [ ] Add `ratatui` and `crossterm` dependencies to `Cargo.toml`
-- [ ] Build interactive Dashboard
-  - [ ] Fuzzy-searchable item list
-  - [ ] Detailed item view pane (with password/key copy and view/mask toggles)
-  - [ ] Settings manager pane (timeout, server URL)
-- [ ] Implement secure clipboard helpers (asynchronous background thread that wipes clipboard memory after 20s)
-- [ ] Implement item editing and creation
-  - [ ] Forms for adding/editing vault ciphers
-  - [ ] Folder selector and custom fields creator
-- [ ] Implement Folder Management (create, rename, delete folders)
-- [ ] Build automatic TUI lock overlay when inactivity timer triggers (wipes screens and requests master password)
+- [ ] Establish TUI App Framework (App State, Event Loop, and raw terminal handlers)
+- [ ] Build Multi-Pane Interactive Dashboard Layout
+  - [ ] **Left Pane (Navigation Panel):** Hierarchical view showing Categories (Logins, Cards, Identities, Secure Notes) and Folders list
+  - [ ] **Middle Pane (Item List Panel):** List of ciphers filtered by current Category/Folder, with fuzzy-search input
+  - [ ] **Right Pane (Details Panel):** Render detailed properties (Title, credentials, notes, custom fields, SSH keys)
+- [ ] Implement Keyboard Interaction Scheme
+  - [ ] Arrow keys for list selection and navigation
+  - [ ] `Tab` / `Shift-Tab` to switch focus between Left, Middle, and Right panes
+  - [ ] Keyboard shortcuts for core actions (Add, Edit, Delete, Copy, Lock, Sync, Logout)
+- [ ] Build Authentication Flow Screens
+  - [ ] TUI Login form (Email/Password credentials and Server URL input)
+  - [ ] TUI Lock Overlay (Wipes screen and prompts for master password on inactivity or lock command)
+  - [ ] TUI Logout support
+- [ ] Implement Vault Item CRUD Actions
+  - [ ] Input Form component for Adding and Updating ciphers (name, type, credentials, custom fields)
+  - [ ] Folder selector dropdown and custom fields builder in forms
+  - [ ] Delete cipher action with confirmation modal
+- [ ] Implement Security Features in TUI
+  - [ ] Master Password Re-prompt validation modal for sensitive ciphers (`reprompt == 1` items) before revealing or decrypting
+  - [ ] Asynchronous Clipboard helper (wipes copied credentials from clipboard buffer after 20 seconds)
 
 ## Phase 11: Organization Support & Multi-Vault Collections
 - [ ] Expand database schema (`vault.db`) to support organization identifiers, collections, and folders
