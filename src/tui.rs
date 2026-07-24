@@ -837,7 +837,8 @@ fn draw_left_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App<'_>) {
     // Render folders
     items.push(ListItem::new(Span::styled("  -- Folders --", Style::default().fg(Color::DarkGray))));
     for folder in &app.folders {
-        items.push(ListItem::new(Span::raw(format!("  📁  {}", folder.name))));
+        let name = decrypt_to_string(&folder.name, &app.keys);
+        items.push(ListItem::new(Span::raw(format!("  📁  {}", name))));
     }
 
     let list = List::new(items)
@@ -869,7 +870,8 @@ fn draw_middle_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App<'_>) {
     let items: Vec<ListItem> = filtered
         .iter()
         .map(|c| {
-            let name = c.name.as_deref().unwrap_or("[No Name]");
+            let raw_name = c.name.as_deref().unwrap_or("[No Name]");
+            let name = decrypt_to_string(raw_name, &app.keys);
             let icon = match c.r#type {
                 1 => "🔑", // Login
                 2 => "📝", // Secure Note
@@ -940,16 +942,10 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
         }
     };
 
-    let decrypt_to_string = |cipher_text: &str, enc: &[u8; 32], mac: &[u8; 32]| -> String {
-        match crypto::decrypt_cipher_string(cipher_text, enc, mac) {
-            Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| "[Invalid UTF-8]".to_string()),
-            Err(_) => "[Decryption Failed]".to_string(),
-        }
-    };
-
     // Title / Header
+    let decrypted_title = c.name.as_deref().map(|n| decrypt_to_string(n, &app.keys)).unwrap_or_else(|| "[No Name]".to_string());
     details_lines.push(Line::from(Span::styled(
-        c.name.as_deref().unwrap_or("[No Name]"),
+        decrypted_title,
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
     details_lines.push(Line::from(Span::styled(
@@ -965,18 +961,18 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
     details_lines.push(Line::from(""));
 
     // Decrypt fields if keys are available
-    if let Some((enc, mac)) = &app.keys {
+    if app.keys.is_some() {
         if c.r#type == 1 {
             // Login Item
             if let Some(login_sync) = &c.login {
                 let decrypted_username = login_sync.username.as_ref().map(|u| {
-                    decrypt_to_string(u, enc, mac)
+                    decrypt_to_string(u, &app.keys)
                 });
                 let decrypted_password = login_sync.password.as_ref().map(|p| {
-                    decrypt_to_string(p, enc, mac)
+                    decrypt_to_string(p, &app.keys)
                 });
                 let decrypted_uri = login_sync.uri.as_ref().map(|u| {
-                    decrypt_to_string(u, enc, mac)
+                    decrypt_to_string(u, &app.keys)
                 });
 
                 add_field(&mut details_lines, "Username", decrypted_username.as_deref(), false);
@@ -992,17 +988,18 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
                 details_lines.push(Line::from(Span::styled("Custom Fields:", Style::default().fg(Color::Yellow))));
                 for f in fields {
                     let decrypted_val = f.value.as_ref().map(|v| {
-                        decrypt_to_string(v, enc, mac)
+                        decrypt_to_string(v, &app.keys)
                     });
                     let is_secret = f.r#type == 1; // Secret field type in Bitwarden
-                    add_field(&mut details_lines, &f.name, decrypted_val.as_deref(), is_secret);
+                    let decrypted_field_name = decrypt_to_string(&f.name, &app.keys);
+                    add_field(&mut details_lines, &decrypted_field_name, decrypted_val.as_deref(), is_secret);
                 }
             }
         }
 
         // Notes
         if let Some(notes) = &c.notes {
-            let decrypted_notes = decrypt_to_string(notes, enc, mac);
+            let decrypted_notes = decrypt_to_string(notes, &app.keys);
             details_lines.push(Line::from(""));
             details_lines.push(Line::from(Span::styled("Notes:", Style::default().fg(Color::Yellow))));
             details_lines.push(Line::from(decrypted_notes));
@@ -1058,4 +1055,15 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
     f.render_widget(block, area);
     f.render_widget(status_widget, layout[0]);
     f.render_widget(shortcut_widget, layout[1]);
+}
+
+fn decrypt_to_string(cipher_text: &str, keys: &Option<([u8; 32], [u8; 32])>) -> String {
+    let (enc, mac) = match keys {
+        Some(k) => k,
+        None => return cipher_text.to_string(),
+    };
+    match crypto::decrypt_cipher_string(cipher_text, enc, mac) {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| cipher_text.to_string()),
+        Err(_) => cipher_text.to_string(),
+    }
 }
