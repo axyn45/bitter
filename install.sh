@@ -77,8 +77,8 @@ echo -e "${BOLD}Configuration options:${NC}"
 CONFIGURE_ENV=false
 CONFIGURE_AUTOSTART=false
 
-# Option A: Shell environment variables (SSH_AUTH_SOCK and PATH)
-prompt "Do you want to configure your shell profile environment variables (adds SSH_AUTH_SOCK and PATH)? [y/N]"
+# Option A: Shell environment variables for SSH Agent feature (SSH_AUTH_SOCK and PATH)
+prompt "Do you want to configure your shell profile to enable the SSH Agent feature (sets up SSH_AUTH_SOCK and PATH)? [y/N]"
 read -r response
 if [[ "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
     CONFIGURE_ENV=true
@@ -99,7 +99,7 @@ if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
     [ -f "$HOME/.zshrc" ] && PROFILES+=("$HOME/.zshrc")
     [ -f "$HOME/.profile" ] && PROFILES+=("$HOME/.profile")
     [ -f "$HOME/.bash_profile" ] && PROFILES+=("$HOME/.bash_profile")
-    
+
     if [ ${#PROFILES[@]} -eq 0 ]; then
         warning "No shell profile files (like .bashrc or .zshrc) were detected."
     else
@@ -109,7 +109,7 @@ if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
         done
         prompt "Select profile to update (e.g. 0, or enter a custom path):"
         read -r choice
-        
+
         TARGET_PROFILE=""
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -lt "${#PROFILES[@]}" ]; then
             TARGET_PROFILE="${PROFILES[$choice]}"
@@ -120,17 +120,17 @@ if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
                 TARGET_PROFILE="$choice"
             fi
         fi
-        
+
         if [ -n "$TARGET_PROFILE" ]; then
             info "Updating $TARGET_PROFILE..."
-            
-            # Check if our block is already present
-            if grep -q "# >>> bitter ssh-agent configuration >>>" "$TARGET_PROFILE" 2>/dev/null; then
+
+            # Check if our block is already present (checking both old and new format to avoid duplicates)
+            if grep -q "# >>> bitter configuration >>>" "$TARGET_PROFILE" 2>/dev/null || grep -q "# >>> bitter ssh-agent configuration >>>" "$TARGET_PROFILE" 2>/dev/null; then
                 info "bitter configuration block is already present in $TARGET_PROFILE. Skipping."
             else
                 echo "" >> "$TARGET_PROFILE"
-                echo "# >>> bitter ssh-agent configuration >>>" >> "$TARGET_PROFILE"
-                
+                echo "# >>> bitter configuration >>>" >> "$TARGET_PROFILE"
+
                 if [ "$CONFIGURE_ENV" = true ]; then
                     # Check if SSH_AUTH_SOCK is already configured in profile
                     if grep -q "SSH_AUTH_SOCK" "$TARGET_PROFILE" 2>/dev/null; then
@@ -139,7 +139,7 @@ if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
                         echo 'export SSH_AUTH_SOCK="$HOME/.cache/bitter/ssh-agent.sock"' >> "$TARGET_PROFILE"
                         success "Added SSH_AUTH_SOCK to $TARGET_PROFILE"
                     fi
-                    
+
                     # Check if PATH already contains ~/.local/bin in active environment or profile
                     if [[ ":$PATH:" == *":$HOME/.local/bin:"* ]] || grep -q "\.local/bin" "$TARGET_PROFILE" 2>/dev/null; then
                         info "PATH already contains $HOME/.local/bin. Skipping path addition."
@@ -148,7 +148,7 @@ if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
                         success "Added $HOME/.local/bin to PATH in $TARGET_PROFILE"
                     fi
                 fi
-                
+
                 if [ "$CONFIGURE_AUTOSTART" = true ]; then
                     echo "" >> "$TARGET_PROFILE"
                     echo "# Start the daemon silently if the socket is not active" >> "$TARGET_PROFILE"
@@ -157,10 +157,10 @@ if [ "$CONFIGURE_ENV" = true ] || [ "$CONFIGURE_AUTOSTART" = true ]; then
                     echo 'fi' >> "$TARGET_PROFILE"
                     success "Added daemon auto-start logic to $TARGET_PROFILE"
                 fi
-                
-                echo "# <<< bitter ssh-agent configuration <<<" >> "$TARGET_PROFILE"
+
+                echo "# <<< bitter configuration <<<" >> "$TARGET_PROFILE"
             fi
-            
+
             echo -e "${YELLOW}ℹ Please run: source $TARGET_PROFILE (or restart your terminal) to apply changes.${NC}"
         fi
     fi
