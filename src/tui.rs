@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use std::io;
@@ -1211,6 +1211,8 @@ fn draw_reprompt_modal(f: &mut ratatui::Frame, app: &App<'_>) {
         60.min(size.width),
         8.min(size.height),
     );
+
+    f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
