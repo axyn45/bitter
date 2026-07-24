@@ -67,6 +67,11 @@ struct App<'a> {
     // UI details
     mask_secrets: bool,
     status_message: Option<(String, Instant)>,
+
+    // Reprompt state
+    reprompt_verified_cipher_id: Option<String>,
+    reprompt_password_input: String,
+    show_reprompt_modal: bool,
 }
 
 impl<'a> App<'a> {
@@ -101,6 +106,9 @@ impl<'a> App<'a> {
             middle_list_state: ListState::default(),
             mask_secrets: true,
             status_message: None,
+            reprompt_verified_cipher_id: None,
+            reprompt_password_input: String::new(),
+            show_reprompt_modal: false,
         };
         
         app.left_list_state.select(Some(0));
@@ -293,6 +301,64 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    async fn handle_reprompt_submit(&mut self, cipher_id: String) -> Result<bool, String> {
+        if self.reprompt_password_input.trim().is_empty() {
+            return Err("Password cannot be empty".to_string());
+        }
+
+        let session = self.repo.load_session()?
+            .ok_or_else(|| "No active session".to_string())?;
+        
+        let api_client = ApiClient::new(&session.server_url);
+
+        // Fetch prelogin params
+        let prelogin = match api_client.prelogin(&session.email).await {
+            Ok(p) => p,
+            Err(_) => {
+                let sync_resp = self.repo.load_sync_response()?;
+                let ud = sync_resp.user_decryption.as_ref()
+                    .ok_or_else(|| "User decryption options missing".to_string())?;
+                let unlock = ud.master_password_unlock.as_ref()
+                    .ok_or_else(|| "MasterPasswordUnlock parameters missing".to_string())?;
+                crate::api::PreloginResponse {
+                    kdf: unlock.kdf.kdf_type,
+                    kdf_iterations: unlock.kdf.iterations,
+                    kdf_memory: unlock.kdf.memory,
+                    kdf_parallelism: unlock.kdf.parallelism,
+                }
+            }
+        };
+
+        // Derive master key
+        let master_key = crypto::prompt_and_derive_master_key(
+            Some(self.reprompt_password_input.clone()),
+            &session.email,
+            prelogin.kdf,
+            prelogin.kdf_iterations,
+            prelogin.kdf_memory,
+            prelogin.kdf_parallelism,
+            None,
+        )?;
+
+        // Try to decrypt the session key using this derived master key
+        let sync_resp = self.repo.load_sync_response()?;
+        let (actual_enc, actual_mac) = match &self.keys {
+            Some(k) => *k,
+            None => return Err("Vault keys missing from memory".to_string()),
+        };
+
+        if let Ok((derived_enc, derived_mac)) = crypto::decrypt_symmetric_key(&master_key, &sync_resp.profile.key) {
+            if derived_enc == actual_enc && derived_mac == actual_mac {
+                self.reprompt_verified_cipher_id = Some(cipher_id);
+                self.reprompt_password_input.clear();
+                self.show_reprompt_modal = false;
+                return Ok(true);
+            }
+        }
+
+        Err("Incorrect master password".to_string())
+    }
+
     fn handle_tui_logout(&mut self) {
         self.keys = None;
         self.user_id = None;
@@ -341,6 +407,9 @@ impl<'a> App<'a> {
         self.ciphers
             .iter()
             .filter(|c| {
+                if c.deleted_date.is_some() {
+                    return false;
+                }
                 if !matches_filter(c) {
                     return false;
                 }
@@ -406,6 +475,10 @@ async fn handle_key_input(key: KeyEvent, app: &mut App<'_>) -> Result<bool, Stri
     // Global quits
     if key.code == KeyCode::Char('q') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Ok(true);
+    }
+
+    if app.show_reprompt_modal {
+        return handle_reprompt_keys(key, app).await;
     }
 
     match &app.state {
@@ -478,6 +551,36 @@ async fn handle_lock_keys(key: KeyEvent, app: &mut App<'_>) -> Result<bool, Stri
         }
         KeyCode::Backspace => {
             app.password_input.pop();
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn handle_reprompt_keys(key: KeyEvent, app: &mut App<'_>) -> Result<bool, String> {
+    match key.code {
+        KeyCode::Esc => {
+            app.reprompt_password_input.clear();
+            app.show_reprompt_modal = false;
+        }
+        KeyCode::Enter => {
+            let filtered = app.get_filtered_ciphers();
+            let selected_idx = app.middle_list_state.selected().unwrap_or(0);
+            if selected_idx < filtered.len() {
+                let cipher_id = filtered[selected_idx].id.clone();
+                if let Err(e) = app.handle_reprompt_submit(cipher_id).await {
+                    app.set_status(&format!("Reprompt verification failed: {}", e));
+                    app.reprompt_password_input.clear();
+                } else {
+                    app.set_status("Master password verified.");
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            app.reprompt_password_input.push(c);
+        }
+        KeyCode::Backspace => {
+            app.reprompt_password_input.pop();
         }
         _ => {}
     }
@@ -558,9 +661,20 @@ async fn handle_dashboard_keys(key: KeyEvent, app: &mut App<'_>) -> Result<bool,
         KeyCode::Char('L') => {
             app.handle_tui_logout();
         }
+        KeyCode::Char('p') => {
+            let filtered = app.get_filtered_ciphers();
+            let selected_idx = app.middle_list_state.selected().unwrap_or(0);
+            if selected_idx < filtered.len() {
+                let c = filtered[selected_idx];
+                if c.reprompt == 1 && app.reprompt_verified_cipher_id.as_ref() != Some(&c.id) {
+                    app.show_reprompt_modal = true;
+                }
+            }
+        }
         
         // Arrows / Navigation keys inside focused panes
         KeyCode::Up | KeyCode::Char('k') => {
+            app.reprompt_verified_cipher_id = None;
             match app.active_panel {
                 ActivePanel::Left => {
                     let curr = app.left_list_state.selected().unwrap_or(0);
@@ -579,6 +693,7 @@ async fn handle_dashboard_keys(key: KeyEvent, app: &mut App<'_>) -> Result<bool,
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
+            app.reprompt_verified_cipher_id = None;
             match app.active_panel {
                 ActivePanel::Left => {
                     let curr = app.left_list_state.selected().unwrap_or(0);
@@ -607,7 +722,12 @@ fn ui_draw(f: &mut ratatui::Frame, app: &mut App<'_>) {
     match &app.state {
         AppState::Login => draw_login(f, app),
         AppState::Lock => draw_lock(f, app),
-        AppState::Dashboard => draw_dashboard(f, app),
+        AppState::Dashboard => {
+            draw_dashboard(f, app);
+            if app.show_reprompt_modal {
+                draw_reprompt_modal(f, app);
+            }
+        }
         AppState::Error(err) => draw_error(f, err),
     }
 }
@@ -967,7 +1087,13 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
 
     // Decrypt fields if keys are available
     if app.keys.is_some() {
-        if c.r#type == 1 {
+        if c.reprompt == 1 && app.reprompt_verified_cipher_id.as_ref() != Some(&c.id) {
+            details_lines.push(Line::from(Span::styled("🔒 RE-PROMPT REQUIRED", Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))));
+            details_lines.push(Line::from(""));
+            details_lines.push(Line::from("This item requires master password verification."));
+            details_lines.push(Line::from("Press [p] to enter your master password and decrypt."));
+        } else {
+            if c.r#type == 1 {
             // Login Item
             if let Some(login_sync) = &c.login {
                 let decrypted_username = login_sync.username.as_ref().map(|u| {
@@ -1024,12 +1150,13 @@ fn draw_right_panel(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
             }
         }
         
-        // Associated SSH Key (if extracted by agent module)
-        if let Some(key_item) = app.decrypted_keys.iter().find(|k| k.id == c.id) {
-            details_lines.push(Line::from(""));
-            details_lines.push(Line::from(Span::styled("SSH Private Key Detected:", Style::default().fg(Color::Yellow))));
-            add_field(&mut details_lines, "Private Key Type", Some("PEM / OpenSSH format"), false);
-            add_field(&mut details_lines, "Private Key Payload", Some(&key_item.private_key), true);
+            // Associated SSH Key (if extracted by agent module)
+            if let Some(key_item) = app.decrypted_keys.iter().find(|k| k.id == c.id) {
+                details_lines.push(Line::from(""));
+                details_lines.push(Line::from(Span::styled("SSH Private Key Detected:", Style::default().fg(Color::Yellow))));
+                add_field(&mut details_lines, "Private Key Type", Some("PEM / OpenSSH format"), false);
+                add_field(&mut details_lines, "Private Key Payload", Some(&key_item.private_key), true);
+            }
         }
     } else {
         details_lines.push(Line::from(Span::styled("Locked (Master key missing)", Style::default().fg(Color::Red))));
@@ -1074,6 +1201,51 @@ fn draw_status_bar(f: &mut ratatui::Frame, area: Rect, app: &App<'_>) {
     f.render_widget(block, area);
     f.render_widget(status_widget, layout[0]);
     f.render_widget(shortcut_widget, layout[1]);
+}
+
+fn draw_reprompt_modal(f: &mut ratatui::Frame, app: &App<'_>) {
+    let size = f.area();
+    let area = Rect::new(
+        size.x + (size.width.saturating_sub(60)) / 2,
+        size.y + (size.height.saturating_sub(8)) / 2,
+        60.min(size.width),
+        8.min(size.height),
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Master Password Verification ")
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    f.render_widget(block, area);
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 1 }));
+
+    f.render_widget(Paragraph::new("This item requires master password validation."), inner[0]);
+
+    let masked = "*".repeat(app.reprompt_password_input.len());
+    f.render_widget(
+        Paragraph::new(masked.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Master Password ")
+                .style(Style::default().fg(Color::Cyan)),
+        ),
+        inner[1],
+    );
+
+    f.render_widget(
+        Paragraph::new("Press [Enter] to submit. Press [Esc] to cancel.")
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        inner[2],
+    );
 }
 
 fn decrypt_to_string(cipher_text: &str, keys: &Option<([u8; 32], [u8; 32])>) -> String {
